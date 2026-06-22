@@ -163,8 +163,11 @@ def build_result_card(issue_key, project, engine_result, game_result, jira_url):
 
 def cmd_webhook(args):
     """Send message via webhook."""
-    with open(args.message_file) if args.message_file else None as f:
-        content = json.load(f) if args.message_file else args.message
+    if args.message_file:
+        with open(args.message_file) as f:
+            content = json.load(f)
+    else:
+        content = args.message
     resp = send_webhook(args.webhook_url, content)
     print(json.dumps(resp, indent=2))
 

@@ -18,10 +18,15 @@ import sys
 import tempfile
 import time
 
-import anthropic
-
-
-# ── Default review instructions (no external config dependency) ──────────────
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import urllib.error
 
 DEFAULT_REVIEW_INSTRUCTIONS = """
 You are a senior game engine engineer reviewing a merge request.
@@ -135,7 +140,7 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
 
 def review_with_claude(diff_info, config, project, issue_key, repo_type):
     """
-    Call Claude API to review the diff.
+    Call LLM API to review the diff (using urllib, no external deps).
     Returns structured review results.
     """
     if not diff_info["diff_text"]:
@@ -147,28 +152,19 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
         }
 
     diff_text = diff_info["diff_text"]
-    # Truncate diff if too large (Claude context limit)
     max_diff_chars = 80000
     if len(diff_text) > max_diff_chars:
         diff_text = diff_text[:max_diff_chars] + f"\n\n... [truncated, original {len(diff_text)} chars]"
 
-    claude_cfg = config.get("claude", {})
     api_key = (os.environ.get("ANTHROPIC_AUTH_TOKEN") or
                os.environ.get("ANTHROPIC_API_KEY") or "")
     if not api_key:
         return {"summary": "ANTHROPIC_AUTH_TOKEN not set", "findings": [], "severity_counts": {}}
 
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", None)
-    model = (os.environ.get("ANTHROPIC_MODEL") or
-             claude_cfg.get("model", "deepseek-v4-flash"))
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    model = os.environ.get("ANTHROPIC_MODEL") or "deepseek-v4-flash"
 
-    client_kwargs = {"api_key": api_key}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-
-    client = anthropic.Anthropic(**client_kwargs)
-
-    system_prompt = claude_cfg.get("review_instructions", "Review this code diff.")
+    system_prompt = DEFAULT_REVIEW_INSTRUCTIONS.strip()
 
     user_prompt = f"""Project: {project} ({repo_type} repository)
 Issue: {issue_key}
@@ -187,44 +183,74 @@ Diff:
 Please review this code change. For each finding, provide:
 - **Severity**: 🔴 Critical / 🟡 Warning / ℹ️ Suggestion
 - **File**: the file path
-- **Line**: approximate line number (if applicable)
 - **Issue**: what the problem is
 - **Suggestion**: how to fix it
 
 At the end, provide a summary with count of each severity level."""
 
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 8192,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{base_url}/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=claude_cfg.get("max_tokens", 8192),
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-
-        review_text = response.content[0].text
-
-        # Rough severity counting
-        critical = review_text.count("🔴")
-        warning = review_text.count("🟡")
-        suggestion = review_text.count("ℹ️")
-
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")[:500]
         return {
-            "summary": "",
-            "review_text": review_text,
-            "severity_counts": {
-                "critical": critical,
-                "warning": warning,
-                "suggestion": suggestion,
-            },
-            "error": None,
+            "summary": f"API error: HTTP {e.code}",
+            "review_text": f"HTTP {e.code}: {error_body}",
+            "severity_counts": {},
+            "error": f"HTTP {e.code}: {error_body}",
         }
     except Exception as e:
         return {
-            "summary": f"Claude API error: {e}",
+            "summary": f"API error: {e}",
             "review_text": None,
             "severity_counts": {},
             "error": str(e),
         }
+
+    # Extract response content
+    try:
+        if "content" in result:
+            review_text = "".join(
+                block.get("text", "") for block in result["content"]
+                if block.get("type") == "text"
+            )
+        else:
+            review_text = result.get("completion", json.dumps(result))
+    except Exception:
+        review_text = json.dumps(result)
+
+    critical = review_text.count("🔴")
+    warning = review_text.count("🟡")
+    suggestion = review_text.count("ℹ️")
+
+    return {
+        "summary": "",
+        "review_text": review_text,
+        "severity_counts": {
+            "critical": critical,
+            "warning": warning,
+            "suggestion": suggestion,
+        },
+        "error": None,
+    }
 
 
 def main():
