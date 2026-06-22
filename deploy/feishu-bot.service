@@ -1,0 +1,24 @@
+[Unit]
+Description=Feishu Code Review Bot
+After=network.target
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian/agent/engine-codereview/feishu-bot
+EnvironmentFile=/home/debian/agent/engine-codereview/feishu-bot/.env
+ExecStart=/usr/bin/python3 /home/debian/agent/engine-codereview/feishu-bot/bot.py
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

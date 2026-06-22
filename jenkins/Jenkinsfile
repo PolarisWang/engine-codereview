@@ -1,0 +1,218 @@
+#!/usr/bin/env groovy
+/*
+ * Code Review Pipeline
+ *
+ * Triggered by Feishu Bot with a Jira URL.
+ * Parses the issue, identifies project (EV/CB2/Mars/Rage),
+ * then runs parallel code reviews on engine and game repos.
+ *
+ * Parameters:
+ *   JIRA_URL  - Full Jira issue URL (e.g. https://jira.company/browse/EV-123)
+ */
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'JIRA_URL', description: 'Jira issue URL (e.g. https://jira.company/browse/EV-123)')
+        string(name: 'FEISHU_MESSAGE_ID', description: '[Optional] Feishu message ID to update', defaultValue: '')
+    }
+
+    environment {
+        // ── Repo paths ──
+        SCRIPTS_DIR = "${env.WORKSPACE}/jenkins/scripts"
+        CONFIG_FILE = "${env.WORKSPACE}/config.yaml"
+
+        // ── Workspace ──
+        REVIEW_WORKSPACE = "${env.WORKSPACE}/review-workspace"
+
+        // ── Result files (shared between stages) ──
+        PARSED_INFO_FILE = "${env.WORKSPACE}/parsed_info.json"
+        ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
+        GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
+    }
+
+    stages {
+        // ──────────────────────────────────────────────
+        // Stage 1: Parse Jira URL → project + MR info
+        // ──────────────────────────────────────────────
+        stage('Parse Jira Issue') {
+            steps {
+                script {
+                    sh """
+                        python3 ${SCRIPTS_DIR}/jira_parser.py \
+                            --jira-url '${params.JIRA_URL}' \
+                            --jira-host '${env.JIRA_HOST}' \
+                            --jira-token '${env.JIRA_TOKEN}' \
+                            > ${PARSED_INFO_FILE}
+                    """
+                    parsedInfo = readJSON(file: PARSED_INFO_FILE)
+
+                    if (parsedInfo.containsKey('error')) {
+                        error("Jira parse failed: ${parsedInfo.error}")
+                    }
+
+                    env.ISSUE_KEY   = parsedInfo.issue_key
+                    env.PROJECT     = parsedInfo.project
+                    env.ENGINE_REPO = parsedInfo.engine_repo
+                    env.GAME_REPO   = parsedInfo.game_repo
+                    env.BASE_BRANCH = parsedInfo.default_branch
+
+                    // Determine branch from MR info or fallback
+                    if (parsedInfo.mr_info) {
+                        env.REVIEW_BRANCH = parsedInfo.mr_info.branch ?: parsedInfo.issue_key
+                    } else {
+                        env.REVIEW_BRANCH = parsedInfo.issue_key
+                    }
+
+                    echo "Parsed: ${env.ISSUE_KEY} → ${env.PROJECT}"
+                    echo "Engine: ${env.ENGINE_REPO}"
+                    echo "Game:   ${env.GAME_REPO}"
+                    echo "Branch: ${env.REVIEW_BRANCH} → ${env.BASE_BRANCH}"
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────
+        // Stage 2: Parallel Code Review (Engine + Game)
+        // ──────────────────────────────────────────────
+        stage('Code Review') {
+            parallel {
+                stage('Engine Repo') {
+                    steps {
+                        script {
+                            sh """
+                                python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                    --repo '${env.ENGINE_REPO}' \
+                                    --branch '${env.REVIEW_BRANCH}' \
+                                    --base-branch '${env.BASE_BRANCH}' \
+                                    --project '${env.PROJECT}' \
+                                    --issue-key '${env.ISSUE_KEY}' \
+                                    --repo-type 'engine' \
+                                    --workspace '${REVIEW_WORKSPACE}' \
+                                    --output '${ENGINE_RESULT_FILE}'
+                            """
+                        }
+                    }
+                    post {
+                        failure {
+                            script {
+                                writeJSON(file: ENGINE_RESULT_FILE, json: [
+                                    project: env.PROJECT, issue_key: env.ISSUE_KEY,
+                                    repo_type: 'engine', error: 'Review failed'
+                                ])
+                            }
+                        }
+                    }
+                }
+
+                stage('Game Repo') {
+                    steps {
+                        script {
+                            sh """
+                                python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                    --repo '${env.GAME_REPO}' \
+                                    --branch '${env.REVIEW_BRANCH}' \
+                                    --base-branch '${env.BASE_BRANCH}' \
+                                    --project '${env.PROJECT}' \
+                                    --issue-key '${env.ISSUE_KEY}' \
+                                    --repo-type 'game' \
+                                    --workspace '${REVIEW_WORKSPACE}' \
+                                    --output '${GAME_RESULT_FILE}'
+                            """
+                        }
+                    }
+                    post {
+                        failure {
+                            script {
+                                writeJSON(file: GAME_RESULT_FILE, json: [
+                                    project: env.PROJECT, issue_key: env.ISSUE_KEY,
+                                    repo_type: 'game', error: 'Review failed'
+                                ])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Post: Send results to Feishu (via temp files to avoid shell quoting issues)
+    // ──────────────────────────────────────────────
+    post {
+        always {
+            script {
+                def engineResult = fileExists(ENGINE_RESULT_FILE) ? readJSON(file: ENGINE_RESULT_FILE) : [:]
+                def gameResult   = fileExists(GAME_RESULT_FILE)   ? readJSON(file: GAME_RESULT_FILE)   : [:]
+
+                feishuWebhook = env.FEISHU_WEBHOOK_URL ?: ''
+                feishuAppId   = env.FEISHU_APP_ID     ?: ''
+                feishuSecret  = env.FEISHU_APP_SECRET ?: ''
+
+                // ── Build severity summary ──
+                def buildSevText = { result ->
+                    def sev = result.review?.severity_counts ?: [:]
+                    def parts = []
+                    if (sev.critical)  parts.append("🔴 ${sev.critical}")
+                    if (sev.warning)   parts.append("🟡 ${sev.warning}")
+                    if (sev.suggestion)parts.append("ℹ️ ${sev.suggestion}")
+                    return parts ? parts.join(' | ') : '✅ Clean'
+                }
+
+                engineSev = buildSevText(engineResult)
+                gameSev   = buildSevText(gameResult)
+
+                // Write review JSONs to temp files for safe shell passing
+                writeJSON(file: "${env.WORKSPACE}/engine_review.json", json: engineResult.review ?: [:])
+                writeJSON(file: "${env.WORKSPACE}/game_review.json",  json: gameResult.review ?: [:])
+
+                // ── Send to Feishu ──
+                if (feishuAppId && feishuSecret) {
+                    // Bot API mode — send/update card
+                    if (params.FEISHU_MESSAGE_ID) {
+                        sh """
+                            python3 ${SCRIPTS_DIR}/feishu_notifier.py update-card \
+                                --app-id '${feishuAppId}' \
+                                --app-secret '${feishuSecret}' \
+                                --message-id '${params.FEISHU_MESSAGE_ID}' \
+                                --issue-key '${env.ISSUE_KEY}' \
+                                --project '${env.PROJECT}' \
+                                --jira-url '${params.JIRA_URL}' \
+                                --engine-json "\$(cat ${env.WORKSPACE}/engine_review.json)" \
+                                --game-json "\$(cat ${env.WORKSPACE}/game_review.json)"
+                        """
+                    } else {
+                        sh """
+                            python3 ${SCRIPTS_DIR}/feishu_notifier.py send-card \
+                                --app-id '${feishuAppId}' \
+                                --app-secret '${feishuSecret}' \
+                                --chat-id '${env.FEISHU_CHAT_ID}' \
+                                --issue-key '${env.ISSUE_KEY}' \
+                                --project '${env.PROJECT}'
+                        """
+                    }
+                } else if (feishuWebhook) {
+                    // Webhook mode — simple text message
+                    message = """✅ Code Review Complete: ${env.ISSUE_KEY}
+Project: ${env.PROJECT}
+Jira: ${params.JIRA_URL}
+
+🔧 Engine: ${engineSev}
+🎮 Game:   ${gameSev}
+
+${BUILD_URL}"""
+                    sh """
+                        python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
+                            --webhook-url '${feishuWebhook}' \
+                            --message '${message}'
+                    """
+                }
+            }
+        }
+
+        cleanup {
+            sh "rm -rf ${REVIEW_WORKSPACE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json || true"
+        }
+    }
+}

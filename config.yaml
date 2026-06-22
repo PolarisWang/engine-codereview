@@ -1,0 +1,62 @@
+# ============================================================
+# Code Review Bot - Project Configuration
+# ============================================================
+# Each project has:
+#   - jira_project_key: prefix used in Jira issue keys (e.g. EV-123)
+#   - engine_repo:     git URL for the engine repository
+#   - game_repo:       git URL for the game repository
+#   - default_branch:  base branch for diff comparison
+
+projects:
+  EV:
+    jira_project_key: EV
+    name: "EngineVerse"
+    engine_repo: "git@github.com:PolarisWang/ev-engine.git"
+    game_repo: "git@github.com:PolarisWang/ev-game.git"
+    default_branch: main
+
+  CB2:
+    jira_project_key: CB2
+    name: "CB2"
+    engine_repo: "git@github.com:PolarisWang/cb2-engine.git"
+    game_repo: "git@github.com:PolarisWang/cb2-game.git"
+    default_branch: main
+
+  Mars:
+    jira_project_key: MARS
+    name: "Mars"
+    engine_repo: "git@github.com:PolarisWang/mars-engine.git"
+    game_repo: "git@github.com:PolarisWang/mars-game.git"
+    default_branch: main
+
+  Rage:
+    jira_project_key: RAGE
+    name: "Rage"
+    engine_repo: "git@github.com:PolarisWang/rage-engine.git"
+    game_repo: "git@github.com:PolarisWang/rage-game.git"
+    default_branch: main
+
+# ============================================================
+# Repository mirror dir (where Jenkins clones repos for review)
+# ============================================================
+workspace:
+  base_dir: /data/codereview/workspace
+  cache_repos: true   # reuse local clones, fetch instead of clone
+
+# ============================================================
+# Claude API settings
+# ============================================================
+claude:
+  model: claude-sonnet-4-6-20250610
+  max_tokens: 8192
+  review_instructions: |
+    You are a senior game engine engineer reviewing a merge request.
+    Focus on:
+    1. Logic correctness and potential bugs
+    2. Performance issues
+    3. Code style and maintainability
+    4. Security concerns
+    5. Missing edge case handling
+
+    Rate each finding as: 🔴 Critical, 🟡 Warning, ℹ️ Suggestion
+    Summarize at the end with a count of each severity level.
