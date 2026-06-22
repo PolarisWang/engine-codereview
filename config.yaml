@@ -11,29 +11,29 @@ projects:
   EV:
     jira_project_key: EV
     name: "EngineVerse"
-    engine_repo: "git@github.com:PolarisWang/ev-engine.git"
-    game_repo: "git@github.com:PolarisWang/ev-game.git"
+    engine_repo: "git@gitlab.booming-inc.com:booming/dev/chaos.git"
+    game_repo: "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git"
     default_branch: main
 
   CB2:
     jira_project_key: CB2
     name: "CB2"
-    engine_repo: "git@github.com:PolarisWang/cb2-engine.git"
-    game_repo: "git@github.com:PolarisWang/cb2-game.git"
+    engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/chaos-cb-2.git"
+    game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/conquerors-blade-2.git"
     default_branch: main
 
   Mars:
     jira_project_key: MARS
     name: "Mars"
-    engine_repo: "git@github.com:PolarisWang/mars-engine.git"
-    game_repo: "git@github.com:PolarisWang/mars-game.git"
+    engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/mars/chaos-mars.git"
+    game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/mars/mars.git"
     default_branch: main
 
   Rage:
     jira_project_key: RAGE
     name: "Rage"
-    engine_repo: "git@github.com:PolarisWang/rage-engine.git"
-    game_repo: "git@github.com:PolarisWang/rage-game.git"
+    engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git"
+    game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git"
     default_branch: main
 
 # ============================================================
