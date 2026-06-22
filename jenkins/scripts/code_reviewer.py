@@ -19,16 +19,33 @@ import tempfile
 import time
 
 import anthropic
-import yaml
+
+
+# ── Default review instructions (no external config dependency) ──────────────
+
+DEFAULT_REVIEW_INSTRUCTIONS = """
+You are a senior game engine engineer reviewing a merge request.
+Focus on:
+1. Logic correctness and potential bugs
+2. Performance issues
+3. Code style and maintainability
+4. Security concerns
+5. Missing edge case handling
+
+Rate each finding as: 🔴 Critical, 🟡 Warning, ℹ️ Suggestion
+Summarize at the end with a count of each severity level.
+"""
 
 
 def load_config():
-    """Load config.yaml (from repo root: engine-codereview/config.yaml)."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    config_path = os.path.join(repo_root, "config.yaml")
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+    """Return minimal config (no YAML needed)."""
+    return {
+        "claude": {
+            "model": os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+            "max_tokens": 8192,
+            "review_instructions": DEFAULT_REVIEW_INSTRUCTIONS.strip(),
+        }
+    }
 
 
 def run_git(cmd, cwd, timeout=120):

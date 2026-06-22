@@ -17,14 +17,16 @@ import re
 import sys
 import urllib.request
 import urllib.error
-import yaml
+
+
+# ── Built-in project Jira keys (no YAML dependency) ─────────────────────────
+
+PROJECT_JIRA_KEYS = ["EV", "CB2", "MARS", "RAGE"]
 
 
 def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    with open(os.path.join(repo_root, "config.yaml")) as f:
-        return yaml.safe_load(f)
+    """Return minimal config (no YAML needed)."""
+    return {"projects": {k: {"jira_project_key": k} for k in PROJECT_JIRA_KEYS}}
 
 
 def jira_get(path, host, token):

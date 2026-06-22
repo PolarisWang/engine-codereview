@@ -16,18 +16,46 @@ import re
 import sys
 import urllib.request
 import urllib.error
-import yaml
 
+
+# ── Built-in project config (no external file dependency) ────────────────────
+
+PROJECT_CONFIG = {
+    "EV": {
+        "jira_project_key": "EV",
+        "name": "EngineVerse",
+        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/chaos.git",
+        "game_repo": "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git",
+        "default_branch": "main",
+    },
+    "CB2": {
+        "jira_project_key": "CB2",
+        "name": "CB2",
+        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/chaos-cb-2.git",
+        "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/conquerors-blade-2.git",
+        "default_branch": "main",
+    },
+    "Mars": {
+        "jira_project_key": "MARS",
+        "name": "Mars",
+        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/mars/chaos-mars.git",
+        "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/mars/mars.git",
+        "default_branch": "main",
+    },
+    "Rage": {
+        "jira_project_key": "RAGE",
+        "name": "Rage",
+        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git",
+        "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git",
+        "default_branch": "main",
+    },
+}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def load_config():
-    """Load project config from repo root."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    config_path = os.path.join(repo_root, "config.yaml")
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+    """Return built-in project config (no YAML dependency)."""
+    return {"projects": PROJECT_CONFIG}
 
 
 def jira_request(path, host, token):
