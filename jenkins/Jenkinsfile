@@ -92,7 +92,7 @@ pipeline {
                     env.GAME_REPO   = parsedInfo.game_repo
                     env.BASE_BRANCH = parsedInfo.default_branch
 
-                    if (parsedInfo.mr_info) {
+                    if (parsedInfo.mr_info != null && parsedInfo.mr_info.toString() != 'null') {
                         env.REVIEW_BRANCH = parsedInfo.mr_info.branch ?: parsedInfo.issue_key
                     } else {
                         env.REVIEW_BRANCH = parsedInfo.issue_key
