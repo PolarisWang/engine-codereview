@@ -28,6 +28,12 @@ import time
 import urllib.request
 import urllib.error
 
+import shutil
+
+# Resolve git path explicitly (agent may not have it on PATH)
+GIT_PATH = shutil.which("git") or "/usr/bin/git"
+
+
 DEFAULT_REVIEW_INSTRUCTIONS = """
 You are a senior game engine engineer reviewing a merge request.
 Focus on:
@@ -71,33 +77,33 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
 
     if cache and os.path.isdir(repo_dir):
         print(f"[git] Updating cached repo: {repo_name}")
-        run_git(["git", "fetch", "--all"], repo_dir)
-        run_git(["git", "reset", "--hard"], repo_dir)
-        rc, _, _ = run_git(["git", "checkout", branch], repo_dir)
+        run_git([GIT_PATH, "fetch", "--all"], repo_dir)
+        run_git([GIT_PATH, "reset", "--hard"], repo_dir)
+        rc, _, _ = run_git([GIT_PATH, "checkout", branch], repo_dir)
         if rc != 0:
-            rc, _, _ = run_git(["git", "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
+            rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
         if rc != 0:
-            run_git(["git", "checkout", base_branch], repo_dir)
-            run_git(["git", "pull", "origin", base_branch], repo_dir)
-            rc, _, _ = run_git(["git", "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
+            run_git([GIT_PATH, "checkout", base_branch], repo_dir)
+            run_git([GIT_PATH, "pull", "origin", base_branch], repo_dir)
+            rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
     else:
         if os.path.isdir(repo_dir):
             run_git(["rm", "-rf", repo_dir], "/tmp")
         print(f"[git] Cloning repo: {repo_name}")
         rc, out, err = run_git(
-            ["git", "clone", "--branch", branch, "--single-branch", repo_url, repo_dir],
+            [GIT_PATH, "clone", "--branch", branch, "--single-branch", repo_url, repo_dir],
             "/tmp", timeout=300
         )
         if rc != 0:
             # Branch may not exist remotely yet — clone default and checkout
-            run_git(["git", "clone", "--single-branch", repo_url, repo_dir], "/tmp", timeout=300)
-            run_git(["git", "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
+            run_git([GIT_PATH, "clone", "--single-branch", repo_url, repo_dir], "/tmp", timeout=300)
+            run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
 
     # Ensure base_branch ref is available
-    run_git(["git", "fetch", "origin", base_branch], repo_dir)
+    run_git([GIT_PATH, "fetch", "origin", base_branch], repo_dir)
     # Get merge-base for accurate diff
     rc, merge_base, _ = run_git(
-        ["git", "merge-base", branch, f"origin/{base_branch}"], repo_dir
+        [GIT_PATH, "merge-base", branch, f"origin/{base_branch}"], repo_dir
     )
     if rc != 0:
         print("[git] merge-base failed, falling back to origin/base")
@@ -105,28 +111,28 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
 
     # Generate diff
     rc, diff_text, _ = run_git(
-        ["git", "diff", merge_base + "..." + branch, "--", "."], repo_dir
+        [GIT_PATH, "diff", merge_base + "..." + branch, "--", "."], repo_dir
     )
     if not diff_text:
         # Try direct diff
         rc, diff_text, _ = run_git(
-            ["git", "diff", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
+            [GIT_PATH, "diff", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
         )
 
     # Changed files list
     rc, changed_files_str, _ = run_git(
-        ["git", "diff", "--name-status", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
+        [GIT_PATH, "diff", "--name-status", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
     )
     changed_files = [line for line in changed_files_str.split("\n") if line.strip()]
 
     # Stats
     rc, stats_str, _ = run_git(
-        ["git", "diff", "--shortstat", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
+        [GIT_PATH, "diff", "--shortstat", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
     )
 
     # Commit log
     rc, commit_log, _ = run_git(
-        ["git", "log", f"origin/{base_branch}..{branch}", "--oneline", "--no-decorate"], repo_dir
+        [GIT_PATH, "log", f"origin/{base_branch}..{branch}", "--oneline", "--no-decorate"], repo_dir
     )
 
     return {

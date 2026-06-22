@@ -204,7 +204,7 @@ pipeline {
 
                 // Send via webhook
                 if (feishuWebhook) {
-                    message = """✅ Code Review Complete: ${env.ISSUE_KEY}
+                    def msgText = """✅ Code Review Complete: ${env.ISSUE_KEY}
 Project: ${env.PROJECT}
 Jira: ${params.JIRA_URL}
 
@@ -212,10 +212,11 @@ Jira: ${params.JIRA_URL}
 🎮 Game (${gameFiles} files): ${gameSev}
 
 ${BUILD_URL}"""
+                    writeJSON(file: 'feishu_msg.json', json: msgText)
                     sh """
                         python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                             --webhook-url '${feishuWebhook}' \
-                            --message '${message}'
+                            --message-file '${env.WORKSPACE}/feishu_msg.json'
                     """
                 }
 
@@ -242,11 +243,12 @@ ${BUILD_URL}"""
                 if (env.ISSUE_KEY != null && env.ISSUE_KEY != '') {
                     def feishuWebhook = env.FEISHU_WEBHOOK_URL ?: ''
                     if (feishuWebhook) {
-                        message = "❌ Code Review Failed: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
+                        def msgText = "❌ Code Review Failed: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
+                        writeJSON(file: 'feishu_err_msg.json', json: msgText)
                         sh """
                             python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                 --webhook-url '${feishuWebhook}' \
-                                --message '${message}'
+                                --message-file '${env.WORKSPACE}/feishu_err_msg.json'
                         """
                     }
                 }
@@ -254,7 +256,7 @@ ${BUILD_URL}"""
         }
 
         cleanup {
-            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json || true"
+            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json || true"
         }
     }
 }
