@@ -87,16 +87,23 @@ def jira_request(path, host, token):
 
 def extract_issue_key(url):
     """Extract Jira issue key from URL like https://jira.company/browse/EV-123"""
-    m = re.search(r'(?:browse|issues)/([A-Za-z]+-\d+)', url)
+    m = re.search(r'(?:browse|issues)/([A-Za-z][A-Za-z0-9]+-\d+)', url)
     return m.group(1) if m else None
 
 
 def identify_project(issue_key, config):
-    """Map issue key prefix to project config entry."""
+    """Map issue key prefix to project config entry.
+    Matches longest prefix first: e.g. 'CB2N' → checks 'CB2N', then 'CB2', then 'C'.
+    """
     prefix = issue_key.split('-')[0].upper()
-    for proj_id, proj_cfg in config["projects"].items():
-        if proj_cfg["jira_project_key"].upper() == prefix:
-            return proj_id, proj_cfg
+    projects = config.get("projects", {})
+
+    # Try longest prefix match: e.g. CB2N → try CB2N, then CB2, then C
+    for length in range(len(prefix), 0, -1):
+        sub = prefix[:length]
+        for proj_id, proj_cfg in projects.items():
+            if proj_cfg["jira_project_key"].upper() == sub:
+                return proj_id, proj_cfg
     return None, None
 
 
@@ -132,7 +139,7 @@ def guess_branch_from_issue(issue_key, config, host, token):
     OR search for branches via Jira API.
     """
     # Try to fetch issue details — custom fields may hold PR links
-    issue_data = jira_request(f"api/3/issue/{issue_key}", host, token)
+    issue_data = jira_request(f"api/2/issue/{issue_key}?fields=summary,description,status,customfield_*,issuelinks", host, token)
     if not issue_data:
         return None
 

@@ -79,7 +79,7 @@ def main():
     from urllib.parse import quote
     jql_encoded = quote(jql)
     data = jira_get(
-        f"api/3/search?jql={jql_encoded}&maxResults=20&fields=summary,updated,status",
+        f"api/2/search?jql={jql_encoded}&maxResults=20&fields=summary,updated,status",
         args.jira_host, args.jira_token
     )
     if not data or "issues" not in data:
