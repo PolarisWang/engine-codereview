@@ -136,11 +136,20 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
         diff_text = diff_text[:max_diff_chars] + f"\n\n... [truncated, original {len(diff_text)} chars]"
 
     claude_cfg = config.get("claude", {})
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = (os.environ.get("ANTHROPIC_AUTH_TOKEN") or
+               os.environ.get("ANTHROPIC_API_KEY") or "")
     if not api_key:
-        return {"summary": "ANTHROPIC_API_KEY not set", "findings": [], "severity_counts": {}}
+        return {"summary": "ANTHROPIC_AUTH_TOKEN not set", "findings": [], "severity_counts": {}}
 
-    client = anthropic.Anthropic(api_key=api_key)
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", None)
+    model = (os.environ.get("ANTHROPIC_MODEL") or
+             claude_cfg.get("model", "deepseek-v4-flash"))
+
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    client = anthropic.Anthropic(**client_kwargs)
 
     system_prompt = claude_cfg.get("review_instructions", "Review this code diff.")
 
@@ -169,7 +178,7 @@ At the end, provide a summary with count of each severity level."""
 
     try:
         response = client.messages.create(
-            model=claude_cfg.get("model", "claude-sonnet-4-6-20250610"),
+            model=model,
             max_tokens=claude_cfg.get("max_tokens", 8192),
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],

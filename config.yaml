@@ -47,7 +47,7 @@ workspace:
 # Claude API settings
 # ============================================================
 claude:
-  model: claude-sonnet-4-6-20250610
+  model: deepseek-v4-flash
   max_tokens: 8192
   review_instructions: |
     You are a senior game engine engineer reviewing a merge request.

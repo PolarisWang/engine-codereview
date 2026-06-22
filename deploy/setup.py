@@ -98,7 +98,7 @@ def cmd_check():
 
     # Jenkins
     checks.append(("JENKINS_URL set", bool(os.environ.get("JENKINS_URL"))))
-    checks.append(("ANTHROPIC_API_KEY set", bool(os.environ.get("ANTHROPIC_API_KEY"))))
+    checks.append(("ANTHROPIC_AUTH_TOKEN set", bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))))
 
     print("=== Environment Check ===")
     all_ok = True

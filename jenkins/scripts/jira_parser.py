@@ -31,16 +31,27 @@ def load_config():
 
 
 def jira_request(path, host, token):
-    """Make an authenticated Jira API request."""
+    """Make an authenticated Jira API request.
+    Tries Bearer first, then Basic auth if Bearer fails.
+    """
     url = f"{host.rstrip('/')}/rest/{path}"
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Accept", "application/json")
+    headers = {"Accept": "application/json"}
+
+    # Try 1: Bearer token (PAT)
+    req = urllib.request.Request(url, headers={**headers, "Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        # Fallback: try basic auth with email:token
+        if e.code not in (401, 403):
+            return None
+
+    # Try 2: Basic auth (in case token is pre-encoded base64 of user:apitoken)
+    req = urllib.request.Request(url, headers={**headers, "Authorization": f"Basic {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
         return None
     except Exception as e:
         return None
