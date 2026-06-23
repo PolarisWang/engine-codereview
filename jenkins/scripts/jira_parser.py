@@ -133,6 +133,28 @@ def get_dev_info(issue_key, host, token):
     return result
 
 
+def get_remote_links(issue_key, host, token):
+    """Get remote links (GitLab MR links etc) from Jira issue."""
+    path = f"api/2/issue/{issue_key}/remotelink"
+    data = jira_request(path, host, token)
+    if not data:
+        return []
+
+    result = []
+    for link in data:
+        obj = link.get("object", {})
+        url = obj.get("url", "")
+        title = obj.get("title", "")
+        if url and ("merge request" in title.lower() or "mr" in title.lower()):
+            result.append({
+                "title": title,
+                "url": url,
+                "branch": "",
+                "target_branch": "",
+            })
+    return result
+
+
 def guess_branch_from_issue(issue_key, config, host, token):
     """
     Fallback: try to get the issue summary and guess branch name,
@@ -185,6 +207,7 @@ def main():
         "game_repo": project_cfg["game_repo"],
         "default_branch": project_cfg["default_branch"],
         "mr_info": None,
+        "mr_links": [],
         "issue_info": None,
     }
 
@@ -204,8 +227,27 @@ def main():
                 "target_branch": project_cfg["default_branch"],
             }
 
+        # Step 3b: Try remote links for GitLab MR info
+        if not result.get("mr_info"):
+            remote_links = get_remote_links(issue_key, args.jira_host, args.jira_token)
+            if remote_links:
+                result["mr_links"] = remote_links
+                # Try to extract branch from MR URL or title
+                for link in remote_links:
+                    title = link.get("title", "")
+                    url = link.get("url", "")
+                    # Extract branch from title: "Merge request - Feature CB2N-25256: desc"
+                    branch = ""
+                    if "Feature " in title or "feature " in title.lower():
+                        parts = title.split("Feature ", 1)
+                        if len(parts) > 1:
+                            branch_part = parts[1].split(":")[0].split(" ")[0].strip()
+                            branch = branch_part
+                    link["branch"] = branch
+                    link["target_branch"] = project_cfg["default_branch"]
+
     # Step 4: Fallback — fetch issue details
-    if args.jira_host and args.jira_token and not result.get("mr_info"):
+    if args.jira_host and args.jira_token and not result.get("mr_info") and not result.get("mr_links"):
         issue_data = guess_branch_from_issue(issue_key, config, args.jira_host, args.jira_token)
         if issue_data:
             result["issue_info"] = issue_data

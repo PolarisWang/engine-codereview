@@ -72,7 +72,35 @@ def send_webhook(webhook_url, content):
     return resp
 
 
-def send_card_message(token, chat_id, card):
+def send_text_message(token, chat_id, text):
+    """Send a plain text message to a chat."""
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "receive_id": chat_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}),
+    }
+    resp = _request("POST", url, data, headers)
+    return resp
+
+
+def reply_in_thread(token, chat_id, parent_message_id, text):
+    """Reply to a message thread with text."""
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{parent_message_id}/reply"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "msg_type": "text",
+        "content": json.dumps({"text": text}),
+    }
+    resp = _request("POST", url, data, headers)
+    return resp
     """Send an interactive card message to a chat."""
     url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
     headers = {
@@ -189,6 +217,44 @@ def cmd_send_card(args):
         sys.exit(1)
 
 
+def cmd_send_message(args):
+    """Send a plain text message (topic starter)."""
+    token = get_tenant_token(args.app_id, args.app_secret)
+    if not token:
+        sys.exit(1)
+    if args.message_file:
+        with open(args.message_file) as f:
+            text = json.load(f)
+    else:
+        text = args.message
+    resp = send_text_message(token, args.chat_id, text)
+    if resp and resp.get("code") == 0:
+        msg_id = resp.get("data", {}).get("message_id", "")
+        print(json.dumps({"message_id": msg_id, "status": "sent"}))
+    else:
+        print(json.dumps({"error": resp}))
+        sys.exit(1)
+
+
+def cmd_reply_message(args):
+    """Reply in an existing message thread."""
+    token = get_tenant_token(args.app_id, args.app_secret)
+    if not token:
+        sys.exit(1)
+    if args.message_file:
+        with open(args.message_file) as f:
+            text = json.load(f)
+    else:
+        text = args.message
+    resp = reply_in_thread(token, args.chat_id, args.message_id, text)
+    if resp and resp.get("code") == 0:
+        msg_id = resp.get("data", {}).get("message_id", "")
+        print(json.dumps({"message_id": msg_id, "status": "replied"}))
+    else:
+        print(json.dumps({"error": resp}))
+        sys.exit(1)
+
+
 def cmd_update_card(args):
     """Update card with review results."""
     token = get_tenant_token(args.app_id, args.app_secret)
@@ -223,6 +289,23 @@ def main():
     p.add_argument("--issue-key", required=True)
     p.add_argument("--project", required=True)
 
+    # ── send-message (topic starter) ──
+    p = sub.add_parser("send-message", help="Send plain text topic starter message")
+    p.add_argument("--app-id", required=True)
+    p.add_argument("--app-secret", required=True)
+    p.add_argument("--chat-id", required=True)
+    p.add_argument("--message", help="Message text")
+    p.add_argument("--message-file", help="Read message text from JSON file")
+
+    # ── reply-message (reply in topic) ──
+    p = sub.add_parser("reply-message", help="Reply in an existing message thread")
+    p.add_argument("--app-id", required=True)
+    p.add_argument("--app-secret", required=True)
+    p.add_argument("--chat-id", required=True)
+    p.add_argument("--message-id", required=True)
+    p.add_argument("--message", help="Reply text")
+    p.add_argument("--message-file", help="Read reply text from JSON file")
+
     # ── update-card ──
     p = sub.add_parser("update-card", help="Update card with results")
     p.add_argument("--app-id", required=True)
@@ -239,6 +322,12 @@ def main():
     if args.command == "webhook":
         cmd_webhook(args)
     elif args.command == "send-card":
+        cmd_send_card(args)
+    elif args.command == "send-message":
+        cmd_send_message(args)
+    elif args.command == "reply-message":
+        cmd_reply_message(args)
+    elif args.command == "update-card":
         cmd_send_card(args)
     elif args.command == "update-card":
         cmd_update_card(args)

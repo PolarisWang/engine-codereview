@@ -36,15 +36,40 @@ GIT_PATH = shutil.which("git") or "/usr/bin/git"
 
 DEFAULT_REVIEW_INSTRUCTIONS = """
 You are a senior game engine engineer reviewing a merge request.
-Focus on:
-1. Logic correctness and potential bugs
-2. Performance issues
-3. Code style and maintainability
-4. Security concerns
-5. Missing edge case handling
 
-Rate each finding as: 🔴 Critical, 🟡 Warning, ℹ️ Suggestion
-Summarize at the end with a count of each severity level.
+## Review Focus Areas
+1. Logic correctness and potential bugs (race conditions, null pointers, type errors)
+2. Memory safety and resource management (leaks, dangling pointers, ownership)
+3. Concurrency and thread safety (shared state, locks, data races)
+4. Performance issues (unnecessary allocations, hot path optimization, algorithm complexity)
+5. API design and interfaces (consistency, backward compatibility, encapsulation)
+6. Error handling and edge cases (unhandled errors, invalid inputs, boundary conditions)
+7. Code style and maintainability (readability, naming, complexity, duplication)
+8. Security concerns (input validation, privilege escalation, data exposure)
+9. Testing coverage (missing tests, untestable code, testability)
+10. Logging and observability (useful error messages, debugability)
+
+## Output Format
+Group findings by severity level. For each finding, use this exact format:
+- **Severity**: 🔴 Critical / 🟡 Warning / ℹ️ Suggestion
+- **File**: path/to/file
+- **Issue**: what the problem is
+- **Suggestion**: how to fix it
+
+Number findings sequentially and continuously across ALL severity groups (e.g., if there are 3 critical items and 2 warnings, the last warning should be #5).
+
+## Summary
+At the very end, provide a summary table:
+
+## Summary
+| Severity | Count |
+|----------|-------|
+| 🔴 Critical | X |
+| 🟡 Warning | X |
+| ℹ️ Suggestion | X |
+| **Total** | **X** |
+
+IMPORTANT: The number of findings listed under each severity level MUST exactly match the count in the summary table. The Total MUST equal the sum of the three counts.
 """
 
 
@@ -243,9 +268,17 @@ At the end, provide a summary with count of each severity level."""
     except Exception:
         review_text = json.dumps(result)
 
-    critical = review_text.count("🔴")
-    warning = review_text.count("🟡")
-    suggestion = review_text.count("ℹ️")
+    # Count findings by severity heading patterns (more accurate than emoji count)
+    import re
+    critical = len(re.findall(r'🔴\s*(?:Critical|关键)', review_text))
+    warning = len(re.findall(r'🟡\s*(?:Warning|警告)', review_text))
+    suggestion = len(re.findall(r'ℹ️?\s*(?:Suggestion|建议)', review_text))
+
+    # Fallback to emoji counting if pattern didn't match
+    if critical == 0 and warning == 0 and suggestion == 0:
+        critical = review_text.count("🔴")
+        warning = review_text.count("🟡")
+        suggestion = review_text.count("ℹ️")
 
     return {
         "summary": "",
