@@ -29,6 +29,7 @@ import urllib.request
 import urllib.error
 
 import shutil
+import re
 
 # Resolve git path explicitly (agent may not have it on PATH)
 GIT_PATH = shutil.which("git") or "/usr/bin/git"
@@ -92,6 +93,16 @@ def run_git(cmd, cwd, timeout=120):
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
+def ssh_to_https(repo_url):
+    """Convert git@ SSH URL to HTTPS URL."""
+    if repo_url.startswith("git@"):
+        # git@host:path/repo.git → https://host/path/repo.git
+        m = re.match(r'git@([^:]+):(.+)', repo_url)
+        if m:
+            return f"https://{m.group(1)}/{m.group(2)}"
+    return repo_url
+
+
 def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True):
     """
     Clone (or fetch) repo, checkout branch, return path and diff info.
@@ -99,6 +110,15 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
     """
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     repo_dir = os.path.join(workspace, repo_name)
+
+    # Check if ssh is available; if not, convert to HTTPS
+    ssh_path = shutil.which("ssh")
+    if not ssh_path:
+        https_url = ssh_to_https(repo_url)
+        print(f"[git] ssh not found, using HTTPS: {https_url}", flush=True)
+        # Use GIT_SSH_COMMAND env to make git use the correct path
+        os.environ.setdefault("GIT_SSH_COMMAND", "/usr/bin/ssh -o StrictHostKeyChecking=no")
+        repo_url = https_url
 
     if cache and os.path.isdir(repo_dir):
         print(f"[git] Updating cached repo: {repo_name}")
@@ -283,7 +303,6 @@ At the end, provide a summary with count of each severity level."""
         review_text = json.dumps(result)
 
     # Count findings by severity heading patterns (more accurate than emoji count)
-    import re
     critical = len(re.findall(r'🔴\s*(?:Critical|关键)', review_text))
     warning = len(re.findall(r'🟡\s*(?:Warning|警告)', review_text))
     suggestion = len(re.findall(r'ℹ️?\s*(?:Suggestion|建议)', review_text))
