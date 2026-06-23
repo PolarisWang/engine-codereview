@@ -208,6 +208,7 @@ def main():
         "default_branch": project_cfg["default_branch"],
         "mr_info": None,
         "mr_links": [],
+        "mr_url": "",
         "issue_info": None,
     }
 
@@ -232,6 +233,9 @@ def main():
             remote_links = get_remote_links(issue_key, args.jira_host, args.jira_token)
             if remote_links:
                 result["mr_links"] = remote_links
+                # Use the first MR URL
+                if remote_links:
+                    result["mr_url"] = remote_links[0].get("url", "")
                 # Try to extract branch from MR URL or title
                 for link in remote_links:
                     title = link.get("title", "")

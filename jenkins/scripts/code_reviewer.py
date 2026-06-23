@@ -304,6 +304,7 @@ def main():
     parser.add_argument("--workspace", default="/tmp/codereview-workspace",
                         help="Workspace directory")
     parser.add_argument("--output", help="Write result JSON to file")
+    parser.add_argument("--mr-url", default="", help="Merge request URL")
     args = parser.parse_args()
 
     config = load_config()
@@ -326,6 +327,7 @@ def main():
             "repo_type": args.repo_type,
             "branch": args.branch,
             "base_branch": args.base_branch,
+            "mr_url": args.mr_url or "",
             "changed_files": diff_info["changed_files"],
             "stats": diff_info["stats"],
             "review": {
@@ -346,6 +348,7 @@ def main():
             "repo_type": args.repo_type,
             "branch": args.branch,
             "base_branch": args.base_branch,
+            "mr_url": args.mr_url or "",
             "changed_files": diff_info["changed_files"],
             "stats": diff_info["stats"],
             "commits": diff_info["commit_log"],
