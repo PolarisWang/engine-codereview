@@ -71,9 +71,9 @@ def main():
         except Exception:
             reviewed = set()
 
-    # ── JQL: issues updated in last 2 hours, in our projects, not closed ──
+    # ── JQL: issues updated in last 30min, in our projects, not closed ──
     jql = (f"project IN ({','.join(project_keys)}) "
-           f"AND updated >= -2h "
+           f"AND updated >= -30m "
            f"AND status NOT IN (Done, Closed, Resolved) "
            f"ORDER BY updated DESC")
     from urllib.parse import quote
