@@ -34,6 +34,8 @@ pipeline {
         ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
         GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
         REVIEWED_STATE_FILE = "/tmp/codereview-reviewed.json"   // Persist across runs
+        // Code review uses its own webhook; don't inherit from global
+        FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: 'https://open.feishu.cn/open-apis/bot/v2/hook/f2ec1781-06d2-42c8-91b4-37616d973970'}"
     }
 
     stages {
