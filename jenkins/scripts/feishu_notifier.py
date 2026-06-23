@@ -194,7 +194,11 @@ def cmd_webhook(args):
     """Send message via webhook."""
     if args.message_file:
         with open(args.message_file) as f:
-            content = json.load(f)
+            raw = f.read()
+        try:
+            content = json.loads(raw)
+        except json.JSONDecodeError:
+            content = raw
     else:
         content = args.message
     resp = send_webhook(args.webhook_url, content)

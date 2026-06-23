@@ -85,7 +85,7 @@ def load_config():
     }
 
 
-def run_git(cmd, cwd, timeout=120):
+def run_git(cmd, cwd, timeout=180):
     """Run a git command, return (returncode, stdout, stderr)."""
     result = subprocess.run(
         cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout
@@ -143,17 +143,15 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         print(f"[git] Cloning repo: {repo_name}")
         rc, out, err = run_git(
             [GIT_PATH, "clone", "--branch", branch, "--single-branch", repo_url, repo_dir],
-            "/tmp", timeout=300
+            "/tmp", timeout=600
         )
         if rc != 0:
             print(f"[git] Clone failed for '{branch}': {err[:300]}", flush=True)
             # Branch may not exist remotely — clone default branch
             rc, out, err = run_git(
                 [GIT_PATH, "clone", "--single-branch", repo_url, repo_dir],
-                "/tmp", timeout=300
+                "/tmp", timeout=600
             )
-            if rc != 0:
-                print(f"[git] Fallback clone also failed: {err[:300]}", flush=True)
             if os.path.isdir(repo_dir):
                 run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir, timeout=30)
 
