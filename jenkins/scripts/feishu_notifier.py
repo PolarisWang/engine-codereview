@@ -42,6 +42,7 @@ def _request(method, url, data=None, headers=None):
     """HTTP request helper."""
     if headers is None:
         headers = {}
+    headers.setdefault("Content-Type", "application/json")
     body = json.dumps(data).encode("utf-8") if data else None
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
