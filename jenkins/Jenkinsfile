@@ -23,6 +23,8 @@ pipeline {
     parameters {
         string(name: 'JIRA_URL', defaultValue: '',
                description: 'Jira issue URL (leave empty for auto-scan mode)')
+        string(name: 'FEISHU_REPLY_MSG_ID', defaultValue: '',
+               description: 'Feishu message ID to reply in (leave empty for new topic)')
     }
 
     environment {
@@ -42,7 +44,7 @@ pipeline {
         // Fallback webhook
         FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: 'https://open.feishu.cn/open-apis/bot/v2/hook/f2ec1781-06d2-42c8-91b4-37616d973970'}"
         // Persist topic message_id across stages
-        FEISHU_TOPIC_MSG_ID = ""
+        FEISHU_TOPIC_MSG_ID = "${params.FEISHU_REPLY_MSG_ID ?: ''}"
     }
 
     stages {
@@ -243,69 +245,128 @@ pipeline {
                 }
                 def topicText = topicParts.join('\n')
 
-                // Send topic message via Bot API
                 def feishuAppId = env.FEISHU_APP_ID ?: ''
                 def feishuAppSecret = env.FEISHU_APP_SECRET ?: ''
                 def feishuChatId = env.FEISHU_CHAT_ID ?: ''
-                def topicMsgId = ''
+                def topicMsgId = env.FEISHU_TOPIC_MSG_ID ?: ''
 
                 if (feishuAppId && feishuAppSecret && feishuChatId) {
                     try {
-                        writeJSON(file: 'feishu_topic_msg.json', json: topicText)
-                        def topicResult = sh(
-                            script: """
-                                python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
-                                    --app-id '${feishuAppId}' \
-                                    --app-secret '${feishuAppSecret}' \
-                                    --chat-id '${feishuChatId}' \
-                                    --message-file '${env.WORKSPACE}/feishu_topic_msg.json'
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        def topicJson = readJSON(text: topicResult)
-                        topicMsgId = topicJson.message_id ?: ''
-                        echo "Topic message sent: ${topicMsgId}"
-
-                        // Reply with engine review details if available
-                        if (engineResult.review?.review_text && topicMsgId) {
-                            def engineDetail = engineResult.review.review_text
-                            def maxLen = 3000
-                            if (engineDetail.length() > maxLen) {
-                                engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
-                            }
-                            writeJSON(file: 'feishu_engine_reply.json', json: "**Engine 详细报告:**\n${engineDetail}")
+                        if (topicMsgId) {
+                            // ── Reply in existing topic (from FEISHU_REPLY_MSG_ID) ──
+                            // 1) Send "Reviewing..." progress reply
+                            def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
+                            writeJSON(file: 'feishu_progress.json', json: progressText)
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
                                     --message-id '${topicMsgId}' \
-                                    --message-file '${env.WORKSPACE}/feishu_engine_reply.json'
+                                    --message-file '${env.WORKSPACE}/feishu_progress.json'
                             """
-                        }
 
-                        // Reply with game review details if available
-                        if (gameResult.review?.review_text && topicMsgId) {
-                            def gameDetail = gameResult.review.review_text
-                            def maxLen = 3000
-                            if (gameDetail.length() > maxLen) {
-                                gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
-                            }
-                            writeJSON(file: 'feishu_game_reply.json', json: "**Game 详细报告:**\n${gameDetail}")
+                            // 2) Reply with summary
+                            writeJSON(file: 'feishu_summary_reply.json', json: topicText)
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
                                     --message-id '${topicMsgId}' \
-                                    --message-file '${env.WORKSPACE}/feishu_game_reply.json'
+                                    --message-file '${env.WORKSPACE}/feishu_summary_reply.json'
                             """
-                        }
 
-                        env.FEISHU_TOPIC_MSG_ID = topicMsgId
+                            // 3) Reply with engine review details
+                            if (engineResult.review?.review_text) {
+                                def engineDetail = engineResult.review.review_text
+                                def maxLen = 3000
+                                if (engineDetail.length() > maxLen) {
+                                    engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
+                                }
+                                writeJSON(file: 'feishu_engine_reply.json', json: "**🔧 Engine 详细报告:**\n${engineDetail}")
+                                sh """
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${feishuAppId}' \
+                                        --app-secret '${feishuAppSecret}' \
+                                        --chat-id '${feishuChatId}' \
+                                        --message-id '${topicMsgId}' \
+                                        --message-file '${env.WORKSPACE}/feishu_engine_reply.json'
+                                """
+                            }
+
+                            // 4) Reply with game review details
+                            if (gameResult.review?.review_text) {
+                                def gameDetail = gameResult.review.review_text
+                                def maxLen = 3000
+                                if (gameDetail.length() > maxLen) {
+                                    gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
+                                }
+                                writeJSON(file: 'feishu_game_reply.json', json: "**🎮 Game 详细报告:**\n${gameDetail}")
+                                sh """
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${feishuAppId}' \
+                                        --app-secret '${feishuAppSecret}' \
+                                        --chat-id '${feishuChatId}' \
+                                        --message-id '${topicMsgId}' \
+                                        --message-file '${env.WORKSPACE}/feishu_game_reply.json'
+                                """
+                            }
+                        } else {
+                            // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
+                            writeJSON(file: 'feishu_topic_msg.json', json: topicText)
+                            def topicResult = sh(
+                                script: """
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
+                                        --app-id '${feishuAppId}' \
+                                        --app-secret '${feishuAppSecret}' \
+                                        --chat-id '${feishuChatId}' \
+                                        --message-file '${env.WORKSPACE}/feishu_topic_msg.json'
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            def topicJson = readJSON(text: topicResult)
+                            topicMsgId = topicJson.message_id ?: ''
+                            echo "Topic message sent: ${topicMsgId}"
+
+                            if (engineResult.review?.review_text && topicMsgId) {
+                                def engineDetail = engineResult.review.review_text
+                                def maxLen = 3000
+                                if (engineDetail.length() > maxLen) {
+                                    engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
+                                }
+                                writeJSON(file: 'feishu_engine_reply.json', json: "**🔧 Engine 详细报告:**\n${engineDetail}")
+                                sh """
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${feishuAppId}' \
+                                        --app-secret '${feishuAppSecret}' \
+                                        --chat-id '${feishuChatId}' \
+                                        --message-id '${topicMsgId}' \
+                                        --message-file '${env.WORKSPACE}/feishu_engine_reply.json'
+                                """
+                            }
+
+                            if (gameResult.review?.review_text && topicMsgId) {
+                                def gameDetail = gameResult.review.review_text
+                                def maxLen = 3000
+                                if (gameDetail.length() > maxLen) {
+                                    gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
+                                }
+                                writeJSON(file: 'feishu_game_reply.json', json: "**🎮 Game 详细报告:**\n${gameDetail}")
+                                sh """
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${feishuAppId}' \
+                                        --app-secret '${feishuAppSecret}' \
+                                        --chat-id '${feishuChatId}' \
+                                        --message-id '${topicMsgId}' \
+                                        --message-file '${env.WORKSPACE}/feishu_game_reply.json'
+                                """
+                            }
+
+                            env.FEISHU_TOPIC_MSG_ID = topicMsgId
+                        }
                     } catch (Exception e) {
                         echo "Bot API notification failed, falling back to webhook: ${e}"
-                        // Fallback to webhook
                         if (env.FEISHU_WEBHOOK_URL) {
                             writeJSON(file: 'feishu_msg.json', json: topicText)
                             sh """
@@ -316,7 +377,6 @@ pipeline {
                         }
                     }
                 } else if (env.FEISHU_WEBHOOK_URL) {
-                    // Webhook-only fallback
                     writeJSON(file: 'feishu_msg.json', json: topicText)
                     sh """
                         python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
@@ -346,7 +406,6 @@ pipeline {
         failure {
             script {
                 if (env.ISSUE_KEY != null && env.ISSUE_KEY != '') {
-                    // Try to reply in existing topic thread
                     def topicMsgId = env.FEISHU_TOPIC_MSG_ID ?: ''
                     def feishuAppId = env.FEISHU_APP_ID ?: ''
                     def feishuAppSecret = env.FEISHU_APP_SECRET ?: ''
@@ -376,7 +435,7 @@ pipeline {
         }
 
         cleanup {
-            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json || true"
+            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json || true"
         }
     }
 }
