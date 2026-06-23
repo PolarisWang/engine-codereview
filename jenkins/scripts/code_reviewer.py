@@ -120,9 +120,23 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
             "/tmp", timeout=300
         )
         if rc != 0:
-            # Branch may not exist remotely yet — clone default and checkout
-            run_git([GIT_PATH, "clone", "--single-branch", repo_url, repo_dir], "/tmp", timeout=300)
-            run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
+            print(f"[git] Clone failed for '{branch}': {err[:300]}", flush=True)
+            # Branch may not exist remotely — clone default branch
+            rc, out, err = run_git(
+                [GIT_PATH, "clone", "--single-branch", repo_url, repo_dir],
+                "/tmp", timeout=300
+            )
+            if rc != 0:
+                print(f"[git] Fallback clone also failed: {err[:300]}", flush=True)
+                # Try with SSH option to skip host key check
+                env = os.environ.copy()
+                env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=no"
+                subprocess.run(
+                    [GIT_PATH, "clone", "--single-branch", repo_url, repo_dir],
+                    capture_output=True, text=True, cwd="/tmp", timeout=300, env=env
+                )
+            if os.path.isdir(repo_dir):
+                run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir, timeout=30)
 
     # Ensure base_branch ref is available
     run_git([GIT_PATH, "fetch", "origin", base_branch], repo_dir)

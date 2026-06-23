@@ -256,7 +256,7 @@ pipeline {
                             // ── Reply in existing topic (from FEISHU_REPLY_MSG_ID) ──
                             // 1) Send "Reviewing..." progress reply
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
-                            writeJSON(file: 'feishu_progress.json', json: progressText)
+                            writeFile(file: 'feishu_progress.json', text: progressText)
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
@@ -267,7 +267,7 @@ pipeline {
                             """
 
                             // 2) Reply with summary
-                            writeJSON(file: 'feishu_summary_reply.json', json: topicText)
+                            writeFile(file: 'feishu_summary_reply.json', text: topicText)
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
@@ -284,7 +284,7 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeJSON(file: 'feishu_engine_reply.json', json: "**🔧 Engine 详细报告:**\n${engineDetail}")
+                                writeFile(file: 'feishu_engine_reply.json', text: "**🔧 Engine 详细报告:**\n${engineDetail}")
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -302,7 +302,7 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeJSON(file: 'feishu_game_reply.json', json: "**🎮 Game 详细报告:**\n${gameDetail}")
+                                writeFile(file: 'feishu_game_reply.json', text: "**🎮 Game 详细报告:**\n${gameDetail}")
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -314,7 +314,7 @@ pipeline {
                             }
                         } else {
                             // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
-                            writeJSON(file: 'feishu_topic_msg.json', json: topicText)
+                            writeFile(file: 'feishu_topic_msg.json', text: topicText)
                             def topicResult = sh(
                                 script: """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
@@ -335,7 +335,7 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeJSON(file: 'feishu_engine_reply.json', json: "**🔧 Engine 详细报告:**\n${engineDetail}")
+                                writeFile(file: 'feishu_engine_reply.json', text: "**🔧 Engine 详细报告:**\n${engineDetail}")
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -352,7 +352,7 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeJSON(file: 'feishu_game_reply.json', json: "**🎮 Game 详细报告:**\n${gameDetail}")
+                                writeFile(file: 'feishu_game_reply.json', text: "**🎮 Game 详细报告:**\n${gameDetail}")
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -368,7 +368,7 @@ pipeline {
                     } catch (Exception e) {
                         echo "Bot API notification failed, falling back to webhook: ${e}"
                         if (env.FEISHU_WEBHOOK_URL) {
-                            writeJSON(file: 'feishu_msg.json', json: topicText)
+                            writeFile(file: 'feishu_msg.json', text: topicText)
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                     --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
@@ -377,7 +377,7 @@ pipeline {
                         }
                     }
                 } else if (env.FEISHU_WEBHOOK_URL) {
-                    writeJSON(file: 'feishu_msg.json', json: topicText)
+                    writeFile(file: 'feishu_msg.json', text: topicText)
                     sh """
                         python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                             --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
@@ -412,7 +412,7 @@ pipeline {
 
                     if (topicMsgId && feishuAppId && feishuAppSecret) {
                         def errText = "❌ **Code Review Failed**: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
-                        writeJSON(file: 'feishu_err_reply.json', json: errText)
+                        writeFile(file: 'feishu_err_reply.json', text: errText)
                         sh """
                             python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                 --app-id '${feishuAppId}' \
@@ -423,7 +423,7 @@ pipeline {
                         """
                     } else if (env.FEISHU_WEBHOOK_URL) {
                         def msgText = "❌ Code Review Failed: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
-                        writeJSON(file: 'feishu_err_msg.json', json: msgText)
+                        writeFile(file: 'feishu_err_msg.json', text: msgText)
                         sh """
                             python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                 --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
