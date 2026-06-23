@@ -158,7 +158,12 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
                 run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir, timeout=30)
 
     # Ensure base_branch ref is available
-    run_git([GIT_PATH, "fetch", "origin", base_branch], repo_dir)
+    # Handle branch names containing "/" (e.g., "rage/master") by using explicit refspec
+    if "/" in base_branch:
+        fetch_ref = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"
+        run_git([GIT_PATH, "fetch", "origin", fetch_ref], repo_dir)
+    else:
+        run_git([GIT_PATH, "fetch", "origin", base_branch], repo_dir)
     # Get merge-base for accurate diff
     rc, merge_base, _ = run_git(
         [GIT_PATH, "merge-base", branch, f"origin/{base_branch}"], repo_dir

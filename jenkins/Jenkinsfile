@@ -37,6 +37,10 @@ pipeline {
         GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
         REVIEWED_STATE_FILE = "/tmp/codereview-reviewed.json"   // Persist across runs
 
+        // GitLab token for HTTPS clone + MR branch detection
+        GITLAB_TOKEN = "${env.GITLAB_TOKEN ?: ''}"
+        GITLAB_USER = "gitlab-ci-token"
+
         // Feishu Bot API (for topic messages)
         FEISHU_APP_ID = "${env.FEISHU_APP_ID ?: ''}"
         FEISHU_APP_SECRET = "${env.FEISHU_APP_SECRET ?: ''}"
@@ -89,6 +93,7 @@ pipeline {
                             --jira-url '${params.JIRA_URL}' \
                             --jira-host '${env.JIRA_HOST}' \
                             --jira-token '${env.JIRA_TOKEN}' \
+                            --gitlab-token '${env.GITLAB_TOKEN}' \
                             > ${PARSED_INFO_FILE}
                     """
                     parsedInfo = readJSON(file: PARSED_INFO_FILE)
@@ -102,18 +107,36 @@ pipeline {
                     env.ENGINE_REPO = parsedInfo.engine_repo
                     env.GAME_REPO   = parsedInfo.game_repo
                     env.BASE_BRANCH = parsedInfo.default_branch
+                    env.ENGINE_BASE_BRANCH = parsedInfo.containsKey('engine_default_branch') ? parsedInfo.engine_default_branch : parsedInfo.default_branch
                     env.MR_URL      = parsedInfo.mr_url ?: ''
 
                     if (parsedInfo.mr_info != null && parsedInfo.mr_info.toString() != 'null') {
                         env.REVIEW_BRANCH = parsedInfo.mr_info.branch ?: parsedInfo.issue_key
+                        // Use MR target_branch as base if available
+                        if (parsedInfo.mr_info.target_branch) {
+                            env.BASE_BRANCH = parsedInfo.mr_info.target_branch
+                            env.ENGINE_BASE_BRANCH = parsedInfo.mr_info.target_branch
+                        }
                     } else {
                         env.REVIEW_BRANCH = parsedInfo.issue_key
+                    }
+
+                    // Game MR info if provided
+                    env.GAME_MR_URL = parsedInfo.containsKey('game_mr_url') ? (parsedInfo.game_mr_url ?: '') : ''
+                    if (parsedInfo.containsKey('game_mr_info') && parsedInfo.game_mr_info != null && parsedInfo.game_mr_info.toString() != 'null') {
+                        env.GAME_MR_BRANCH = parsedInfo.game_mr_info.branch ?: ''
+                        env.GAME_BASE_BRANCH = parsedInfo.game_mr_info.target_branch ?: env.BASE_BRANCH
+                    } else {
+                        env.GAME_MR_BRANCH = ''
+                        env.GAME_BASE_BRANCH = env.BASE_BRANCH
                     }
 
                     echo "Parsed: ${env.ISSUE_KEY} → ${env.PROJECT}"
                     echo "Engine: ${env.ENGINE_REPO}"
                     echo "Game:   ${env.GAME_REPO}"
                     echo "Branch: ${env.REVIEW_BRANCH} → ${env.BASE_BRANCH}"
+                    echo "Engine base: ${env.ENGINE_BASE_BRANCH}"
+                    echo "Game base: ${env.GAME_BASE_BRANCH}"
                 }
             }
         }
@@ -127,15 +150,18 @@ pipeline {
                 stage('Engine Repo') {
                     steps {
                         script {
+                            def engineBranch = env.REVIEW_BRANCH
+                            def engineBase = env.ENGINE_BASE_BRANCH
+                            def engineMrUrl = env.MR_URL
                             sh """
                                 python3 ${SCRIPTS_DIR}/code_reviewer.py \
                                     --repo '${env.ENGINE_REPO}' \
-                                    --branch '${env.REVIEW_BRANCH}' \
-                                    --base-branch '${env.BASE_BRANCH}' \
+                                    --branch '${engineBranch}' \
+                                    --base-branch '${engineBase}' \
                                     --project '${env.PROJECT}' \
                                     --issue-key '${env.ISSUE_KEY}' \
                                     --repo-type 'engine' \
-                                    --mr-url '${env.MR_URL}' \
+                                    --mr-url '${engineMrUrl}' \
                                     --workspace '${REVIEW_WORKSPACE}' \
                                     --output '${ENGINE_RESULT_FILE}'
                             """
@@ -156,15 +182,18 @@ pipeline {
                 stage('Game Repo') {
                     steps {
                         script {
+                            def gameBranch = env.GAME_MR_BRANCH ?: env.REVIEW_BRANCH
+                            def gameBase = env.GAME_BASE_BRANCH ?: env.BASE_BRANCH
+                            def gameMrUrl = env.GAME_MR_URL ?: env.MR_URL
                             sh """
                                 python3 ${SCRIPTS_DIR}/code_reviewer.py \
                                     --repo '${env.GAME_REPO}' \
-                                    --branch '${env.REVIEW_BRANCH}' \
-                                    --base-branch '${env.BASE_BRANCH}' \
+                                    --branch '${gameBranch}' \
+                                    --base-branch '${gameBase}' \
                                     --project '${env.PROJECT}' \
                                     --issue-key '${env.ISSUE_KEY}' \
                                     --repo-type 'game' \
-                                    --mr-url '${env.MR_URL}' \
+                                    --mr-url '${gameMrUrl}' \
                                     --workspace '${REVIEW_WORKSPACE}' \
                                     --output '${GAME_RESULT_FILE}'
                             """

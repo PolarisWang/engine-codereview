@@ -16,6 +16,7 @@ import re
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 # ── Built-in project config (no external file dependency) ────────────────────
@@ -26,28 +27,30 @@ PROJECT_CONFIG = {
         "name": "EngineVerse",
         "engine_repo": "git@gitlab.booming-inc.com:booming/dev/chaos.git",
         "game_repo": "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git",
-        "default_branch": "main",
+        "default_branch": "dev",
     },
     "CB2": {
         "jira_project_key": "CB2",
         "name": "CB2",
         "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/chaos-cb-2.git",
         "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/conquerors-blade-2.git",
-        "default_branch": "main",
+        "default_branch": "master",
     },
     "Mars": {
         "jira_project_key": "MARS",
         "name": "Mars",
         "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/mars/chaos-mars.git",
         "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/mars/mars.git",
-        "default_branch": "main",
+        "default_branch": "master",
     },
     "Rage": {
         "jira_project_key": "RAGE",
         "name": "Rage",
         "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git",
         "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git",
-        "default_branch": "main",
+        # Engine uses rage/master, game uses master — will be set per-repo below
+        "default_branch": "master",
+        "engine_default_branch": "rage/master",
     },
 }
 
@@ -83,6 +86,51 @@ def jira_request(path, host, token):
         return None
     except Exception as e:
         return None
+
+
+def gitlab_api_get(path, token):
+    """Make a GitLab API GET request."""
+    url = f"https://gitlab.booming-inc.com/api/v4/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"[gitlab] API error {e.code} for {url[:80]}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[gitlab] Request error: {e}", file=sys.stderr)
+        return None
+
+
+def gitlab_get_mr(mr_url, token):
+    """
+    Fetch GitLab MR details via API.
+    Returns dict with source_branch, target_branch, or None on failure.
+    """
+    # Parse MR URL: https://gitlab.booming-inc.com/group/project/-/merge_requests/123
+    m = re.match(r'https://gitlab\.booming-inc\.com/(.+?)/-/merge_requests/(\d+)', mr_url)
+    if not m:
+        print(f"[gitlab] Cannot parse MR URL: {mr_url}", file=sys.stderr)
+        return None
+
+    project_path = m.group(1)
+    mr_iid = m.group(2)
+
+    # URL-encode the project path
+    project_encoded = urllib.parse.quote(project_path, safe='')
+
+    data = gitlab_api_get(f"projects/{project_encoded}/merge_requests/{mr_iid}", token)
+    if not data:
+        return None
+
+    return {
+        "source_branch": data.get("source_branch", ""),
+        "target_branch": data.get("target_branch", ""),
+        "state": data.get("state", ""),
+        "title": data.get("title", ""),
+    }
 
 
 def extract_issue_key(url):
@@ -133,8 +181,10 @@ def get_dev_info(issue_key, host, token):
     return result
 
 
-def get_remote_links(issue_key, host, token):
-    """Get remote links (GitLab MR links etc) from Jira issue."""
+def get_remote_links(issue_key, host, token, gitlab_token=None):
+    """Get remote links (GitLab MR links etc) from Jira issue.
+    If gitlab_token is provided, fetches real branch info from GitLab API.
+    """
     path = f"api/2/issue/{issue_key}/remotelink"
     data = jira_request(path, host, token)
     if not data:
@@ -146,11 +196,22 @@ def get_remote_links(issue_key, host, token):
         url = obj.get("url", "")
         title = obj.get("title", "")
         if url and ("merge request" in title.lower() or "mr" in title.lower()):
+            branch = ""
+            target_branch = ""
+            # Try GitLab API for real branch info
+            if gitlab_token:
+                mr_info = gitlab_get_mr(url, gitlab_token)
+                if mr_info:
+                    branch = mr_info["source_branch"]
+                    target_branch = mr_info["target_branch"]
+                    print(f"[gitlab] MR {url}: source={branch}, target={target_branch}",
+                          file=sys.stderr)
+
             result.append({
                 "title": title,
                 "url": url,
-                "branch": "",
-                "target_branch": "",
+                "branch": branch,
+                "target_branch": target_branch,
             })
     return result
 
@@ -182,9 +243,12 @@ def main():
                         help="Jira host (e.g. https://jira.company)")
     parser.add_argument("--jira-token", default=os.environ.get("JIRA_TOKEN", ""),
                         help="Jira API token or password")
+    parser.add_argument("--gitlab-token", default=os.environ.get("GITLAB_TOKEN", ""),
+                        help="GitLab personal access token")
     args = parser.parse_args()
 
     config = load_config()
+    gitlab_token = args.gitlab_token or os.environ.get("GITLAB_TOKEN", "")
 
     # Step 1: Extract issue key
     issue_key = extract_issue_key(args.jira_url)
@@ -199,6 +263,8 @@ def main():
         sys.exit(1)
 
     # Step 3: Try to get dev info (branches/PRs linked in Jira)
+    # Use engine-specific default branch if configured
+    engine_default_branch = project_cfg.get("engine_default_branch", project_cfg["default_branch"])
     result = {
         "issue_key": issue_key,
         "project": project_id,
@@ -206,6 +272,7 @@ def main():
         "engine_repo": project_cfg["engine_repo"],
         "game_repo": project_cfg["game_repo"],
         "default_branch": project_cfg["default_branch"],
+        "engine_default_branch": engine_default_branch,
         "mr_info": None,
         "mr_links": [],
         "mr_url": "",
@@ -228,27 +295,41 @@ def main():
                 "target_branch": project_cfg["default_branch"],
             }
 
-        # Step 3b: Try remote links for GitLab MR info
+        # Step 3b: Try remote links for GitLab MR info (with GitLab API)
         if not result.get("mr_info"):
-            remote_links = get_remote_links(issue_key, args.jira_host, args.jira_token)
+            remote_links = get_remote_links(issue_key, args.jira_host, args.jira_token, gitlab_token)
             if remote_links:
                 result["mr_links"] = remote_links
                 # Use the first MR URL
                 if remote_links:
                     result["mr_url"] = remote_links[0].get("url", "")
-                # Try to extract branch from MR URL or title
+                # Use branch info from GitLab API if available
                 for link in remote_links:
-                    title = link.get("title", "")
-                    url = link.get("url", "")
-                    # Extract branch from title: "Merge request - Feature CB2N-25256: desc"
-                    branch = ""
-                    if "Feature " in title or "feature " in title.lower():
-                        parts = title.split("Feature ", 1)
-                        if len(parts) > 1:
-                            branch_part = parts[1].split(":")[0].split(" ")[0].strip()
-                            branch = branch_part
-                    link["branch"] = branch
-                    link["target_branch"] = project_cfg["default_branch"]
+                    branch = link.get("branch", "")
+                    target_branch = link.get("target_branch", "")
+                    if branch:
+                        result["mr_info"] = {
+                            "branch": branch,
+                            "target_branch": target_branch or project_cfg["default_branch"],
+                        }
+                        break
+
+        # Step 3c: If we have mr_info from GitLab, also try to find per-repo MR URLs
+        # (engine and game repos may use different MRs)
+        if result.get("mr_info") and result.get("mr_url"):
+            mr_info = result["mr_info"]
+            # Try to find game repo MR URL from the same Jira remote links
+            for link in result.get("mr_links", []):
+                if link.get("url") and link["url"] != result.get("mr_url"):
+                    l_branch = link.get("branch", "")
+                    l_target = link.get("target_branch", "")
+                    if l_branch:
+                        result.setdefault("game_mr_info", {
+                            "branch": l_branch,
+                            "target_branch": l_target or project_cfg["default_branch"],
+                        })
+                        result["game_mr_url"] = link["url"]
+                        break
 
     # Step 4: Fallback — fetch issue details
     if args.jira_host and args.jira_token and not result.get("mr_info") and not result.get("mr_links"):
