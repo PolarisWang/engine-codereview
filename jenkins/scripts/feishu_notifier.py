@@ -224,7 +224,11 @@ def cmd_send_message(args):
         sys.exit(1)
     if args.message_file:
         with open(args.message_file) as f:
-            text = json.load(f)
+            raw = f.read()
+        try:
+            text = json.loads(raw)
+        except json.JSONDecodeError:
+            text = raw
     else:
         text = args.message
     resp = send_text_message(token, args.chat_id, text)
@@ -243,7 +247,11 @@ def cmd_reply_message(args):
         sys.exit(1)
     if args.message_file:
         with open(args.message_file) as f:
-            text = json.load(f)
+            raw = f.read()
+        try:
+            text = json.loads(raw)
+        except json.JSONDecodeError:
+            text = raw
     else:
         text = args.message
     resp = reply_in_thread(token, args.chat_id, args.message_id, text)
@@ -327,8 +335,6 @@ def main():
         cmd_send_message(args)
     elif args.command == "reply-message":
         cmd_reply_message(args)
-    elif args.command == "update-card":
-        cmd_send_card(args)
     elif args.command == "update-card":
         cmd_update_card(args)
 
