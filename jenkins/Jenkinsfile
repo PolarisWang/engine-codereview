@@ -432,6 +432,7 @@ print(base64.b64encode(msg.encode('utf-8')).decode())
                             }
 
                             env.FEISHU_TOPIC_MSG_ID = topicMsgId
+                            }
                     } catch (Exception e) {
                         echo "Bot API notification failed, falling back to webhook: ${e}"
                         if (env.FEISHU_WEBHOOK_URL) {
