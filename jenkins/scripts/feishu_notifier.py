@@ -89,10 +89,11 @@ def send_text_message(token, chat_id, text):
         "Content-Type": "application/json",
     }
     content = {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}
+    content_str = json.dumps(content, ensure_ascii=False)
     body = json.dumps({
         "receive_id": chat_id,
         "msg_type": "post",
-        "content": json.dumps(content, ensure_ascii=False),
+        "content": content_str,
     }, ensure_ascii=False)
     resp = _request("POST", url, headers=headers, raw_body=body)
     return resp
@@ -106,9 +107,10 @@ def reply_in_thread(token, chat_id, parent_message_id, text):
         "Content-Type": "application/json",
     }
     content = {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}
+    content_str = json.dumps(content, ensure_ascii=False)
     body = json.dumps({
         "msg_type": "post",
-        "content": json.dumps(content, ensure_ascii=False),
+        "content": content_str,
     }, ensure_ascii=False)
     resp = _request("POST", url, headers=headers, raw_body=body)
     return resp
