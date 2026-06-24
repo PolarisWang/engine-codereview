@@ -3,14 +3,18 @@
  * Code Review Pipeline
  *
  * Two modes:
- *   1. Scan mode (cron triggered, no JIRA_URL) — scan Jira for issues needing review
+ *   1. Scan mode (cron triggered, no JIRA_URL) — poll Feishu group for new
+ *      topic messages containing Jira URLs, reply in-thread with review results
  *   2. Direct mode (JIRA_URL provided) — review a specific Jira issue
  *
  * Triggered by:
- *   - cron: every 30 minutes (scan mode)
+ *   - cron: every 30 seconds (scan mode)
  *   - manual: with JIRA_URL parameter
  *
- * Results are sent to Feishu group via webhook.
+ * Requires Jenkins global env vars:
+ *   JIRA_HOST, JIRA_TOKEN — Jira API access
+ *   GITLAB_TOKEN — GitLab API for MR branch detection
+ *   FEISHU_APP_ID, FEISHU_APP_SECRET — Feishu bot credentials
  */
 
 pipeline {
@@ -55,7 +59,16 @@ pipeline {
 
     stages {
         // ──────────────────────────────────────────────
-        // Stage 0: Scan — only when JIRA_URL is empty
+        // Stage 0: Checkout — pull latest code from SCM
+        // ──────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        // ──────────────────────────────────────────────
+        // Stage 1: Scan — only when JIRA_URL is empty
         // ──────────────────────────────────────────────
         stage('Scan Feishu Messages') {
             when { expression { params.JIRA_URL == null || params.JIRA_URL == '' } }
@@ -247,7 +260,7 @@ pipeline {
         }
 
         // ──────────────────────────────────────────────
-        // Stage 1: Parse Jira URL → project + MR info
+        // Stage 2: Parse Jira URL → project + MR info
         // ──────────────────────────────────────────────
         stage('Parse Jira Issue') {
             when {
@@ -312,7 +325,7 @@ pipeline {
         }
 
         // ──────────────────────────────────────────────
-        // Stage 2: Parallel Code Review (Engine + Game)
+        // Stage 3: Parallel Code Review (Engine + Game)
         // ──────────────────────────────────────────────
         stage('Code Review') {
             when { expression { env.ISSUE_KEY != null && env.ISSUE_KEY != '' } }
