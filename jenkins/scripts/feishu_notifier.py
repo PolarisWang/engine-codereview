@@ -38,12 +38,21 @@ import base64
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _request(method, url, data=None, headers=None):
-    """HTTP request helper."""
+def _request(method, url, data=None, headers=None, raw_body=None):
+    """HTTP request helper.
+    Args:
+        raw_body: Pre-serialized JSON string (takes precedence over data)
+        data: Dict to serialize as JSON
+    """
     if headers is None:
         headers = {}
     headers.setdefault("Content-Type", "application/json")
-    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data else None
+    if raw_body:
+        body = raw_body.encode("utf-8")
+    elif data:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    else:
+        body = None
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -79,12 +88,13 @@ def send_text_message(token, chat_id, text):
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    data = {
+    content = {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}
+    body = json.dumps({
         "receive_id": chat_id,
         "msg_type": "post",
-        "content": {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}},
-    }
-    resp = _request("POST", url, data, headers)
+        "content": json.dumps(content, ensure_ascii=False),
+    }, ensure_ascii=False)
+    resp = _request("POST", url, headers=headers, raw_body=body)
     return resp
 
 
@@ -95,11 +105,12 @@ def reply_in_thread(token, chat_id, parent_message_id, text):
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    data = {
+    content = {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}
+    body = json.dumps({
         "msg_type": "post",
-        "content": {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}},
-    }
-    resp = _request("POST", url, data, headers)
+        "content": json.dumps(content, ensure_ascii=False),
+    }, ensure_ascii=False)
+    resp = _request("POST", url, headers=headers, raw_body=body)
     return resp
     """Send an interactive card message to a chat."""
     url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
