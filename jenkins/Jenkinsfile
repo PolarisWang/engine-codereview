@@ -47,8 +47,7 @@ pipeline {
         FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_254e95f0687245b9df82ab8bf823ca54'}"
         // Fallback webhook
         FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: 'https://open.feishu.cn/open-apis/bot/v2/hook/f2ec1781-06d2-42c8-91b4-37616d973970'}"
-        // Persist topic message_id across stages
-        FEISHU_TOPIC_MSG_ID = "${params.FEISHU_REPLY_MSG_ID ?: ''}"
+        FEISHU_TOPIC_MSG_ID = ''
     }
 
     stages {
@@ -137,6 +136,10 @@ pipeline {
                     echo "Branch: ${env.REVIEW_BRANCH} → ${env.BASE_BRANCH}"
                     echo "Engine base: ${env.ENGINE_BASE_BRANCH}"
                     echo "Game base: ${env.GAME_BASE_BRANCH}"
+
+                    // Set FEISHU_TOPIC_MSG_ID from params (params is available inside script blocks)
+                    env.FEISHU_TOPIC_MSG_ID = params.FEISHU_REPLY_MSG_ID ?: ''
+                    echo "Feishu reply mode: ${env.FEISHU_TOPIC_MSG_ID ? 'replying in thread' : 'new topic'}"
                 }
             }
         }
