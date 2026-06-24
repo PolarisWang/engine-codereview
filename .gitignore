@@ -1,5 +1,12 @@
 # Secrets & Environment
 feishu-bot/.env
+.env
+
+# Claude Code work directory
+.claude/
+
+# Logs
+*.log
 
 # Python
 __pycache__/
@@ -8,6 +15,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.egg
 
 # IDE
 .vscode/
@@ -19,3 +27,7 @@ Thumbs.db
 
 # Review workspace (local clones)
 review-workspace/
+
+# Temp files from builds
+/tmp/feishu_*
+/tmp/codereview*
