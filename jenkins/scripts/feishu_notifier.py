@@ -82,7 +82,7 @@ def send_text_message(token, chat_id, text):
     data = {
         "receive_id": chat_id,
         "msg_type": "post",
-        "content": json.dumps({"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}),
+        "content": {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}},
     }
     resp = _request("POST", url, data, headers)
     return resp
@@ -97,7 +97,7 @@ def reply_in_thread(token, chat_id, parent_message_id, text):
     }
     data = {
         "msg_type": "post",
-        "content": json.dumps({"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}),
+        "content": {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}},
     }
     resp = _request("POST", url, data, headers)
     return resp
