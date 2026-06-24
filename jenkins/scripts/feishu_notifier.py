@@ -239,7 +239,9 @@ def cmd_send_message(args):
     token = get_tenant_token(args.app_id, args.app_secret)
     if not token:
         sys.exit(1)
-    if args.message_file:
+    if args.message_base64:
+        text = base64.b64decode(args.message_base64).decode("utf-8")
+    elif args.message_file:
         with open(args.message_file) as f:
             raw = f.read()
         try:
@@ -262,7 +264,9 @@ def cmd_reply_message(args):
     token = get_tenant_token(args.app_id, args.app_secret)
     if not token:
         sys.exit(1)
-    if args.message_file:
+    if args.message_base64:
+        text = base64.b64decode(args.message_base64).decode("utf-8")
+    elif args.message_file:
         with open(args.message_file) as f:
             raw = f.read()
         try:
@@ -321,6 +325,7 @@ def main():
     p.add_argument("--chat-id", required=True)
     p.add_argument("--message", help="Message text")
     p.add_argument("--message-file", help="Read message text from JSON file")
+    p.add_argument("--message-base64", help="Base64-encoded message text")
 
     # ── reply-message (reply in topic) ──
     p = sub.add_parser("reply-message", help="Reply in an existing message thread")
@@ -330,6 +335,7 @@ def main():
     p.add_argument("--message-id", required=True)
     p.add_argument("--message", help="Reply text")
     p.add_argument("--message-file", help="Read reply text from JSON file")
+    p.add_argument("--message-base64", help="Base64-encoded reply text")
 
     # ── update-card ──
     p = sub.add_parser("update-card", help="Update card with results")
