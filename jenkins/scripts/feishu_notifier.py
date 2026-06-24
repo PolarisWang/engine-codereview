@@ -43,7 +43,7 @@ def _request(method, url, data=None, headers=None):
     if headers is None:
         headers = {}
     headers.setdefault("Content-Type", "application/json")
-    body = json.dumps(data).encode("utf-8") if data else None
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data else None
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -73,7 +73,7 @@ def send_webhook(webhook_url, content):
 
 
 def send_text_message(token, chat_id, text):
-    """Send a plain text message to a chat."""
+    """Send a post (rich text) message to a chat."""
     url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -81,23 +81,23 @@ def send_text_message(token, chat_id, text):
     }
     data = {
         "receive_id": chat_id,
-        "msg_type": "text",
-        "content": json.dumps({"text": text}),
+        "msg_type": "post",
+        "content": json.dumps({"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}),
     }
     resp = _request("POST", url, data, headers)
     return resp
 
 
 def reply_in_thread(token, chat_id, parent_message_id, text):
-    """Reply to a message thread with text."""
+    """Reply to a message thread with post (rich text) content."""
     url = f"https://open.feishu.cn/open-apis/im/v1/messages/{parent_message_id}/reply"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     data = {
-        "msg_type": "text",
-        "content": json.dumps({"text": text}),
+        "msg_type": "post",
+        "content": json.dumps({"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}),
     }
     resp = _request("POST", url, data, headers)
     return resp
