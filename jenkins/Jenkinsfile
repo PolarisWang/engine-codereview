@@ -135,6 +135,9 @@ pipeline {
                     echo "Branch: ${env.REVIEW_BRANCH} → ${env.BASE_BRANCH}"
                     echo "Engine base: ${env.ENGINE_BASE_BRANCH}"
                     echo "Game base: ${env.GAME_BASE_BRANCH}"
+
+                    // Persist FEISHU_REPLY_MSG_ID to file for post block access
+                    writeFile(file: "${env.WORKSPACE}/.feishu_reply_msg_id", text: "${params.FEISHU_REPLY_MSG_ID ?: ''}")
                 }
             }
         }
@@ -275,7 +278,7 @@ pipeline {
                 def feishuAppId = env.FEISHU_APP_ID ?: ''
                 def feishuAppSecret = env.FEISHU_APP_SECRET ?: ''
                 def feishuChatId = env.FEISHU_CHAT_ID ?: ''
-                def topicMsgId = params.FEISHU_REPLY_MSG_ID ?: ''
+                def topicMsgId = fileExists('.feishu_reply_msg_id') ? readFile('.feishu_reply_msg_id').trim() : ''
 
                 if (feishuAppId && feishuAppSecret && feishuChatId) {
                     try {
