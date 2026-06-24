@@ -59,16 +59,7 @@ pipeline {
 
     stages {
         // ──────────────────────────────────────────────
-        // Stage 0: Checkout — pull latest code from SCM
-        // ──────────────────────────────────────────────
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
-
-        // ──────────────────────────────────────────────
-        // Stage 1: Scan — only when JIRA_URL is empty
+        // Stage 0: Scan Feishu — only when JIRA_URL is empty
         // ──────────────────────────────────────────────
         stage('Scan Feishu Messages') {
             when { expression { params.JIRA_URL == null || params.JIRA_URL == '' } }
@@ -260,7 +251,7 @@ pipeline {
         }
 
         // ──────────────────────────────────────────────
-        // Stage 2: Parse Jira URL → project + MR info
+        // Stage 1: Parse Jira URL → project + MR info
         // ──────────────────────────────────────────────
         stage('Parse Jira Issue') {
             when {
@@ -325,7 +316,7 @@ pipeline {
         }
 
         // ──────────────────────────────────────────────
-        // Stage 3: Parallel Code Review (Engine + Game)
+        // Stage 2: Parallel Code Review (Engine + Game)
         // ──────────────────────────────────────────────
         stage('Code Review') {
             when { expression { env.ISSUE_KEY != null && env.ISSUE_KEY != '' } }
