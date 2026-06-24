@@ -17,8 +17,7 @@ pipeline {
     agent any
 
     triggers {
-        // Disabled temporarily — cron flooding queue during testing
-        // cron('* * * * *')
+        cron('')
     }
 
     parameters {
