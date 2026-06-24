@@ -286,7 +286,7 @@ pipeline {
                             // ── Reply in existing topic (from FEISHU_REPLY_MSG_ID) ──
                             // 1) Send "Reviewing..." progress reply
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
-                            def progressBase64 = progressText.bytes.encodeBase64().toString()
+                            def progressBase64 = progressText.toString().getBytes("UTF-8").encodeBase64().toString()
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
@@ -297,7 +297,7 @@ pipeline {
                             """
 
                             // 2) Reply with summary
-                            def summaryBase64 = topicText.bytes.encodeBase64().toString()
+                            def summaryBase64 = topicText.toString().getBytes("UTF-8").encodeBase64().toString()
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
@@ -344,7 +344,7 @@ pipeline {
                             }
                         } else {
                             // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
-                            def topicBase64 = topicText.bytes.encodeBase64().toString()
+                            def topicBase64 = topicText.toString().getBytes("UTF-8").encodeBase64().toString()
                             def topicResult = sh(
                                 script: """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
@@ -365,7 +365,7 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                def engineBase64 = engineDetail.bytes.encodeBase64().toString()
+                                def engineBase64 = engineDetail.toString().getBytes("UTF-8").encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -382,7 +382,7 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                def gameBase64 = gameDetail.bytes.encodeBase64().toString()
+                                def gameBase64 = gameDetail.toString().getBytes("UTF-8").encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
