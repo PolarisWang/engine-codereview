@@ -48,7 +48,6 @@ PROJECT_CONFIG = {
         "name": "Rage",
         "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git",
         "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git",
-        # Engine uses rage/master, game uses master — will be set per-repo below
         "default_branch": "master",
         "engine_default_branch": "rage/master",
     },
@@ -104,19 +103,31 @@ def gitlab_api_get(path, token):
         return None
 
 
+def parse_gitlab_mr_url(url):
+    """
+    Parse a GitLab MR URL to extract project path and MR IID.
+
+    Handles formats like:
+      https://gitlab.booming-inc.com/group/subgroup/project/-/merge_requests/123
+      https://gitlab.booming-inc.com/group/project/-/merge_requests/123
+    """
+    m = re.match(r'https://gitlab\.booming-inc\.com/(.+?)/-/merge_requests/(\d+)', url)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
 def gitlab_get_mr(mr_url, token):
     """
     Fetch GitLab MR details via API.
     Returns dict with source_branch, target_branch, or None on failure.
+
+    Uses parse_gitlab_mr_url to extract project path and MR IID from URL.
     """
-    # Parse MR URL: https://gitlab.booming-inc.com/group/project/-/merge_requests/123
-    m = re.match(r'https://gitlab\.booming-inc\.com/(.+?)/-/merge_requests/(\d+)', mr_url)
-    if not m:
+    project_path, mr_iid = parse_gitlab_mr_url(mr_url)
+    if not project_path:
         print(f"[gitlab] Cannot parse MR URL: {mr_url}", file=sys.stderr)
         return None
-
-    project_path = m.group(1)
-    mr_iid = m.group(2)
 
     # URL-encode the project path
     project_encoded = urllib.parse.quote(project_path, safe='')
@@ -183,7 +194,8 @@ def get_dev_info(issue_key, host, token):
 
 def get_remote_links(issue_key, host, token, gitlab_token=None):
     """Get remote links (GitLab MR links etc) from Jira issue.
-    If gitlab_token is provided, fetches real branch info from GitLab API.
+    If gitlab_token is provided, fetches real branch info from GitLab API
+    for each GitLab MR link found.
     """
     path = f"api/2/issue/{issue_key}/remotelink"
     data = jira_request(path, host, token)

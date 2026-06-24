@@ -17,7 +17,7 @@ pipeline {
     agent any
 
     triggers {
-        cron('')
+        cron('* * * * *')
     }
 
     parameters {
@@ -35,7 +35,7 @@ pipeline {
         PARSED_INFO_FILE = "${env.WORKSPACE}/parsed_info.json"
         ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
         GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
-        REVIEWED_STATE_FILE = "/tmp/codereview-reviewed.json"   // Persist across runs
+        REVIEWED_STATE_FILE = "/tmp/codereview-feishu-state.json"   // Feishu scanner state (processed msg IDs)
 
         // GitLab token for HTTPS clone + MR branch detection
         GITLAB_TOKEN = "${env.GITLAB_TOKEN ?: ''}"
@@ -47,33 +47,200 @@ pipeline {
         FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_254e95f0687245b9df82ab8bf823ca54'}"
         // Fallback webhook
         FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: 'https://open.feishu.cn/open-apis/bot/v2/hook/f2ec1781-06d2-42c8-91b4-37616d973970'}"
+
+        // Jira credentials (injected via Jenkins global env or credentials)
+        JIRA_HOST = "${env.JIRA_HOST ?: ''}"
+        JIRA_TOKEN = "${env.JIRA_TOKEN ?: ''}"
     }
 
     stages {
         // ──────────────────────────────────────────────
         // Stage 0: Scan — only when JIRA_URL is empty
         // ──────────────────────────────────────────────
-        stage('Scan Jira Issues') {
+        stage('Scan Feishu Messages') {
             when { expression { params.JIRA_URL == null || params.JIRA_URL == '' } }
             steps {
                 script {
                     sh """
-                        python3 ${SCRIPTS_DIR}/jira_scanner.py \
+                        python3 ${SCRIPTS_DIR}/feishu_scanner.py \
+                            --app-id '${env.FEISHU_APP_ID}' \
+                            --app-secret '${env.FEISHU_APP_SECRET}' \
+                            --chat-id '${env.FEISHU_CHAT_ID}' \
                             --jira-host '${env.JIRA_HOST}' \
-                            --jira-token '${env.JIRA_TOKEN}' \
-                            --output '${SCAN_RESULT_FILE}' \
-                            --state-file '${REVIEWED_STATE_FILE}'
+                            --state-file '${REVIEWED_STATE_FILE}' \
+                            --output '${SCAN_RESULT_FILE}'
                     """
                     scanResult = readJSON(file: SCAN_RESULT_FILE)
-                    issues = scanResult.issues ?: []
-                    echo "Found ${issues.size()} issues to review"
+                    items = scanResult.items ?: []
+                    echo "Found ${items.size()} Jira URLs to review"
 
-                    if (issues.isEmpty()) {
+                    if (items.isEmpty()) {
                         currentBuild.result = 'SUCCESS'
                     } else {
-                        // Process first issue (one per run to keep results focused)
-                        env.JIRA_URL = "https://${env.JIRA_HOST}/browse/${issues[0].key}"
-                        echo "Auto-selected: ${env.JIRA_URL}"
+                        echo "Processing ${items.size()} detected Jira URLs"
+                        def issueBuilds = [:]
+                        items.each { item ->
+                            def issueKey = item.issue_key
+                            def jiraUrl = item.jira_url
+                            def msgId = item.message_id
+                            issueBuilds[issueKey] = {
+                                def engFile = "${env.WORKSPACE}/result_${issueKey}_engine.json"
+                                def gamFile = "${env.WORKSPACE}/result_${issueKey}_game.json"
+                                def infoFile = "${env.WORKSPACE}/parsed_${issueKey}.json"
+
+                                // Step 1: Reply "reviewing..." in Feishu thread
+                                def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
+                                sh """
+                                    echo '${progressText}' | python3 -c "
+                                import sys, base64
+                                msg = sys.stdin.read()
+                                print(base64.b64encode(msg.encode('utf-8')).decode())
+                                " > /tmp/fs_review_progress_${issueKey}.b64
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${env.FEISHU_APP_ID}' \
+                                        --app-secret '${env.FEISHU_APP_SECRET}' \
+                                        --chat-id '${env.FEISHU_CHAT_ID}' \
+                                        --message-id '${msgId}' \
+                                        --message-base64 \$(cat /tmp/fs_review_progress_${issueKey}.b64)
+                                """
+
+                                // Step 2: Parse Jira → project + MR info
+                                sh """
+                                    python3 ${SCRIPTS_DIR}/jira_parser.py \
+                                        --jira-url '${jiraUrl}' \
+                                        --jira-host '${env.JIRA_HOST}' \
+                                        --jira-token '${env.JIRA_TOKEN}' \
+                                        --gitlab-token '${env.GITLAB_TOKEN}' \
+                                        > ${infoFile}
+                                """
+                                def parsedInfo = readJSON(file: infoFile)
+                                if (parsedInfo.containsKey('error')) {
+                                    def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
+                                    sh """
+                                        echo '${errMsg}' | python3 -c "
+                                    import sys, base64
+                                    msg = sys.stdin.read()
+                                    print(base64.b64encode(msg.encode('utf-8')).decode())
+                                    " > /tmp/fs_err_${issueKey}.b64
+                                        python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                            --app-id '${env.FEISHU_APP_ID}' \
+                                            --app-secret '${env.FEISHU_APP_SECRET}' \
+                                            --chat-id '${env.FEISHU_CHAT_ID}' \
+                                            --message-id '${msgId}' \
+                                            --message-base64 \$(cat /tmp/fs_err_${issueKey}.b64)
+                                    """
+                                    return
+                                }
+                                def reviewBranch = parsedInfo.mr_info?.branch ?: issueKey
+                                def baseBranch = parsedInfo.mr_info?.target_branch ?: parsedInfo.default_branch ?: 'master'
+                                def engineRepo = parsedInfo.engine_repo
+                                def gameRepo = parsedInfo.game_repo
+                                def project = parsedInfo.project
+                                echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, project=${project}"
+
+                                // Step 3: Parallel code review (engine + game)
+                                sh """
+                                    python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                        --repo '${engineRepo}' \
+                                        --branch '${reviewBranch}' \
+                                        --base-branch '${baseBranch}' \
+                                        --project '${project}' \
+                                        --issue-key '${issueKey}' \
+                                        --repo-type 'engine' \
+                                        --workspace '${REVIEW_WORKSPACE}' \
+                                        --output '${engFile}'
+                                    python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                        --repo '${gameRepo}' \
+                                        --branch '${reviewBranch}' \
+                                        --base-branch '${baseBranch}' \
+                                        --project '${project}' \
+                                        --issue-key '${issueKey}' \
+                                        --repo-type 'game' \
+                                        --workspace '${REVIEW_WORKSPACE}' \
+                                        --output '${gamFile}'
+                                """
+                                def engineResult = fileExists(engFile) ? readJSON(file: engFile) : [:]
+                                def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
+
+                                // Step 4: Build and reply summary
+                                def engSev = engineResult.review?.severity_counts ?: [:]
+                                def gamSev = gameResult.review?.severity_counts ?: [:]
+                                def engChanged = (engineResult.changed_files ?: []).size()
+                                def gamChanged = (gameResult.changed_files ?: []).size()
+                                def msg = "🔍 **Code Review Complete: ${issueKey}**\n"
+                                msg += "Project: ${project}\n"
+                                msg += "Branch: ${reviewBranch} → ${baseBranch}\n"
+                                if (parsedInfo.mr_url) msg += "MR: ${parsedInfo.mr_url}\n"
+                                msg += "\n🔧 Engine (${engChanged} files): "
+                                msg += engSev.critical ? "🔴${engSev.critical} " : ""
+                                msg += engSev.warning ? "🟡${engSev.warning} " : ""
+                                msg += engSev.suggestion ? "ℹ️${engSev.suggestion} " : ""
+                                msg += (!engSev.critical && !engSev.warning && !engSev.suggestion) ? "✅ Clean " : ""
+                                msg += "\n🎮 Game (${gamChanged} files): "
+                                msg += gamSev.critical ? "🔴${gamSev.critical} " : ""
+                                msg += gamSev.warning ? "🟡${gamSev.warning} " : ""
+                                msg += gamSev.suggestion ? "ℹ️${gamSev.suggestion} " : ""
+                                msg += (!gamSev.critical && !gamSev.warning && !gamSev.suggestion) ? "✅ Clean" : ""
+
+                                sh """
+                                    cat > /tmp/fs_summary_${issueKey}.txt << 'FSEOF'
+                                ${msg}
+                                FSEOF
+                                    python3 -c "
+                                import base64
+                                with open('/tmp/fs_summary_${issueKey}.txt') as f:
+                                    print(base64.b64encode(f.read().encode('utf-8')).decode())
+                                " > /tmp/fs_summary_${issueKey}.b64
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${env.FEISHU_APP_ID}' \
+                                        --app-secret '${env.FEISHU_APP_SECRET}' \
+                                        --chat-id '${env.FEISHU_CHAT_ID}' \
+                                        --message-id '${msgId}' \
+                                        --message-base64 \$(cat /tmp/fs_summary_${issueKey}.b64)
+                                """
+
+                                // Step 5: Reply with engine detail (if any findings)
+                                if (engineResult.review?.review_text) {
+                                    def detail = engineResult.review.review_text
+                                    def maxLen = 3000
+                                    if (detail.length() > maxLen) {
+                                        detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
+                                    }
+                                    writeFile(file: "${env.WORKSPACE}/.fs_engine_${issueKey}.txt",
+                                              text: "**🔧 Engine 详细报告:**\n${detail}")
+                                    sh """
+                                        python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                            --app-id '${env.FEISHU_APP_ID}' \
+                                            --app-secret '${env.FEISHU_APP_SECRET}' \
+                                            --chat-id '${env.FEISHU_CHAT_ID}' \
+                                            --message-id '${msgId}' \
+                                            --message-file '${env.WORKSPACE}/.fs_engine_${issueKey}.txt'
+                                    """
+                                }
+
+                                // Step 6: Reply with game detail (if any findings)
+                                if (gameResult.review?.review_text) {
+                                    def detail = gameResult.review.review_text
+                                    def maxLen = 3000
+                                    if (detail.length() > maxLen) {
+                                        detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
+                                    }
+                                    writeFile(file: "${env.WORKSPACE}/.fs_game_${issueKey}.txt",
+                                              text: "**🎮 Game 详细报告:**\n${detail}")
+                                    sh """
+                                        python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                            --app-id '${env.FEISHU_APP_ID}' \
+                                            --app-secret '${env.FEISHU_APP_SECRET}' \
+                                            --chat-id '${env.FEISHU_CHAT_ID}' \
+                                            --message-id '${msgId}' \
+                                            --message-file '${env.WORKSPACE}/.fs_game_${issueKey}.txt'
+                                    """
+                                }
+
+                                echo "Completed review for ${issueKey}"
+                            }
+                        }
+                        parallel issueBuilds
                     }
                 }
             }
@@ -83,7 +250,9 @@ pipeline {
         // Stage 1: Parse Jira URL → project + MR info
         // ──────────────────────────────────────────────
         stage('Parse Jira Issue') {
-            when { expression { params.JIRA_URL != null && params.JIRA_URL != '' } }
+            when {
+                expression { params.JIRA_URL != null && params.JIRA_URL != '' }
+            }
             steps {
                 script {
                     sh """
@@ -223,6 +392,13 @@ pipeline {
             script {
                 if (env.ISSUE_KEY == null || env.ISSUE_KEY == '') {
                     echo "No issues to review — skipping notification"
+                    return
+                }
+
+                // In scan mode (no explicit JIRA_URL), results were already sent inline
+                def isScanMode = (params.JIRA_URL == null || params.JIRA_URL == '')
+                if (isScanMode) {
+                    echo "Scan mode — results already sent inline, skipping post notification"
                     return
                 }
 
