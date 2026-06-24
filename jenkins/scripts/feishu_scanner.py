@@ -59,22 +59,27 @@ def get_tenant_token(app_id, app_secret):
 
 # ── Message polling ───────────────────────────────────────────────────────────
 
-def list_messages(token, chat_id, page_size=50, page_token=None, start_time=None):
+def list_messages(token, chat_id, page_size=50, page_token=None, start_time=None, end_time=None):
     """
     List messages from a group chat using Feishu API.
-    GET /open-apis/im/v1/messages?container_id_type=chat_id&container_id={chat_id}
+    GET /open-apis/im/v1/messages?container_id_type=chat&container_id={chat_id}
     """
     params = f"container_id_type=chat&container_id={chat_id}&page_size={page_size}&sort_type=ByCreateTimeDesc"
     if page_token:
         params += f"&page_token={page_token}"
     if start_time:
         params += f"&start_time={start_time}"
+    if end_time:
+        params += f"&end_time={end_time}"
     url = f"https://open.feishu.cn/open-apis/im/v1/messages?{params}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     resp = _request("GET", url, headers=headers)
+    if resp and resp.get("code") != 0:
+        print(f"[feishu] list_messages error: code={resp.get('code')} msg={resp.get('msg')}",
+              file=sys.stderr)
     return resp
 
 
@@ -161,6 +166,14 @@ def main():
 
         data = resp.get("data", {})
         items = data.get("items", [])
+        print(f"[feishu] Page: {len(items)} messages (has_more={data.get('has_more')})", flush=True)
+        if items and not page_token and len(all_messages) < 2:
+            # Print first message as debug sample
+            sample = items[0]
+            print(f"[feishu] Sample: id={sample.get('message_id','')} type={sample.get('msg_type','')} "
+                  f"chat_id={sample.get('chat_id','')} thread_id={sample.get('thread_id','')} "
+                  f"parent_id={sample.get('parent_id','')} "
+                  f"sender_type={sample.get('sender',{}).get('sender_type','') if isinstance(sample.get('sender'), dict) else '?'}", flush=True)
         all_messages.extend(items)
 
         if not data.get("has_more"):
