@@ -64,7 +64,7 @@ def list_messages(token, chat_id, page_size=50, page_token=None, start_time=None
     List messages from a group chat using Feishu API.
     GET /open-apis/im/v1/messages?container_id_type=chat_id&container_id={chat_id}
     """
-    params = f"container_id_type=chat_id&container_id={chat_id}&page_size={page_size}&sort_type=ByCreateTimeDesc"
+    params = f"container_id_type=chat&container_id={chat_id}&page_size={page_size}&sort_type=ByCreateTimeDesc"
     if page_token:
         params += f"&page_token={page_token}"
     if start_time:
@@ -140,13 +140,14 @@ def main():
         sys.exit(0)
 
     # ── Calculate time window: scan last 60 seconds (with 10s buffer) ──
-    # Use milliseconds for Feishu API
-    now_ms = int(time.time() * 1000)
-    window_start = now_ms - 70_000  # last 70 seconds
-    if last_start_time and last_start_time > window_start:
-        window_start = last_start_time
+    # Use 10-digit Unix seconds for Feishu API
+    now_sec = int(time.time())
+    window_start = now_sec - 70  # last 70 seconds
+    if last_start_time and last_start_time // 1000 > window_start:
+        # last_start_time was stored as milliseconds, convert to seconds
+        window_start = last_start_time // 1000
 
-    print(f"[feishu] Scanning messages from {window_start} to {now_ms}", flush=True)
+    print(f"[feishu] Scanning messages from {window_start} to {now_sec}", flush=True)
 
     all_messages = []
     page_token = None
@@ -247,7 +248,7 @@ def main():
 
     state = {
         "processed_ids": processed_list,
-        "last_scan_time": now_ms,
+        "last_scan_time": now_sec,
         "last_start_time": window_start,
     }
     with open(args.state_file, "w") as f:
