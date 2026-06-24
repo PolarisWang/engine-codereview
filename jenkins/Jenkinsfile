@@ -137,7 +137,8 @@ pipeline {
                     echo "Engine base: ${env.ENGINE_BASE_BRANCH}"
                     echo "Game base: ${env.GAME_BASE_BRANCH}"
 
-                    // Set FEISHU_TOPIC_MSG_ID from params (params is available inside script blocks)
+                    // Set FEISHU_TOPIC_MSG_ID from build parameter
+                    echo "DEBUG: params.FEISHU_REPLY_MSG_ID='${params.FEISHU_REPLY_MSG_ID}'"
                     env.FEISHU_TOPIC_MSG_ID = params.FEISHU_REPLY_MSG_ID ?: ''
                     echo "Feishu reply mode: ${env.FEISHU_TOPIC_MSG_ID ? 'replying in thread' : 'new topic'}"
                 }
