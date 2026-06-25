@@ -149,8 +149,8 @@ def main():
     now_sec = int(time.time())
     # On first scan (no state), look back 24h to catch any existing topic starters
     window_start = now_sec - 86400 if not last_start_time else max(last_start_time // 1000, now_sec - 86400)
-    # Also cap at 70s going forward for incremental scans
-    window_start = max(window_start, now_sec - 70) if last_start_time else window_start
+    # Always use at least 300s (5 min) overlap to avoid missing messages between builds
+    window_start = max(window_start, now_sec - 300) if last_start_time else window_start
 
     print(f"[feishu] Scanning messages from {window_start} to {now_sec}", flush=True)
 
