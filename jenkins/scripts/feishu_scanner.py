@@ -192,9 +192,9 @@ def main():
             continue
 
         # Check if it's a thread reply — skip those
-        # Feishu topic replies have thread_id in message body
-        thread_id = msg.get("thread_id", "") or msg.get("parent_id", "")
-        if thread_id:
+        # Feishu sets thread_id on ALL messages in group chats, but only
+        # thread replies have parent_id set (indicating they're replies in a topic)
+        if msg.get("parent_id"):
             new_processed.add(msg_id)
             continue
 
