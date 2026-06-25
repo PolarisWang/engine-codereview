@@ -160,31 +160,26 @@ pipeline {
                                 def engineResult = fileExists(engFile) ? readJSON(file: engFile) : [:]
                                 def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
 
-                                // Step 4: Build and reply summary
+                                // Step 4: Build and reply summary via writeFile (avoid heredoc + emoji issues)
                                 def engSev = engineResult.review?.severity_counts ?: [:]
                                 def gamSev = gameResult.review?.severity_counts ?: [:]
                                 def engChanged = (engineResult.changed_files ?: []).size()
                                 def gamChanged = (gameResult.changed_files ?: []).size()
-                                def msg = "🔍 **Code Review Complete: ${issueKey}**\n"
-                                msg += "Project: ${project}\n"
-                                msg += "Branch: ${reviewBranch} → ${baseBranch}\n"
-                                if (parsedInfo.mr_url) msg += "MR: ${parsedInfo.mr_url}\n"
-                                msg += "\n🔧 Engine (${engChanged} files): "
-                                msg += engSev.critical ? "🔴${engSev.critical} " : ""
-                                msg += engSev.warning ? "🟡${engSev.warning} " : ""
-                                msg += engSev.suggestion ? "ℹ️${engSev.suggestion} " : ""
-                                msg += (!engSev.critical && !engSev.warning && !engSev.suggestion) ? "✅ Clean " : ""
-                                msg += "\n🎮 Game (${gamChanged} files): "
-                                msg += gamSev.critical ? "🔴${gamSev.critical} " : ""
-                                msg += gamSev.warning ? "🟡${gamSev.warning} " : ""
-                                msg += gamSev.suggestion ? "ℹ️${gamSev.suggestion} " : ""
-                                msg += (!gamSev.critical && !gamSev.warning && !gamSev.suggestion) ? "✅ Clean" : ""
-
+                                def engSeverity = ""
+                                if (engSev.critical)  engSeverity += "CRITICAL(${engSev.critical}) "
+                                if (engSev.warning)   engSeverity += "WARN(${engSev.warning}) "
+                                if (engSev.suggestion) engSeverity += "SUGGEST(${engSev.suggestion}) "
+                                if (!engSeverity) engSeverity = "CLEAN"
+                                def gamSeverity = ""
+                                if (gamSev.critical)  gamSeverity += "CRITICAL(${gamSev.critical}) "
+                                if (gamSev.warning)   gamSeverity += "WARN(${gamSev.warning}) "
+                                if (gamSev.suggestion) gamSeverity += "SUGGEST(${gamSev.suggestion}) "
+                                if (!gamSeverity) gamSeverity = "CLEAN"
+                                def mrUrl = parsedInfo.mr_url ?: ''
+                                writeFile(file: "${env.WORKSPACE}/.fs_summary_${issueKey}.txt",
+                                    text: "Project: ${project}\nBranch: ${reviewBranch} -> ${baseBranch}\n${mrUrl ? 'MR: ' + mrUrl + '\n' : ''}\nEngine(${engChanged} files): ${engSeverity}\nGame(${gamChanged} files): ${gamSeverity}")
                                 sh """
-                                    cat > /tmp/fs_summary_${issueKey}.txt << 'FSEOF'
-                                ${msg}
-                                FSEOF
-                                    python3 -c "import base64;f=open('/tmp/fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
+                                    python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
