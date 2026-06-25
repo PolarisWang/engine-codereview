@@ -95,11 +95,7 @@ pipeline {
                                 // Step 1: Reply "reviewing..." in Feishu thread
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
                                 sh """
-                                    echo '${progressText}' | python3 -c "
-                                import sys, base64
-                                msg = sys.stdin.read()
-                                print(base64.b64encode(msg.encode('utf-8')).decode())
-                                " > /tmp/fs_review_progress_${issueKey}.b64
+                                    echo '${progressText}' | python3 -c "import sys,base64;msg=sys.stdin.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/fs_review_progress_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
@@ -121,11 +117,7 @@ pipeline {
                                 if (parsedInfo.containsKey('error')) {
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
                                     sh """
-                                        echo '${errMsg}' | python3 -c "
-                                    import sys, base64
-                                    msg = sys.stdin.read()
-                                    print(base64.b64encode(msg.encode('utf-8')).decode())
-                                    " > /tmp/fs_err_${issueKey}.b64
+                                        echo '${errMsg}' | python3 -c "import sys,base64;msg=sys.stdin.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/fs_err_${issueKey}.b64
                                         python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
@@ -190,11 +182,7 @@ pipeline {
                                     cat > /tmp/fs_summary_${issueKey}.txt << 'FSEOF'
                                 ${msg}
                                 FSEOF
-                                    python3 -c "
-                                import base64
-                                with open('/tmp/fs_summary_${issueKey}.txt') as f:
-                                    print(base64.b64encode(f.read().encode('utf-8')).decode())
-                                " > /tmp/fs_summary_${issueKey}.b64
+                                    python3 -c "import base64;f=open('/tmp/fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
@@ -467,12 +455,7 @@ pipeline {
                             // 1) Send "Reviewing..." progress reply
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
                             sh """
-                                echo '${progressText}' | python3 -c "
-import sys, base64, json
-msg = sys.stdin.read()
-b64 = base64.b64encode(msg.encode('utf-8')).decode()
-print(b64)
-" > /tmp/feishu_progress_b64.txt
+                                echo '${progressText}' | python3 -c "import sys,base64,json;msg=sys.stdin.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_progress_b64.txt
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
@@ -486,13 +469,7 @@ print(b64)
                                 cat > /tmp/feishu_summary_b64.txt << 'SUMMARYEOF'
 ${topicText}
 SUMMARYEOF
-                                python3 -c "
-import sys, base64
-with open('/tmp/feishu_summary_b64.txt') as f:
-    msg = f.read()
-b64 = base64.b64encode(msg.encode('utf-8')).decode()
-print(b64)
-" > /tmp/feishu_summary_b64_enc.txt
+                                python3 -c "import sys,base64;f=open('/tmp/feishu_summary_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_summary_b64_enc.txt
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
@@ -543,12 +520,7 @@ print(b64)
                                     cat > /tmp/feishu_topic_b64.txt << 'TOPICEOF'
 ${topicText}
 TOPICEOF
-                                    python3 -c "
-import base64
-with open('/tmp/feishu_topic_b64.txt') as f:
-    msg = f.read()
-print(base64.b64encode(msg.encode('utf-8')).decode())
-" > /tmp/feishu_topic_b64_enc.txt
+                                    python3 -c "import base64;f=open('/tmp/feishu_topic_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_topic_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
@@ -571,12 +543,7 @@ print(base64.b64encode(msg.encode('utf-8')).decode())
                                     cat > /tmp/feishu_engine_b64.txt << 'ENGEOF'
 ${engineDetail}
 ENGEOF
-                                    python3 -c "
-import base64
-with open('/tmp/feishu_engine_b64.txt') as f:
-    msg = f.read()
-print(base64.b64encode(msg.encode('utf-8')).decode())
-" > /tmp/feishu_engine_b64_enc.txt
+                                    python3 -c "import base64;f=open('/tmp/feishu_engine_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_engine_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
@@ -596,12 +563,7 @@ print(base64.b64encode(msg.encode('utf-8')).decode())
                                     cat > /tmp/feishu_game_b64.txt << 'GAMEOF'
 ${gameDetail}
 GAMEOF
-                                    python3 -c "
-import base64
-with open('/tmp/feishu_game_b64.txt') as f:
-    msg = f.read()
-print(base64.b64encode(msg.encode('utf-8')).decode())
-" > /tmp/feishu_game_b64_enc.txt
+                                    python3 -c "import base64;f=open('/tmp/feishu_game_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_game_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
