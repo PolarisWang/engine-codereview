@@ -158,7 +158,7 @@ def main():
     page_token = None
     while True:
         resp = list_messages(token, args.chat_id, page_size=50, page_token=page_token,
-                             start_time=window_start)
+                             start_time=window_start, end_time=now_sec)
         if not resp or resp.get("code") != 0:
             err_msg = resp.get("msg", "unknown") if resp else "no response"
             print(f"[feishu] List messages error: {err_msg}", file=sys.stderr)
