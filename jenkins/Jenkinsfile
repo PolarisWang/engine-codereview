@@ -82,8 +82,11 @@ pipeline {
                         currentBuild.result = 'SUCCESS'
                     } else {
                         echo "Processing ${items.size()} detected Jira URLs"
+                        // Deduplicate by issue_key: only process the first message per issue
+                        def uniqueIssues = items.groupBy { it.issue_key }.collect { k, v -> v[0] }
+                        echo "Processing ${uniqueIssues.size()} unique Jira issues"
                         def issueBuilds = [:]
-                        items.each { item ->
+                        uniqueIssues.each { item ->
                             def issueKey = item.issue_key
                             def jiraUrl = item.jira_url
                             def msgId = item.message_id
@@ -161,19 +164,21 @@ pipeline {
                                 def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
 
                                 // Step 4: Build and reply summary via writeFile (avoid heredoc + emoji issues)
-                                def engSev = engineResult.review?.severity_counts ?: [:]
-                                def gamSev = gameResult.review?.severity_counts ?: [:]
+                                def engSev = engineResult.review?.severity_counts
+                                if (engSev == null || engSev instanceof net.sf.json.JSONNull) engSev = [:]
+                                def gamSev = gameResult.review?.severity_counts
+                                if (gamSev == null || gamSev instanceof net.sf.json.JSONNull) gamSev = [:]
                                 def engChanged = (engineResult.changed_files ?: []).size()
                                 def gamChanged = (gameResult.changed_files ?: []).size()
                                 def engSeverity = ""
-                                if (engSev.critical)  engSeverity += "CRITICAL(${engSev.critical}) "
-                                if (engSev.warning)   engSeverity += "WARN(${engSev.warning}) "
-                                if (engSev.suggestion) engSeverity += "SUGGEST(${engSev.suggestion}) "
+                                if (engSev.get('critical'))  engSeverity += "CRITICAL(${engSev.get('critical')}) "
+                                if (engSev.get('warning'))   engSeverity += "WARN(${engSev.get('warning')}) "
+                                if (engSev.get('suggestion')) engSeverity += "SUGGEST(${engSev.get('suggestion')}) "
                                 if (!engSeverity) engSeverity = "CLEAN"
                                 def gamSeverity = ""
-                                if (gamSev.critical)  gamSeverity += "CRITICAL(${gamSev.critical}) "
-                                if (gamSev.warning)   gamSeverity += "WARN(${gamSev.warning}) "
-                                if (gamSev.suggestion) gamSeverity += "SUGGEST(${gamSev.suggestion}) "
+                                if (gamSev.get('critical'))  gamSeverity += "CRITICAL(${gamSev.get('critical')}) "
+                                if (gamSev.get('warning'))   gamSeverity += "WARN(${gamSev.get('warning')}) "
+                                if (gamSev.get('suggestion')) gamSeverity += "SUGGEST(${gamSev.get('suggestion')}) "
                                 if (!gamSeverity) gamSeverity = "CLEAN"
                                 def mrUrl = parsedInfo.mr_url ?: ''
                                 writeFile(file: "${env.WORKSPACE}/.fs_summary_${issueKey}.txt",
