@@ -217,16 +217,21 @@ def main():
             if msg_type == "text":
                 text = content_dict.get("text", "")
             elif msg_type == "post":
-                # Post content: {"zh_cn": {"content": [[{"tag":"text|a",...}]]}}
-                # Try zh_cn locale first, then any locale key
+                # Post content has two possible structures:
+                #   1) {"zh_cn": {"content": [[{tag:"text|a",...}]]}}  (locale-wrapped)
+                #   2) {"title":"", "content": [[{tag:"text|a",...}]]}  (direct)
                 paragraphs = []
                 if isinstance(content_dict, dict):
-                    for locale_key in ("zh_cn", "en_us", "content"):
-                        pc = content_dict.get(locale_key, {})
-                        if isinstance(pc, dict):
-                            paragraphs = pc.get("content", [])
-                            if paragraphs:
-                                break
+                    for locale_key in ("zh_cn", "en_us"):
+                        pc = content_dict.get(locale_key)
+                        if isinstance(pc, dict) and pc.get("content"):
+                            paragraphs = pc["content"]
+                            break
+                    if not paragraphs and content_dict.get("content"):
+                        # Direct structure — content is the paragraph list itself
+                        raw = content_dict["content"]
+                        if isinstance(raw, list) and len(raw) > 0:
+                            paragraphs = raw
                 for paragraph in paragraphs:
                     for seg in paragraph:
                         if seg.get("tag") == "text":
