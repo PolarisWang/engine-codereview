@@ -217,12 +217,22 @@ def main():
             if msg_type == "text":
                 text = content_dict.get("text", "")
             elif msg_type == "post":
-                # Post content: {"zh_cn": {"content": [[{"tag": "text", "text": "..."}]]}}
-                post_content = content_dict.get("zh_cn", {})
-                for paragraph in post_content.get("content", []):
-                    for segment in paragraph:
-                        if segment.get("tag") == "text":
-                            text += segment.get("text", "")
+                # Post content: {"zh_cn": {"content": [[{"tag":"text|a",...}]]}}
+                # Try zh_cn locale first, then any locale key
+                paragraphs = []
+                if isinstance(content_dict, dict):
+                    for locale_key in ("zh_cn", "en_us", "content"):
+                        pc = content_dict.get(locale_key, {})
+                        if isinstance(pc, dict):
+                            paragraphs = pc.get("content", [])
+                            if paragraphs:
+                                break
+                for paragraph in paragraphs:
+                    for seg in paragraph:
+                        if seg.get("tag") == "text":
+                            text += seg.get("text", "")
+                        elif seg.get("tag") == "a":
+                            text += seg.get("href", "")  # extract URL from links
         except (json.JSONDecodeError, TypeError, AttributeError):
             text = str(content)
 
