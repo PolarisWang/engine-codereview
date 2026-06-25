@@ -144,13 +144,13 @@ def main():
         print(json.dumps({"error": "Failed to get Feishu token", "items": []}))
         sys.exit(0)
 
-    # ── Calculate time window: scan last 60 seconds (with 10s buffer) ──
+    # ── Calculate time window ──
     # Use 10-digit Unix seconds for Feishu API
     now_sec = int(time.time())
-    window_start = now_sec - 70  # last 70 seconds
-    if last_start_time and last_start_time // 1000 > window_start:
-        # last_start_time was stored as milliseconds, convert to seconds
-        window_start = last_start_time // 1000
+    # On first scan (no state), look back 24h to catch any existing topic starters
+    window_start = now_sec - 86400 if not last_start_time else max(last_start_time // 1000, now_sec - 86400)
+    # Also cap at 70s going forward for incremental scans
+    window_start = max(window_start, now_sec - 70) if last_start_time else window_start
 
     print(f"[feishu] Scanning messages from {window_start} to {now_sec}", flush=True)
 
