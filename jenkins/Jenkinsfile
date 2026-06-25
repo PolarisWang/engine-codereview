@@ -127,8 +127,10 @@ pipeline {
                                     """
                                     return
                                 }
-                                def reviewBranch = parsedInfo.mr_info?.branch ?: issueKey
-                                def baseBranch = parsedInfo.mr_info?.target_branch ?: parsedInfo.default_branch ?: 'master'
+                                def mrInfo = parsedInfo.mr_info
+                                if (mrInfo instanceof net.sf.json.JSONNull) mrInfo = null
+                                def reviewBranch = mrInfo?.branch ?: issueKey
+                                def baseBranch = mrInfo?.target_branch ?: parsedInfo.default_branch ?: 'master'
                                 def engineRepo = parsedInfo.engine_repo
                                 def gameRepo = parsedInfo.game_repo
                                 def project = parsedInfo.project
