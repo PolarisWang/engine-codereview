@@ -26,7 +26,7 @@ import urllib.error
 
 # ── Jira URL pattern ──────────────────────────────────────────────────────────
 
-JIRA_URL_PATTERN = re.compile(r'https?://[\w.-]+/(?:browse|issues)/([A-Za-z]+-\d+)')
+JIRA_URL_PATTERN = re.compile(r'https?://[\w.-]+/(?:browse|issues)/([A-Za-z][A-Za-z0-9]+-\d+)')
 
 
 # ── Feishu API helpers (same pattern as feishu_notifier.py) ───────────────────
