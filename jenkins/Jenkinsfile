@@ -163,26 +163,76 @@ pipeline {
                                 def engineResult = fileExists(engFile) ? readJSON(file: engFile) : [:]
                                 def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
 
-                                // Step 4: Build and reply summary via writeFile (avoid heredoc + emoji issues)
+                                // Step 4: Build informative summary (never just "CLEAN")
                                 def engSev = engineResult.review?.severity_counts
                                 if (engSev == null || engSev instanceof net.sf.json.JSONNull) engSev = [:]
                                 def gamSev = gameResult.review?.severity_counts
                                 if (gamSev == null || gamSev instanceof net.sf.json.JSONNull) gamSev = [:]
                                 def engChanged = (engineResult.changed_files ?: []).size()
                                 def gamChanged = (gameResult.changed_files ?: []).size()
-                                def engSeverity = ""
-                                if (engSev.get('critical'))  engSeverity += "CRITICAL(${engSev.get('critical')}) "
-                                if (engSev.get('warning'))   engSeverity += "WARN(${engSev.get('warning')}) "
-                                if (engSev.get('suggestion')) engSeverity += "SUGGEST(${engSev.get('suggestion')}) "
-                                if (!engSeverity) engSeverity = "CLEAN"
-                                def gamSeverity = ""
-                                if (gamSev.get('critical'))  gamSeverity += "CRITICAL(${gamSev.get('critical')}) "
-                                if (gamSev.get('warning'))   gamSeverity += "WARN(${gamSev.get('warning')}) "
-                                if (gamSev.get('suggestion')) gamSeverity += "SUGGEST(${gamSev.get('suggestion')}) "
-                                if (!gamSeverity) gamSeverity = "CLEAN"
+                                def engFiles = (engineResult.changed_files ?: []).collect { line -> line.split("\t").size() > 1 ? line.split("\t")[1] : line.split("\\s+").size() > 1 ? line.split("\\s+")[1] : line }
+                                def gamFiles = (gameResult.changed_files ?: []).collect { line -> line.split("\t").size() > 1 ? line.split("\t")[1] : line.split("\\s+").size() > 1 ? line.split("\\s+")[1] : line }
+                                def engStats = engineResult.stats ?: ""
+                                def gamStats = gameResult.stats ?: ""
+                                def engCommits = engineResult.commits ?: ""
+                                def gamCommits = gameResult.commits ?: ""
+                                def engError = engineResult.review?.error ?: engineResult.error ?: ""
+                                def gamError = gameResult.review?.error ?: gameResult.error ?: ""
+
+                                // Build engine section
+                                def engText = ""
+                                if (engError) {
+                                    engText = "🔧 **Engine 仓库** ❌ 审查失败\n原因: ${engError}"
+                                } else if (engChanged == 0) {
+                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更（可能 MR 分支已经合并到目标分支，或分支名不匹配）"
+                                } else {
+                                    engText = "🔧 **Engine 仓库**\n变更文件: ${engChanged} 个"
+                                    if (engStats) engText += " (${engStats})"
+                                    if (engSev.get('critical'))  engText += "\n🔴 Critical: ${engSev.get('critical')}"
+                                    if (engSev.get('warning'))   engText += "\n🟡 Warning: ${engSev.get('warning')}"
+                                    if (engSev.get('suggestion')) engText += "\nℹ️ Suggestion: ${engSev.get('suggestion')}"
+                                    if (!engSev.get('critical') && !engSev.get('warning') && !engSev.get('suggestion')) {
+                                        engText += "\n✅ 未发现严重问题"
+                                    }
+                                }
+
+                                // Build game section
+                                def gamText = ""
+                                if (gamError) {
+                                    gamText = "🎮 **Game 仓库** ❌ 审查失败\n原因: ${gamError}"
+                                } else if (gamChanged == 0) {
+                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更（可能 MR 分支已经合并到目标分支，或分支名不匹配）"
+                                } else {
+                                    gamText = "🎮 **Game 仓库**\n变更文件: ${gamChanged} 个"
+                                    if (gamStats) gamText += " (${gamStats})"
+                                    if (gamSev.get('critical'))  gamText += "\n🔴 Critical: ${gamSev.get('critical')}"
+                                    if (gamSev.get('warning'))   gamText += "\n🟡 Warning: ${gamSev.get('warning')}"
+                                    if (gamSev.get('suggestion')) gamText += "\nℹ️ Suggestion: ${gamSev.get('suggestion')}"
+                                    if (!gamSev.get('critical') && !gamSev.get('warning') && !gamSev.get('suggestion')) {
+                                        gamText += "\n✅ 未发现严重问题"
+                                    }
+                                }
+
                                 def mrUrl = parsedInfo.mr_url ?: ''
+                                def summaryText = "**🔍 Code Review 报告: ${issueKey}**\n\n"
+                                summaryText += "**项目:** ${project}\n"
+                                summaryText += "**分支:** ${reviewBranch} → ${baseBranch}\n"
+                                if (mrUrl) summaryText += "**MR:** ${mrUrl}\n"
+                                summaryText += "\n${engText}\n"
+                                summaryText += "\n${gamText}\n"
+                                summaryText += "\n---\n📎 Jira: ${jiraUrl}"
+
                                 writeFile(file: "${env.WORKSPACE}/.fs_summary_${issueKey}.txt",
-                                    text: "Project: ${project}\nBranch: ${reviewBranch} -> ${baseBranch}\n${mrUrl ? 'MR: ' + mrUrl + '\n' : ''}\nEngine(${engChanged} files): ${engSeverity}\nGame(${gamChanged} files): ${gamSeverity}")
+                                    text: summaryText)
+                                sh """
+                                    python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
+                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        --app-id '${env.FEISHU_APP_ID}' \
+                                        --app-secret '${env.FEISHU_APP_SECRET}' \
+                                        --chat-id '${env.FEISHU_CHAT_ID}' \
+                                        --message-id '${msgId}' \
+                                        --message-base64 \$(cat /tmp/fs_summary_${issueKey}.b64)
+                                """
                                 sh """
                                     python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
@@ -400,48 +450,47 @@ pipeline {
                 def gameResult   = fileExists(GAME_RESULT_FILE)   ? readJSON(file: GAME_RESULT_FILE)   : [:]
                 def feishuWebhook = env.FEISHU_WEBHOOK_URL ?: ''
 
-                // Build severity summary
-                def buildSevText = { result ->
+                // Build severity summary with context
+                def buildRepoBlock = { result, repoLabel, repoIcon ->
                     def sev = result.review?.severity_counts ?: [:]
-                    def parts = []
-                    if (sev.critical)  parts.append("🔴 ${sev.critical}")
-                    if (sev.warning)   parts.append("🟡 ${sev.warning}")
-                    if (sev.suggestion)parts.append("ℹ️ ${sev.suggestion}")
-                    return parts ? parts.join(' | ') : '✅ Clean'
-                }
-                engineSev = buildSevText(engineResult)
-                gameSev   = buildSevText(gameResult)
-
-                // Count changed files
-                def engineFiles = (engineResult.changed_files ?: []).size()
-                def gameFiles   = (gameResult.changed_files   ?: []).size()
-
-                // Build topic message
-                def buildTopicText = { repoType, result ->
-                    def sev = result.review?.severity_counts ?: [:]
-                    def reviewText = result.review?.review_text ?: ''
                     def changedFiles = (result.changed_files ?: []).size()
+                    def statsStr = result.stats ?: ''
+                    def errorStr = result.review?.error ?: result.error ?: ''
                     def mrUrl = result.mr_url ?: ''
 
-                    def text = "**${repoType == 'engine' ? '🔧' : '🎮'} ${repoType == 'engine' ? 'Engine' : 'Game'} 仓库**\n"
-                    text += "${changedFiles} files changed\n"
-                    if (sev.critical)  text += "🔴 Critical: ${sev.critical}  "
-                    if (sev.warning)   text += "🟡 Warning: ${sev.warning}  "
-                    if (sev.suggestion)text += "ℹ️ Suggestion: ${sev.suggestion}"
-                    if (!sev.critical && !sev.warning && !sev.suggestion) text += "✅ No issues found"
+                    def text = "${repoIcon} **${repoLabel} 仓库**\n"
+                    if (errorStr) {
+                        text += "❌ 审查失败\n原因: ${errorStr}\n"
+                    } else if (changedFiles == 0) {
+                        text += "⏭️ 跳过审查\n原因: 该分支相对于目标分支没有代码变更\n"
+                    } else {
+                        text += "变更文件: ${changedFiles} 个"
+                        if (statsStr) text += " (${statsStr})"
+                        text += "\n"
+                        if (sev.get('critical'))  text += "🔴 Critical: ${sev.get('critical')}  "
+                        if (sev.get('warning'))   text += "🟡 Warning: ${sev.get('warning')}  "
+                        if (sev.get('suggestion')) text += "\nℹ️ Suggestion: ${sev.get('suggestion')}"
+                        if (!sev.get('critical') && !sev.get('warning') && !sev.get('suggestion')) {
+                            text += "✅ 未发现严重问题"
+                        }
+                    }
                     if (mrUrl) text += "\nMR: ${mrUrl}"
                     return text
                 }
 
+                def engineSev = ""
+                def gameSev   = ""
+
                 def topicParts = []
                 topicParts.add("**🔍 Code Review: ${env.ISSUE_KEY}**")
-                topicParts.add("Project: ${env.PROJECT}")
+                topicParts.add("项目: ${env.PROJECT}")
+                topicParts.add("分支: ${env.REVIEW_BRANCH} → ${env.BASE_BRANCH}")
                 topicParts.add("Jira: ${params.JIRA_URL}")
                 topicParts.add("")
-                topicParts.add(buildTopicText('engine', engineResult))
-                if (gameResult && gameResult.review?.review_text) {
+                topicParts.add(buildRepoBlock(engineResult, 'Engine', '🔧'))
+                if (gameResult) {
                     topicParts.add("")
-                    topicParts.add(buildTopicText('game', gameResult))
+                    topicParts.add(buildRepoBlock(gameResult, 'Game', '🎮'))
                 }
                 def topicText = topicParts.join('\n')
 
@@ -466,12 +515,10 @@ pipeline {
                                     --message-base64 \$(cat /tmp/feishu_progress_b64.txt)
                             """
 
-                            // 2) Reply with summary
+                            // 2) Reply with summary (use writeFile to avoid heredoc/emoji issues)
+                            writeFile(file: "${env.WORKSPACE}/.fs_direct_summary.txt", text: topicText)
                             sh """
-                                cat > /tmp/feishu_summary_b64.txt << 'SUMMARYEOF'
-${topicText}
-SUMMARYEOF
-                                python3 -c "import sys,base64;f=open('/tmp/feishu_summary_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_summary_b64_enc.txt
+                                python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_direct_summary.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/feishu_summary_b64_enc.txt
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
@@ -517,12 +564,10 @@ SUMMARYEOF
                             }
                         } else {
                             // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
+                            writeFile(file: "${env.WORKSPACE}/.fs_direct_topic.txt", text: topicText)
                             def topicResult = sh(
                                 script: """
-                                    cat > /tmp/feishu_topic_b64.txt << 'TOPICEOF'
-${topicText}
-TOPICEOF
-                                    python3 -c "import base64;f=open('/tmp/feishu_topic_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_topic_b64_enc.txt
+                                    python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_direct_topic.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/feishu_topic_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
@@ -541,17 +586,14 @@ TOPICEOF
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
+                                writeFile(file: "${env.WORKSPACE}/.fs_detail_engine_${env.ISSUE_KEY}.txt", text: engineDetail)
                                 sh """
-                                    cat > /tmp/feishu_engine_b64.txt << 'ENGEOF'
-${engineDetail}
-ENGEOF
-                                    python3 -c "import base64;f=open('/tmp/feishu_engine_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_engine_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
                                         --message-id '${topicMsgId}' \
-                                        --message-base64 \$(cat /tmp/feishu_engine_b64_enc.txt)
+                                        --message-file '${env.WORKSPACE}/.fs_detail_engine_${env.ISSUE_KEY}.txt'
                                 """
                             }
 
@@ -561,17 +603,14 @@ ENGEOF
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
+                                writeFile(file: "${env.WORKSPACE}/.fs_detail_game_${env.ISSUE_KEY}.txt", text: gameDetail)
                                 sh """
-                                    cat > /tmp/feishu_game_b64.txt << 'GAMEOF'
-${gameDetail}
-GAMEOF
-                                    python3 -c "import base64;f=open('/tmp/feishu_game_b64.txt');msg=f.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_game_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
                                         --message-id '${topicMsgId}' \
-                                        --message-base64 \$(cat /tmp/feishu_game_b64_enc.txt)
+                                        --message-file '${env.WORKSPACE}/.fs_detail_game_${env.ISSUE_KEY}.txt'
                                 """
                             }
 
@@ -647,7 +686,7 @@ GAMEOF
         }
 
         cleanup {
-            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json || true"
+            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id || true"
         }
     }
 }
