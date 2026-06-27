@@ -85,7 +85,7 @@ def load_config():
     }
 
 
-def run_git(cmd, cwd, timeout=180):
+def run_git(cmd, cwd, timeout=600):
     """Run a git command, return (returncode, stdout, stderr)."""
     result = subprocess.run(
         cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout
@@ -130,7 +130,7 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
 
     if cache and os.path.isdir(repo_dir):
         print(f"[git] Updating cached repo: {repo_name}")
-        run_git([GIT_PATH, "fetch", "--all"], repo_dir)
+        run_git([GIT_PATH, "fetch", "origin"], repo_dir, timeout=300)
         run_git([GIT_PATH, "reset", "--hard"], repo_dir)
         rc, _, _ = run_git([GIT_PATH, "checkout", branch], repo_dir)
         if rc != 0:
