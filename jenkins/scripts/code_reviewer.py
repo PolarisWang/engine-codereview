@@ -106,10 +106,12 @@ def ssh_to_https(repo_url):
 def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True):
     """
     Clone (or fetch) repo, checkout branch, return path and diff info.
-    Returns dict with: diff_text, changed_files, insertions, deletions, commit_log
+    Returns dict with: diff_text, changed_files, insertions, deletions, commit_log, branch_exists, branch_merged
     """
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     repo_dir = os.path.join(workspace, repo_name)
+    branch_exists = True
+    branch_merged = False
 
     # Always convert SSH→HTTPS and use token auth for GitLab
     if repo_url.startswith("git@"):
@@ -134,6 +136,7 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         if rc != 0:
             rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
         if rc != 0:
+            branch_exists = False
             run_git([GIT_PATH, "checkout", base_branch], repo_dir)
             run_git([GIT_PATH, "pull", "origin", base_branch], repo_dir)
             rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
@@ -147,6 +150,7 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         )
         if rc != 0:
             print(f"[git] Clone failed for '{branch}': {err[:300]}", flush=True)
+            branch_exists = False
             # Branch may not exist remotely — clone default branch
             rc, out, err = run_git(
                 [GIT_PATH, "clone", "--single-branch", repo_url, repo_dir],
@@ -196,11 +200,25 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         [GIT_PATH, "log", f"origin/{base_branch}..{branch}", "--oneline", "--no-decorate"], repo_dir
     )
 
+    # Detect if branch is merged (branch exists but no new commits vs base)
+    if not diff_text and branch_exists:
+        rc, merge_base_commit, _ = run_git(
+            [GIT_PATH, "merge-base", branch, f"origin/{base_branch}"], repo_dir
+        )
+        rc, head_commit, _ = run_git(
+            [GIT_PATH, "rev-parse", branch], repo_dir
+        )
+        if merge_base_commit == head_commit:
+            branch_merged = True
+            print(f"[git] Branch '{branch}' is fully merged into '{base_branch}' (HEAD at merge-base)", flush=True)
+
     return {
         "diff_text": diff_text,
         "changed_files": changed_files,
         "stats": stats_str,
         "commit_log": commit_log[:5000] if len(commit_log) > 5000 else commit_log,
+        "branch_exists": branch_exists,
+        "branch_merged": branch_merged,
         "repo_dir": repo_dir,
     }
 
@@ -365,6 +383,8 @@ def main():
             "mr_url": args.mr_url or "",
             "changed_files": diff_info["changed_files"],
             "stats": diff_info["stats"],
+            "branch_exists": diff_info["branch_exists"],
+            "branch_merged": diff_info["branch_merged"],
             "review": {
                 "summary": "No changes to review — branch is up to date with base.",
                 "findings": [],
@@ -387,6 +407,8 @@ def main():
             "changed_files": diff_info["changed_files"],
             "stats": diff_info["stats"],
             "commits": diff_info["commit_log"],
+            "branch_exists": diff_info["branch_exists"],
+            "branch_merged": diff_info["branch_merged"],
             "review": review_result,
         }
 

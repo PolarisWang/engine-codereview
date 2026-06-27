@@ -210,13 +210,15 @@ def get_remote_links(issue_key, host, token, gitlab_token=None):
         if url and ("merge request" in title.lower() or "mr" in title.lower()):
             branch = ""
             target_branch = ""
+            mr_state = ""
             # Try GitLab API for real branch info
             if gitlab_token:
                 mr_info = gitlab_get_mr(url, gitlab_token)
                 if mr_info:
                     branch = mr_info["source_branch"]
                     target_branch = mr_info["target_branch"]
-                    print(f"[gitlab] MR {url}: source={branch}, target={target_branch}",
+                    mr_state = mr_info.get("state", "")
+                    print(f"[gitlab] MR {url}: source={branch}, target={target_branch}, state={mr_state}",
                           file=sys.stderr)
 
             result.append({
@@ -224,6 +226,7 @@ def get_remote_links(issue_key, host, token, gitlab_token=None):
                 "url": url,
                 "branch": branch,
                 "target_branch": target_branch,
+                "state": mr_state,
             })
     return result
 
@@ -319,10 +322,12 @@ def main():
                 for link in remote_links:
                     branch = link.get("branch", "")
                     target_branch = link.get("target_branch", "")
+                    mr_state = link.get("state", "")
                     if branch:
                         result["mr_info"] = {
                             "branch": branch,
                             "target_branch": target_branch or project_cfg["default_branch"],
+                            "state": mr_state,
                         }
                         break
 

@@ -180,12 +180,22 @@ pipeline {
                                 def engError = engineResult.review?.error ?: engineResult.error ?: ""
                                 def gamError = gameResult.review?.error ?: gameResult.error ?: ""
 
-                                // Build engine section
+                                // Build engine section — determine precise reason for no diff
                                 def engText = ""
+                                def engBranchMerged = engineResult.branch_merged ?: false
+                                def engBranchExists = engineResult.containsKey('branch_exists') ? engineResult.branch_exists : true
+                                def mrState = parsedInfo.mr_info?.state ?: ""
                                 if (engError) {
                                     engText = "🔧 **Engine 仓库** ❌ 审查失败\n原因: ${engError}"
+                                } else if (!engBranchExists) {
+                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 在远程仓库中不存在（可能已被删除或从未创建）"
+                                } else if (engBranchMerged) {
+                                    def mergedHint = ""
+                                    if (mrState == "merged") mergedHint = "GitLab 显示该 MR 已合并"
+                                    else if (mrState == "closed") mergedHint = "GitLab 显示该 MR 已关闭"
+                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 已经合并到 `${baseBranch}`，没有新的代码变更${mergedHint ? '（' + mergedHint + '）' : ''}"
                                 } else if (engChanged == 0) {
-                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更（可能 MR 分支已经合并到目标分支，或分支名不匹配）"
+                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更"
                                 } else {
                                     engText = "🔧 **Engine 仓库**\n变更文件: ${engChanged} 个"
                                     if (engStats) engText += " (${engStats})"
@@ -199,10 +209,16 @@ pipeline {
 
                                 // Build game section
                                 def gamText = ""
+                                def gamBranchMerged = gameResult.branch_merged ?: false
+                                def gamBranchExists = gameResult.containsKey('branch_exists') ? gameResult.branch_exists : true
                                 if (gamError) {
                                     gamText = "🎮 **Game 仓库** ❌ 审查失败\n原因: ${gamError}"
+                                } else if (!gamBranchExists) {
+                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 在远程仓库中不存在（可能已被删除或从未创建）"
+                                } else if (gamBranchMerged) {
+                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 已经合并到 `${baseBranch}`，没有新的代码变更"
                                 } else if (gamChanged == 0) {
-                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更（可能 MR 分支已经合并到目标分支，或分支名不匹配）"
+                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更"
                                 } else {
                                     gamText = "🎮 **Game 仓库**\n变更文件: ${gamChanged} 个"
                                     if (gamStats) gamText += " (${gamStats})"
@@ -225,15 +241,6 @@ pipeline {
 
                                 writeFile(file: "${env.WORKSPACE}/.fs_summary_${issueKey}.txt",
                                     text: summaryText)
-                                sh """
-                                    python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
-                                        --app-id '${env.FEISHU_APP_ID}' \
-                                        --app-secret '${env.FEISHU_APP_SECRET}' \
-                                        --chat-id '${env.FEISHU_CHAT_ID}' \
-                                        --message-id '${msgId}' \
-                                        --message-base64 \$(cat /tmp/fs_summary_${issueKey}.b64)
-                                """
                                 sh """
                                     python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
@@ -458,10 +465,16 @@ pipeline {
                     def statsStr = result.stats ?: ''
                     def errorStr = result.review?.error ?: result.error ?: ''
                     def mrUrl = result.mr_url ?: ''
+                    def branchMerged = result.branch_merged ?: false
+                    def branchExists = result.containsKey('branch_exists') ? result.branch_exists : true
 
                     def text = "${repoIcon} **${repoLabel} 仓库**\n"
                     if (errorStr) {
                         text += "❌ 审查失败\n原因: ${errorStr}\n"
+                    } else if (!branchExists) {
+                        text += "⏭️ 跳过审查\n原因: 分支在远程仓库中不存在（可能已被删除或从未创建）\n"
+                    } else if (branchMerged) {
+                        text += "⏭️ 跳过审查\n原因: 分支已经合并到目标分支，没有新的代码变更\n"
                     } else if (changedFiles == 0) {
                         text += "⏭️ 跳过审查\n原因: 该分支相对于目标分支没有代码变更\n"
                     } else {
