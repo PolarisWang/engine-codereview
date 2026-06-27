@@ -119,17 +119,17 @@ pipeline {
                                 def gamFile = "${env.WORKSPACE}/result_${issueKey}_game.json"
                                 def infoFile = "${env.WORKSPACE}/parsed_${issueKey}.json"
 
-                                // Step 1: Reply "reviewing..." in Feishu thread (use writeFile to avoid echo + emoji issues)
+                                // Step 1: Reply "reviewing..." in Feishu thread
+                                // Use base64 to bypass any file encoding issues
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
-                                writeFile(file: "${env.WORKSPACE}/.fs_progress_${issueKey}.txt", encoding: "UTF-8",
-                                    text: progressText)
+                                def progressB64 = progressText.bytes.encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
                                         --message-id '${msgId}' \
-                                        --message-file '${env.WORKSPACE}/.fs_progress_${issueKey}.txt'
+                                        --message-base64 '${progressB64}'
                                 """
 
                                 // Step 2: Parse Jira → project + MR info
@@ -144,14 +144,14 @@ pipeline {
                                 def parsedInfo = readJSON(file: infoFile)
                                 if (parsedInfo.containsKey('error')) {
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
-                                    writeFile(file: "${env.WORKSPACE}/.fs_err_${issueKey}.txt", text: errMsg, encoding: "UTF-8")
+                                    def errB64 = errMsg.bytes.encodeBase64().toString()
                                     sh """
                                         python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
                                             --message-id '${msgId}' \
-                                            --message-file '${env.WORKSPACE}/.fs_err_${issueKey}.txt'
+                                            --message-base64 '${errB64}'
                                     """
                                     return
                                 }
@@ -263,15 +263,14 @@ pipeline {
                                 summaryText += "\n${gamText}\n"
                                 summaryText += "\n---\n📎 Jira: ${jiraUrl}"
 
-                                writeFile(file: "${env.WORKSPACE}/.fs_summary_${issueKey}.txt", encoding: "UTF-8",
-                                    text: summaryText)
+                                def summaryB64 = summaryText.bytes.encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
                                         --message-id '${msgId}' \
-                                        --message-file '${env.WORKSPACE}/.fs_summary_${issueKey}.txt'
+                                        --message-base64 '${summaryB64}'
                                 """
 
                                 // Step 5: Reply with engine detail (if any findings)
@@ -281,15 +280,14 @@ pipeline {
                                     if (detail.length() > maxLen) {
                                         detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
                                     }
-                                    writeFile(file: "${env.WORKSPACE}/.fs_engine_${issueKey}.txt", encoding: "UTF-8",
-                                              text: "**🔧 Engine 详细报告:**\n${detail}")
+                                    def engineB64 = "**🔧 Engine 详细报告:**\n${detail}".bytes.encodeBase64().toString()
                                     sh """
                                         python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
                                             --message-id '${msgId}' \
-                                            --message-file '${env.WORKSPACE}/.fs_engine_${issueKey}.txt'
+                                            --message-base64 '${engineB64}'
                                     """
                                 }
 
@@ -300,15 +298,14 @@ pipeline {
                                     if (detail.length() > maxLen) {
                                         detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
                                     }
-                                    writeFile(file: "${env.WORKSPACE}/.fs_game_${issueKey}.txt", encoding: "UTF-8",
-                                              text: "**🎮 Game 详细报告:**\n${detail}")
+                                    def gameB64 = "**🎮 Game 详细报告:**\n${detail}".bytes.encodeBase64().toString()
                                     sh """
                                         python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
                                             --message-id '${msgId}' \
-                                            --message-file '${env.WORKSPACE}/.fs_game_${issueKey}.txt'
+                                            --message-base64 '${gameB64}'
                                     """
                                 }
 
@@ -550,25 +547,25 @@ pipeline {
                             // ── Reply in existing topic (from FEISHU_REPLY_MSG_ID) ──
                             // 1) Send "Reviewing..." progress reply
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
-                            writeFile(file: "${env.WORKSPACE}/.fs_direct_progress.txt", text: progressText, encoding: "UTF-8")
+                            def progressB64 = progressText.bytes.encodeBase64().toString()
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
                                     --message-id '${topicMsgId}' \
-                                    --message-file '${env.WORKSPACE}/.fs_direct_progress.txt'
+                                    --message-base64 '${progressB64}'
                             """
 
-                            // 2) Reply with summary (use --message-file to avoid base64 encoding issues)
-                            writeFile(file: "${env.WORKSPACE}/.fs_direct_summary.txt", text: topicText, encoding: "UTF-8")
+                            // 2) Reply with summary
+                            def summaryB64 = topicText.bytes.encodeBase64().toString()
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
                                     --message-id '${topicMsgId}' \
-                                    --message-file '${env.WORKSPACE}/.fs_direct_summary.txt'
+                                    --message-base64 '${summaryB64}'
                             """
 
                             // 3) Reply with engine review details
@@ -578,14 +575,14 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeFile(file: 'feishu_engine_reply.json', text: "**🔧 Engine 详细报告:**\n${engineDetail}", encoding: "UTF-8")
+                                def engineB64 = "**🔧 Engine 详细报告:**\n${engineDetail}".bytes.encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
                                         --message-id '${topicMsgId}' \
-                                        --message-file '${env.WORKSPACE}/feishu_engine_reply.json'
+                                        --message-base64 '${engineB64}'
                                 """
                             }
 
@@ -596,26 +593,26 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeFile(file: 'feishu_game_reply.json', text: "**🎮 Game 详细报告:**\n${gameDetail}", encoding: "UTF-8")
+                                def gameB64 = "**🎮 Game 详细报告:**\n${gameDetail}".bytes.encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
                                         --message-id '${topicMsgId}' \
-                                        --message-file '${env.WORKSPACE}/feishu_game_reply.json'
+                                        --message-base64 '${gameB64}'
                                 """
                             }
                         } else {
                             // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
-                            writeFile(file: "${env.WORKSPACE}/.fs_direct_topic.txt", text: topicText, encoding: "UTF-8")
+                            def topicB64 = topicText.bytes.encodeBase64().toString()
                             def topicResult = sh(
                                 script: """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
-                                        --message-file '${env.WORKSPACE}/.fs_direct_topic.txt'
+                                        --message-base64 '${topicB64}'
                                 """,
                                 returnStdout: true
                             ).trim()
@@ -629,14 +626,14 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeFile(file: "${env.WORKSPACE}/.fs_detail_engine_${env.ISSUE_KEY}.txt", text: engineDetail, encoding: "UTF-8")
+                                def engineB64 = engineDetail.bytes.encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
                                         --message-id '${topicMsgId}' \
-                                        --message-file '${env.WORKSPACE}/.fs_detail_engine_${env.ISSUE_KEY}.txt'
+                                        --message-base64 '${engineB64}'
                                 """
                             }
 
@@ -646,14 +643,14 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                writeFile(file: "${env.WORKSPACE}/.fs_detail_game_${env.ISSUE_KEY}.txt", text: gameDetail, encoding: "UTF-8")
+                                def gameB64 = gameDetail.bytes.encodeBase64().toString()
                                 sh """
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
                                         --message-id '${topicMsgId}' \
-                                        --message-file '${env.WORKSPACE}/.fs_detail_game_${env.ISSUE_KEY}.txt'
+                                        --message-base64 '${gameB64}'
                                 """
                             }
 
@@ -662,20 +659,20 @@ pipeline {
                     } catch (Exception e) {
                         echo "Bot API notification failed, falling back to webhook: ${e}"
                         if (env.FEISHU_WEBHOOK_URL) {
-                            writeFile(file: 'feishu_msg.json', text: topicText, encoding: "UTF-8")
+                            def webhookB64 = topicText.bytes.encodeBase64().toString()
                             sh """
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                     --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
-                                    --message-file '${env.WORKSPACE}/feishu_msg.json'
+                                    --message-base64 '${webhookB64}'
                             """
                         }
                     }
                 } else if (env.FEISHU_WEBHOOK_URL) {
-                    writeFile(file: 'feishu_msg.json', text: topicText, encoding: "UTF-8")
+                    def webhookB64 = topicText.bytes.encodeBase64().toString()
                     sh """
                         python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                             --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
-                            --message-file '${env.WORKSPACE}/feishu_msg.json'
+                            --message-base64 '${webhookB64}'
                     """
                 }
 
@@ -706,22 +703,22 @@ pipeline {
 
                     if (topicMsgId && feishuAppId && feishuAppSecret) {
                         def errText = "❌ **Code Review Failed**: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
-                        writeFile(file: 'feishu_err_reply.json', text: errText, encoding: "UTF-8")
+                        def errB64 = errText.bytes.encodeBase64().toString()
                         sh """
                             python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                 --app-id '${feishuAppId}' \
                                 --app-secret '${feishuAppSecret}' \
                                 --chat-id '${env.FEISHU_CHAT_ID}' \
                                 --message-id '${topicMsgId}' \
-                                --message-file '${env.WORKSPACE}/feishu_err_reply.json'
+                                --message-base64 '${errB64}'
                         """
                     } else if (env.FEISHU_WEBHOOK_URL) {
                         def msgText = "❌ Code Review Failed: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
-                        writeFile(file: 'feishu_err_msg.json', text: msgText, encoding: "UTF-8")
+                        def msgB64 = msgText.bytes.encodeBase64().toString()
                         sh """
                             python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                 --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
-                                --message-file '${env.WORKSPACE}/feishu_err_msg.json'
+                                --message-base64 '${msgB64}'
                         """
                     }
                 }

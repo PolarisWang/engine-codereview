@@ -36,6 +36,25 @@ import urllib.error
 import base64
 
 
+STDIN_PREFIX = "@stdin"
+
+
+def read_message_text(args):
+    """Resolve message text from --message, --message-file, --message-base64, or stdin."""
+    if args.message_base64:
+        return base64.b64decode(args.message_base64).decode("utf-8")
+    if args.message_file:
+        if args.message_file == STDIN_PREFIX:
+            return sys.stdin.read()
+        with open(args.message_file, encoding="utf-8") as f:
+            raw = f.read()
+        try:
+            return json.loads(raw) if isinstance(json.loads(raw), str) else raw
+        except (json.JSONDecodeError, ValueError):
+            return raw
+    return args.message
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _request(method, url, data=None, headers=None, raw_body=None):
@@ -235,16 +254,8 @@ def build_result_card(issue_key, project, engine_result, game_result, jira_url):
 
 def cmd_webhook(args):
     """Send message via webhook."""
-    if args.message_file:
-        with open(args.message_file, encoding="utf-8") as f:
-            raw = f.read()
-        try:
-            content = json.loads(raw)
-        except json.JSONDecodeError:
-            content = raw
-    else:
-        content = args.message
-    resp = send_webhook(args.webhook_url, content)
+    text = read_message_text(args)
+    resp = send_webhook(args.webhook_url, text)
     print(json.dumps(resp, indent=2))
 
 
@@ -269,17 +280,7 @@ def cmd_send_message(args):
     token = get_tenant_token(args.app_id, args.app_secret)
     if not token:
         sys.exit(1)
-    if args.message_base64:
-        text = base64.b64decode(args.message_base64).decode("utf-8")
-    elif args.message_file:
-        with open(args.message_file, encoding="utf-8") as f:
-            raw = f.read()
-        try:
-            text = json.loads(raw)
-        except json.JSONDecodeError:
-            text = raw
-    else:
-        text = args.message
+    text = read_message_text(args)
     resp = send_text_message(token, args.chat_id, text)
     if resp and resp.get("code") == 0:
         msg_id = resp.get("data", {}).get("message_id", "")
@@ -294,17 +295,7 @@ def cmd_reply_message(args):
     token = get_tenant_token(args.app_id, args.app_secret)
     if not token:
         sys.exit(1)
-    if args.message_base64:
-        text = base64.b64decode(args.message_base64).decode("utf-8")
-    elif args.message_file:
-        with open(args.message_file, encoding="utf-8") as f:
-            raw = f.read()
-        try:
-            text = json.loads(raw)
-        except json.JSONDecodeError:
-            text = raw
-    else:
-        text = args.message
+    text = read_message_text(args)
     resp = reply_in_thread(token, args.chat_id, args.message_id, text)
     if resp and resp.get("code") == 0:
         msg_id = resp.get("data", {}).get("message_id", "")
@@ -339,6 +330,7 @@ def main():
     p.add_argument("--webhook-url", required=True)
     p.add_argument("--message", help="Message text or JSON string")
     p.add_argument("--message-file", help="Read message from JSON file")
+    p.add_argument("--message-base64", help="Base64-encoded message text")
 
     # ── send-card ──
     p = sub.add_parser("send-card", help="Send initial processing card")
