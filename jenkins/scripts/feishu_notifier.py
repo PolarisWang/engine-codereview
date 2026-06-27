@@ -56,9 +56,11 @@ def _request(method, url, data=None, headers=None, raw_body=None):
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
+            raw = resp.read()
+            return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as e:
-        print(f"[ERROR] HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"[ERROR] HTTP {e.code}: {error_body[:500]}", file=sys.stderr)
         return None
 
 
@@ -82,17 +84,26 @@ def send_webhook(webhook_url, content):
 
 
 def send_text_message(token, chat_id, text):
-    """Send a post (rich text) message to a chat."""
+    """Send an interactive card message to a chat."""
     url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    content = {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}
-    content_str = json.dumps(content, ensure_ascii=False)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "Code Review"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": text},
+        ],
+    }
+    content_str = json.dumps(card, ensure_ascii=False)
     body = json.dumps({
         "receive_id": chat_id,
-        "msg_type": "post",
+        "msg_type": "interactive",
         "content": content_str,
     }, ensure_ascii=False)
     resp = _request("POST", url, headers=headers, raw_body=body)
@@ -100,32 +111,30 @@ def send_text_message(token, chat_id, text):
 
 
 def reply_in_thread(token, chat_id, parent_message_id, text):
-    """Reply to a message thread with post (rich text) content."""
+    """Reply to a message thread with an interactive card (supports markdown & emoji)."""
     url = f"https://open.feishu.cn/open-apis/im/v1/messages/{parent_message_id}/reply"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    content = {"zh_cn": {"content": [[{"tag": "text", "text": text}]]}}
-    content_str = json.dumps(content, ensure_ascii=False)
+    # Use interactive card format for reliable encoding and markdown rendering
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "Code Review"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": text},
+        ],
+    }
+    content_str = json.dumps(card, ensure_ascii=False)
     body = json.dumps({
-        "msg_type": "post",
+        "msg_type": "interactive",
         "content": content_str,
     }, ensure_ascii=False)
     resp = _request("POST", url, headers=headers, raw_body=body)
-    return resp
-    """Send an interactive card message to a chat."""
-    url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "receive_id": chat_id,
-        "msg_type": "interactive",
-        "content": json.dumps(card),
-    }
-    resp = _request("POST", url, data, headers)
+    print(f"[feishu] reply_in_thread response: {json.dumps(resp, ensure_ascii=False)[:200] if resp else 'None'}", file=sys.stderr)
     return resp
 
 
