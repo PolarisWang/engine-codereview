@@ -44,7 +44,7 @@ pipeline {
         PYTHON = sh(script: "which python3 2>/dev/null || which python 2>/dev/null || echo '/usr/bin/python3'", returnStdout: true).trim()
         SCRIPTS_DIR = "${env.WORKSPACE}/jenkins/scripts"
         CONFIG_FILE = "${env.WORKSPACE}/config.yaml"
-        REVIEW_WORKSPACE = "${env.WORKSPACE}/review-workspace"
+        REVIEW_WORKSPACE = "${env.HOME}/codereview-workspace"
         SCAN_RESULT_FILE = "${env.WORKSPACE}/scan_result.json"
         PARSED_INFO_FILE = "${env.WORKSPACE}/parsed_info.json"
         ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
@@ -737,7 +737,7 @@ pipeline {
         }
 
         cleanup {
-            sh "rm -rf ${REVIEW_WORKSPACE} ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id || true"
+            sh "rm -rf ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id || true"
         }
     }
 }
