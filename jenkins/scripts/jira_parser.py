@@ -213,6 +213,10 @@ def get_remote_links(issue_key, host, token, gitlab_token=None):
             mr_state = ""
             # Try GitLab API for real branch info
             if gitlab_token:
+                # Skip non-MR URLs (e.g., commit links)
+                proj, iid = parse_gitlab_mr_url(url)
+                if not proj:
+                    continue
                 mr_info = gitlab_get_mr(url, gitlab_token)
                 if mr_info:
                     branch = mr_info["source_branch"]
@@ -319,34 +323,51 @@ def main():
                 if remote_links:
                     result["mr_url"] = remote_links[0].get("url", "")
                 # Use branch info from GitLab API if available
+                # Prefer opened MRs over closed/merged ones
+                best_mr = None
                 for link in remote_links:
                     branch = link.get("branch", "")
                     target_branch = link.get("target_branch", "")
                     mr_state = link.get("state", "")
                     if branch:
-                        result["mr_info"] = {
+                        mr_info = {
                             "branch": branch,
                             "target_branch": target_branch or project_cfg["default_branch"],
                             "state": mr_state,
                         }
-                        break
+                        # Prefer opened MRs; if no open MR found, use the last one with a branch
+                        if mr_state == "opened":
+                            best_mr = mr_info
+                            break
+                        best_mr = mr_info
+                if best_mr:
+                    result["mr_info"] = best_mr
 
         # Step 3c: If we have mr_info from GitLab, also try to find per-repo MR URLs
         # (engine and game repos may use different MRs)
         if result.get("mr_info") and result.get("mr_url"):
             mr_info = result["mr_info"]
             # Try to find game repo MR URL from the same Jira remote links
+            game_mr_info = None
             for link in result.get("mr_links", []):
                 if link.get("url") and link["url"] != result.get("mr_url"):
                     l_branch = link.get("branch", "")
                     l_target = link.get("target_branch", "")
+                    l_state = link.get("state", "")
                     if l_branch:
-                        result.setdefault("game_mr_info", {
+                        candidate = {
                             "branch": l_branch,
                             "target_branch": l_target or project_cfg["default_branch"],
-                        })
-                        result["game_mr_url"] = link["url"]
-                        break
+                        }
+                        if l_state == "opened":
+                            game_mr_info = candidate
+                            result["game_mr_url"] = link["url"]
+                            break
+                        if not game_mr_info:
+                            game_mr_info = candidate
+                            result["game_mr_url"] = link["url"]
+            if game_mr_info:
+                result["game_mr_info"] = game_mr_info
 
     # Step 4: Fallback — fetch issue details
     if args.jira_host and args.jira_token and not result.get("mr_info") and not result.get("mr_links"):
