@@ -95,16 +95,17 @@ pipeline {
                                 def gamFile = "${env.WORKSPACE}/result_${issueKey}_game.json"
                                 def infoFile = "${env.WORKSPACE}/parsed_${issueKey}.json"
 
-                                // Step 1: Reply "reviewing..." in Feishu thread
+                                // Step 1: Reply "reviewing..." in Feishu thread (use writeFile to avoid echo + emoji issues)
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
+                                writeFile(file: "${env.WORKSPACE}/.fs_progress_${issueKey}.txt",
+                                    text: progressText)
                                 sh """
-                                    echo '${progressText}' | python3 -c "import sys,base64;msg=sys.stdin.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/fs_review_progress_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
                                         --message-id '${msgId}' \
-                                        --message-base64 \$(cat /tmp/fs_review_progress_${issueKey}.b64)
+                                        --message-file '${env.WORKSPACE}/.fs_progress_${issueKey}.txt'
                                 """
 
                                 // Step 2: Parse Jira → project + MR info
@@ -119,14 +120,14 @@ pipeline {
                                 def parsedInfo = readJSON(file: infoFile)
                                 if (parsedInfo.containsKey('error')) {
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
+                                    writeFile(file: "${env.WORKSPACE}/.fs_err_${issueKey}.txt", text: errMsg)
                                     sh """
-                                        echo '${errMsg}' | python3 -c "import sys,base64;msg=sys.stdin.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/fs_err_${issueKey}.b64
                                         python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
                                             --message-id '${msgId}' \
-                                            --message-base64 \$(cat /tmp/fs_err_${issueKey}.b64)
+                                            --message-file '${env.WORKSPACE}/.fs_err_${issueKey}.txt'
                                     """
                                     return
                                 }
@@ -505,14 +506,14 @@ pipeline {
                             // ── Reply in existing topic (from FEISHU_REPLY_MSG_ID) ──
                             // 1) Send "Reviewing..." progress reply
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
+                            writeFile(file: "${env.WORKSPACE}/.fs_direct_progress.txt", text: progressText)
                             sh """
-                                echo '${progressText}' | python3 -c "import sys,base64,json;msg=sys.stdin.read();print(base64.b64encode(msg.encode('utf-8')).decode())" > /tmp/feishu_progress_b64.txt
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
                                     --message-id '${topicMsgId}' \
-                                    --message-base64 \$(cat /tmp/feishu_progress_b64.txt)
+                                    --message-file '${env.WORKSPACE}/.fs_direct_progress.txt'
                             """
 
                             // 2) Reply with summary (use writeFile to avoid heredoc/emoji issues)
