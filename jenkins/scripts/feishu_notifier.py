@@ -57,7 +57,11 @@ def _request(method, url, data=None, headers=None, raw_body=None):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
-            return json.loads(raw.decode("utf-8"))
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                print(f"[WARN] Non-JSON response: {raw[:300]}", file=sys.stderr)
+                return {"code": -1, "msg": "non-json response", "raw": raw.decode("utf-8")[:500]}
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         print(f"[ERROR] HTTP {e.code}: {error_body[:500]}", file=sys.stderr)
@@ -135,6 +139,23 @@ def reply_in_thread(token, chat_id, parent_message_id, text):
     }, ensure_ascii=False)
     resp = _request("POST", url, headers=headers, raw_body=body)
     print(f"[feishu] reply_in_thread response: {json.dumps(resp, ensure_ascii=False)[:200] if resp else 'None'}", file=sys.stderr)
+    return resp
+
+
+def send_card_message(token, chat_id, card):
+    """Send a pre-built interactive card message to a chat."""
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    content_str = json.dumps(card, ensure_ascii=False)
+    body = json.dumps({
+        "receive_id": chat_id,
+        "msg_type": "interactive",
+        "content": content_str,
+    }, ensure_ascii=False)
+    resp = _request("POST", url, headers=headers, raw_body=body)
     return resp
 
 

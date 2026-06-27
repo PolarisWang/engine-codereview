@@ -130,7 +130,7 @@ def main():
     state = {}
     if os.path.exists(args.state_file):
         try:
-            with open(args.state_file) as f:
+            with open(args.state_file, encoding='utf-8') as f:
                 state = json.load(f)
         except Exception:
             state = {}
@@ -279,7 +279,7 @@ def main():
         "last_scan_time": now_sec,
         "last_start_time": window_start,
     }
-    with open(args.state_file, "w") as f:
+    with open(args.state_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
     # ── Write output ──
@@ -289,7 +289,7 @@ def main():
         "total_messages": len(all_messages),
         "jira_found": len(items),
     }
-    with open(args.output, "w") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     print(json.dumps({"summary": f"Scanned {len(all_messages)} messages, found {len(items)} Jira URLs",
