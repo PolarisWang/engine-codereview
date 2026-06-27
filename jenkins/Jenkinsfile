@@ -313,14 +313,14 @@ pipeline {
                                 }
 
                                 echo "Completed review for ${issueKey}"
-                                // Persist to cross-build dedup state
-                                def processedStateFile = "${env.WORKSPACE}/.codereview-reviewed.json"
+                                // Persist to cross-build dedup state via env to avoid scope conflicts
+                                env.PROCESSED_STATE_FILE = "${env.WORKSPACE}/.codereview-reviewed.json"
                                 def revState = [:]
-                                if (fileExists(processedStateFile)) {
-                                    try { revState = readJSON(file: processedStateFile) } catch (Exception e) {}
+                                if (fileExists(env.PROCESSED_STATE_FILE)) {
+                                    try { revState = readJSON(file: env.PROCESSED_STATE_FILE) } catch (Exception e) {}
                                 }
                                 revState[issueKey] = "${currentBuild.number}"
-                                writeJSON(file: processedStateFile, json: revState)
+                                writeJSON(file: env.PROCESSED_STATE_FILE, json: revState)
                             }
                         }
                         parallel issueBuilds
