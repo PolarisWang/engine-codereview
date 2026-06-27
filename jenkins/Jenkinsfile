@@ -39,7 +39,7 @@ pipeline {
         PARSED_INFO_FILE = "${env.WORKSPACE}/parsed_info.json"
         ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
         GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
-        REVIEWED_STATE_FILE = "/tmp/codereview-feishu-state.json"   // Feishu scanner state (processed msg IDs)
+        REVIEWED_STATE_FILE = "${env.WORKSPACE}/.codereview-feishu-state.json"   // Feishu scanner state (processed msg IDs)
 
         // GitLab token for HTTPS clone + MR branch detection
         GITLAB_TOKEN = "${env.GITLAB_TOKEN ?: ''}"
@@ -242,13 +242,12 @@ pipeline {
                                 writeFile(file: "${env.WORKSPACE}/.fs_summary_${issueKey}.txt",
                                     text: summaryText)
                                 sh """
-                                    python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_summary_${issueKey}.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/fs_summary_${issueKey}.b64
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
                                         --message-id '${msgId}' \
-                                        --message-base64 \$(cat /tmp/fs_summary_${issueKey}.b64)
+                                        --message-file '${env.WORKSPACE}/.fs_summary_${issueKey}.txt'
                                 """
 
                                 // Step 5: Reply with engine detail (if any findings)
@@ -529,16 +528,15 @@ pipeline {
                                     --message-file '${env.WORKSPACE}/.fs_direct_progress.txt'
                             """
 
-                            // 2) Reply with summary (use writeFile to avoid heredoc/emoji issues)
+                            // 2) Reply with summary (use --message-file to avoid base64 encoding issues)
                             writeFile(file: "${env.WORKSPACE}/.fs_direct_summary.txt", text: topicText)
                             sh """
-                                python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_direct_summary.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/feishu_summary_b64_enc.txt
                                 python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
                                     --message-id '${topicMsgId}' \
-                                    --message-base64 \$(cat /tmp/feishu_summary_b64_enc.txt)
+                                    --message-file '${env.WORKSPACE}/.fs_direct_summary.txt'
                             """
 
                             // 3) Reply with engine review details
@@ -581,12 +579,11 @@ pipeline {
                             writeFile(file: "${env.WORKSPACE}/.fs_direct_topic.txt", text: topicText)
                             def topicResult = sh(
                                 script: """
-                                    python3 -c "import base64;f=open('${env.WORKSPACE}/.fs_direct_topic.txt');print(base64.b64encode(f.read().encode('utf-8')).decode())" > /tmp/feishu_topic_b64_enc.txt
                                     python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
-                                        --message-base64 \$(cat /tmp/feishu_topic_b64_enc.txt)
+                                        --message-file '${env.WORKSPACE}/.fs_direct_topic.txt'
                                 """,
                                 returnStdout: true
                             ).trim()

@@ -206,7 +206,7 @@ def build_result_card(issue_key, project, engine_result, game_result, jira_url):
 def cmd_webhook(args):
     """Send message via webhook."""
     if args.message_file:
-        with open(args.message_file) as f:
+        with open(args.message_file, encoding="utf-8") as f:
             raw = f.read()
         try:
             content = json.loads(raw)
@@ -242,7 +242,7 @@ def cmd_send_message(args):
     if args.message_base64:
         text = base64.b64decode(args.message_base64).decode("utf-8")
     elif args.message_file:
-        with open(args.message_file) as f:
+        with open(args.message_file, encoding="utf-8") as f:
             raw = f.read()
         try:
             text = json.loads(raw)
@@ -267,7 +267,7 @@ def cmd_reply_message(args):
     if args.message_base64:
         text = base64.b64decode(args.message_base64).decode("utf-8")
     elif args.message_file:
-        with open(args.message_file) as f:
+        with open(args.message_file, encoding="utf-8") as f:
             raw = f.read()
         try:
             text = json.loads(raw)
