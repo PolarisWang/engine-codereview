@@ -127,7 +127,7 @@ pipeline {
                                 // Step 1: Reply "reviewing..." in Feishu thread
                                 // Use base64 to bypass any file encoding issues
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
-                                def progressB64 = progressText.bytes.encodeBase64().toString()
+                                def progressB64 = progressText.toString().bytes.encodeBase64().toString()
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
@@ -149,7 +149,7 @@ pipeline {
                                 def parsedInfo = readJSON(file: infoFile)
                                 if (parsedInfo.containsKey('error')) {
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
-                                    def errB64 = errMsg.bytes.encodeBase64().toString()
+                                    def errB64 = errMsg.toString().bytes.encodeBase64().toString()
                                     sh """
                                         ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
@@ -269,7 +269,7 @@ pipeline {
                                 summaryText += "\n${gamText}\n"
                                 summaryText += "\n---\n📎 Jira: ${jiraUrl}"
 
-                                def summaryB64 = summaryText.bytes.encodeBase64().toString()
+                                def summaryB64 = summaryText.toString().bytes.encodeBase64().toString()
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
@@ -286,7 +286,7 @@ pipeline {
                                     if (detail.length() > maxLen) {
                                         detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
                                     }
-                                    def engineB64 = "**🔧 Engine 详细报告:**\n${detail}".bytes.encodeBase64().toString()
+                                    def engineB64 = ("**🔧 Engine 详细报告:**\n${detail}").toString().bytes.encodeBase64().toString()
                                     sh """
                                         ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
@@ -304,7 +304,7 @@ pipeline {
                                     if (detail.length() > maxLen) {
                                         detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
                                     }
-                                    def gameB64 = "**🎮 Game 详细报告:**\n${detail}".bytes.encodeBase64().toString()
+                                    def gameB64 = ("**🎮 Game 详细报告:**\n${detail}").toString().bytes.encodeBase64().toString()
                                     sh """
                                         ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
@@ -553,7 +553,7 @@ pipeline {
                             // ── Reply in existing topic (from FEISHU_REPLY_MSG_ID) ──
                             // 1) Send "Reviewing..." progress reply
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
-                            def progressB64 = progressText.bytes.encodeBase64().toString()
+                            def progressB64 = progressText.toString().bytes.encodeBase64().toString()
                             sh """
                                 ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
@@ -564,7 +564,7 @@ pipeline {
                             """
 
                             // 2) Reply with summary
-                            def summaryB64 = topicText.bytes.encodeBase64().toString()
+                            def summaryB64 = topicText.toString().bytes.encodeBase64().toString()
                             sh """
                                 ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
@@ -581,7 +581,7 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                def engineB64 = "**🔧 Engine 详细报告:**\n${engineDetail}".bytes.encodeBase64().toString()
+                                def engineB64 = ("**🔧 Engine 详细报告:**\n${engineDetail}").toString().bytes.encodeBase64().toString()
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -599,7 +599,7 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                def gameB64 = "**🎮 Game 详细报告:**\n${gameDetail}".bytes.encodeBase64().toString()
+                                def gameB64 = ("**🎮 Game 详细报告:**\n${gameDetail}").toString().bytes.encodeBase64().toString()
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -611,7 +611,7 @@ pipeline {
                             }
                         } else {
                             // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
-                            def topicB64 = topicText.bytes.encodeBase64().toString()
+                            def topicB64 = topicText.toString().bytes.encodeBase64().toString()
                             def topicResult = sh(
                                 script: """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py send-message \
@@ -632,7 +632,7 @@ pipeline {
                                 if (engineDetail.length() > maxLen) {
                                     engineDetail = engineDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                def engineB64 = engineDetail.bytes.encodeBase64().toString()
+                                def engineB64 = engineDetail.toString().bytes.encodeBase64().toString()
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -649,7 +649,7 @@ pipeline {
                                 if (gameDetail.length() > maxLen) {
                                     gameDetail = gameDetail.substring(0, maxLen) + "\n\n... (剩余内容请在 Jenkins 构建日志中查看)"
                                 }
-                                def gameB64 = gameDetail.bytes.encodeBase64().toString()
+                                def gameB64 = gameDetail.toString().bytes.encodeBase64().toString()
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
@@ -709,7 +709,7 @@ pipeline {
 
                     if (topicMsgId && feishuAppId && feishuAppSecret) {
                         def errText = "❌ **Code Review Failed**: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
-                        def errB64 = errText.bytes.encodeBase64().toString()
+                        def errB64 = errText.toString().bytes.encodeBase64().toString()
                         sh """
                             ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                 --app-id '${feishuAppId}' \
@@ -720,7 +720,7 @@ pipeline {
                         """
                     } else if (env.FEISHU_WEBHOOK_URL) {
                         def msgText = "❌ Code Review Failed: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
-                        def msgB64 = msgText.bytes.encodeBase64().toString()
+                        def msgB64 = msgText.toString().bytes.encodeBase64().toString()
                         sh """
                             ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                 --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
