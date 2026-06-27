@@ -36,6 +36,7 @@ pipeline {
     }
 
     environment {
+        PYTHON = sh(script: "which python3 2>/dev/null || which python 2>/dev/null || echo '/usr/bin/python3'", returnStdout: true).trim()
         SCRIPTS_DIR = "${env.WORKSPACE}/jenkins/scripts"
         CONFIG_FILE = "${env.WORKSPACE}/config.yaml"
         REVIEW_WORKSPACE = "${env.WORKSPACE}/review-workspace"
@@ -70,7 +71,7 @@ pipeline {
             steps {
                 script {
                     sh """
-                        python3 ${SCRIPTS_DIR}/feishu_scanner.py \
+                        ${PYTHON} ${SCRIPTS_DIR}/feishu_scanner.py \
                             --app-id '${env.FEISHU_APP_ID}' \
                             --app-secret '${env.FEISHU_APP_SECRET}' \
                             --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -128,7 +129,7 @@ pipeline {
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
                                 def progressB64 = progressText.bytes.encodeBase64().toString()
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -138,7 +139,7 @@ pipeline {
 
                                 // Step 2: Parse Jira → project + MR info
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/jira_parser.py \
+                                    ${PYTHON} ${SCRIPTS_DIR}/jira_parser.py \
                                         --jira-url '${jiraUrl}' \
                                         --jira-host '${env.JIRA_HOST}' \
                                         --jira-token '${env.JIRA_TOKEN}' \
@@ -150,7 +151,7 @@ pipeline {
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
                                     def errB64 = errMsg.bytes.encodeBase64().toString()
                                     sh """
-                                        python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -163,23 +164,24 @@ pipeline {
                                 if (mrInfo instanceof net.sf.json.JSONNull) mrInfo = null
                                 def reviewBranch = mrInfo?.branch ?: issueKey
                                 def baseBranch = mrInfo?.target_branch ?: parsedInfo.default_branch ?: 'master'
+                                def engineBase = parsedInfo.engine_default_branch ?: baseBranch
                                 def engineRepo = parsedInfo.engine_repo
                                 def gameRepo = parsedInfo.game_repo
                                 def project = parsedInfo.project
-                                echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, project=${project}"
+                                echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, engine_base=${engineBase}, project=${project}"
 
                                 // Step 3: Parallel code review (engine + game)
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                    ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
                                         --repo '${engineRepo}' \
                                         --branch '${reviewBranch}' \
-                                        --base-branch '${baseBranch}' \
+                                        --base-branch '${engineBase}' \
                                         --project '${project}' \
                                         --issue-key '${issueKey}' \
                                         --repo-type 'engine' \
                                         --workspace '${REVIEW_WORKSPACE}' \
                                         --output '${engFile}'
-                                    python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                    ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
                                         --repo '${gameRepo}' \
                                         --branch '${reviewBranch}' \
                                         --base-branch '${baseBranch}' \
@@ -269,7 +271,7 @@ pipeline {
 
                                 def summaryB64 = summaryText.bytes.encodeBase64().toString()
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -286,7 +288,7 @@ pipeline {
                                     }
                                     def engineB64 = "**🔧 Engine 详细报告:**\n${detail}".bytes.encodeBase64().toString()
                                     sh """
-                                        python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -304,7 +306,7 @@ pipeline {
                                     }
                                     def gameB64 = "**🎮 Game 详细报告:**\n${detail}".bytes.encodeBase64().toString()
                                     sh """
-                                        python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
                                             --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -340,7 +342,7 @@ pipeline {
             steps {
                 script {
                     sh """
-                        python3 ${SCRIPTS_DIR}/jira_parser.py \
+                        ${PYTHON} ${SCRIPTS_DIR}/jira_parser.py \
                             --jira-url '${params.JIRA_URL}' \
                             --jira-host '${env.JIRA_HOST}' \
                             --jira-token '${env.JIRA_TOKEN}' \
@@ -408,7 +410,7 @@ pipeline {
                             def engineBase = env.ENGINE_BASE_BRANCH
                             def engineMrUrl = env.MR_URL
                             sh """
-                                python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
                                     --repo '${env.ENGINE_REPO}' \
                                     --branch '${engineBranch}' \
                                     --base-branch '${engineBase}' \
@@ -440,7 +442,7 @@ pipeline {
                             def gameBase = env.GAME_BASE_BRANCH ?: env.BASE_BRANCH
                             def gameMrUrl = env.GAME_MR_URL ?: env.MR_URL
                             sh """
-                                python3 ${SCRIPTS_DIR}/code_reviewer.py \
+                                ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
                                     --repo '${env.GAME_REPO}' \
                                     --branch '${gameBranch}' \
                                     --base-branch '${gameBase}' \
@@ -553,7 +555,7 @@ pipeline {
                             def progressText = "🤖 **正在 Review...**\n已收到 ${env.ISSUE_KEY}，正在拉取代码并进行 AI 审查，请稍候..."
                             def progressB64 = progressText.bytes.encodeBase64().toString()
                             sh """
-                                python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
@@ -564,7 +566,7 @@ pipeline {
                             // 2) Reply with summary
                             def summaryB64 = topicText.bytes.encodeBase64().toString()
                             sh """
-                                python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                     --app-id '${feishuAppId}' \
                                     --app-secret '${feishuAppSecret}' \
                                     --chat-id '${feishuChatId}' \
@@ -581,7 +583,7 @@ pipeline {
                                 }
                                 def engineB64 = "**🔧 Engine 详细报告:**\n${engineDetail}".bytes.encodeBase64().toString()
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
@@ -599,7 +601,7 @@ pipeline {
                                 }
                                 def gameB64 = "**🎮 Game 详细报告:**\n${gameDetail}".bytes.encodeBase64().toString()
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
@@ -612,7 +614,7 @@ pipeline {
                             def topicB64 = topicText.bytes.encodeBase64().toString()
                             def topicResult = sh(
                                 script: """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py send-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py send-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
@@ -632,7 +634,7 @@ pipeline {
                                 }
                                 def engineB64 = engineDetail.bytes.encodeBase64().toString()
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
@@ -649,7 +651,7 @@ pipeline {
                                 }
                                 def gameB64 = gameDetail.bytes.encodeBase64().toString()
                                 sh """
-                                    python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                         --app-id '${feishuAppId}' \
                                         --app-secret '${feishuAppSecret}' \
                                         --chat-id '${feishuChatId}' \
@@ -665,7 +667,7 @@ pipeline {
                         if (env.FEISHU_WEBHOOK_URL) {
                             def webhookB64 = topicText.bytes.encodeBase64().toString()
                             sh """
-                                python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
+                                ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                     --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
                                     --message-base64 '${webhookB64}'
                             """
@@ -674,7 +676,7 @@ pipeline {
                 } else if (env.FEISHU_WEBHOOK_URL) {
                     def webhookB64 = topicText.bytes.encodeBase64().toString()
                     sh """
-                        python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
+                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                             --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
                             --message-base64 '${webhookB64}'
                     """
@@ -709,7 +711,7 @@ pipeline {
                         def errText = "❌ **Code Review Failed**: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
                         def errB64 = errText.bytes.encodeBase64().toString()
                         sh """
-                            python3 ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                            ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
                                 --app-id '${feishuAppId}' \
                                 --app-secret '${feishuAppSecret}' \
                                 --chat-id '${env.FEISHU_CHAT_ID}' \
@@ -720,7 +722,7 @@ pipeline {
                         def msgText = "❌ Code Review Failed: ${env.ISSUE_KEY}\nBuild: ${BUILD_URL}"
                         def msgB64 = msgText.bytes.encodeBase64().toString()
                         sh """
-                            python3 ${SCRIPTS_DIR}/feishu_notifier.py webhook \
+                            ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py webhook \
                                 --webhook-url '${env.FEISHU_WEBHOOK_URL}' \
                                 --message-base64 '${msgB64}'
                         """
