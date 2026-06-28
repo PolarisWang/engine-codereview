@@ -126,9 +126,8 @@ def main():
         print(json.dumps({"error": "FEISHU_APP_ID and FEISHU_APP_SECRET required", "items": []}))
         sys.exit(0)
 
-    # ── Load state for time window tracking only, NOT for dedup ──
+    # ── Load state for time window tracking only ──
     state = {}
-    last_start_time = 0
 
     # ── Get Feishu token ──
     token = get_tenant_token(args.app_id, args.app_secret)
@@ -137,12 +136,12 @@ def main():
         sys.exit(0)
 
     # ── Calculate time window ──
-    # Use 10-digit Unix seconds for Feishu API
+    # Only scan recent messages to avoid re-processing old topics on every build
+    # Scan window: last 5 minutes (300 seconds) to catch newly posted topics
     now_sec = int(time.time())
-    # On first scan (no state), look back 24h to catch any existing topic starters
-    window_start = now_sec - 86400 if not last_start_time else max(last_start_time // 1000, now_sec - 86400)
-    # Always use at least 300s (5 min) overlap to avoid missing messages between builds
-    window_start = max(window_start, now_sec - 300) if last_start_time else window_start
+    window_start = now_sec - 300
+
+    print(f"[feishu] Scanning messages from {window_start} to {now_sec} (last 5 min)", flush=True)
 
     print(f"[feishu] Scanning messages from {window_start} to {now_sec}", flush=True)
 
@@ -244,11 +243,8 @@ def main():
                 "create_time": msg.get("create_time", ""),
             })
 
-    # ── Save state (only time window, no processed_ids) ──
-    state = {
-        "last_scan_time": now_sec,
-        "last_start_time": window_start,
-    }
+    # ── Save state (just last scan time) ──
+    state = {"last_scan_time": now_sec}
     with open(args.state_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
