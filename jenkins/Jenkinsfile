@@ -98,11 +98,13 @@ pipeline {
                             def issueKey = item.issue_key
                             def jiraUrl = item.jira_url
                             def msgId = item.message_id
-                            issueBuilds[issueKey] = {
-                                def engFile = "${env.WORKSPACE}/result_${issueKey}_engine.json"
-                                def gamFile = "${env.WORKSPACE}/result_${issueKey}_game.json"
-                                def infoFile = "${env.WORKSPACE}/parsed_${issueKey}.json"
-                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_${issueKey}"
+                            // Use message_id as key (not issue_key) so each topic gets its own review
+                            def buildKey = msgId
+                            issueBuilds[buildKey] = {
+                                def engFile = "${env.WORKSPACE}/result_${buildKey}_engine.json"
+                                def gamFile = "${env.WORKSPACE}/result_${buildKey}_game.json"
+                                def infoFile = "${env.WORKSPACE}/parsed_${buildKey}.json"
+                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_${buildKey}"
 
                                 // Step 1: Reply with processing card in Feishu thread, capture message_id
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
