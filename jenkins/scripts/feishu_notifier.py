@@ -321,6 +321,26 @@ def cmd_update_card(args):
     print(json.dumps(resp, indent=2))
 
 
+def cmd_update_reply(args):
+    """Update a thread reply card with new text content (PATCH in-place)."""
+    token = get_tenant_token(args.app_id, args.app_secret)
+    if not token:
+        sys.exit(1)
+    text = read_message_text(args)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "Code Review"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": text},
+        ],
+    }
+    resp = update_card_message(token, args.message_id, card)
+    print(json.dumps(resp, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Feishu Code Review Notifier")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -370,6 +390,13 @@ def main():
     p.add_argument("--engine-json", help="Engine review result JSON string")
     p.add_argument("--game-json", help="Game review result JSON string")
 
+    # ── update-reply (update a thread reply card with new text) ──
+    p = sub.add_parser("update-reply", help="Update a thread reply card with new text content")
+    p.add_argument("--app-id", required=True)
+    p.add_argument("--app-secret", required=True)
+    p.add_argument("--message-id", required=True)
+    p.add_argument("--message-base64", help="Base64-encoded new card text")
+
     args = parser.parse_args()
 
     if args.command == "webhook":
@@ -382,6 +409,8 @@ def main():
         cmd_reply_message(args)
     elif args.command == "update-card":
         cmd_update_card(args)
+    elif args.command == "update-reply":
+        cmd_update_reply(args)
 
 
 if __name__ == "__main__":

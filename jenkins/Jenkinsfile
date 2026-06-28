@@ -128,9 +128,9 @@ pipeline {
                                 def engFile = "${env.WORKSPACE}/result_${issueKey}_engine.json"
                                 def gamFile = "${env.WORKSPACE}/result_${issueKey}_game.json"
                                 def infoFile = "${env.WORKSPACE}/parsed_${issueKey}.json"
+                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_${issueKey}"
 
-                                // Step 1: Reply "reviewing..." in Feishu thread
-                                // Use base64 to bypass any file encoding issues
+                                // Step 1: Reply with processing card in Feishu thread, capture message_id
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
                                 def progressB64 = b64(progressText)
                                 sh """
@@ -139,8 +139,10 @@ pipeline {
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --chat-id '${env.FEISHU_CHAT_ID}' \
                                         --message-id '${msgId}' \
-                                        --message-base64 '${progressB64}'
+                                        --message-base64 '${progressB64}' > ${replyMsgIdFile}
                                 """
+                                def replyResp = readJSON(file: replyMsgIdFile)
+                                def replyMsgId = replyResp.message_id ?: ''
 
                                 // Step 2: Parse Jira → project + MR info
                                 sh """
@@ -156,11 +158,10 @@ pipeline {
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
                                     def errB64 = b64(errMsg)
                                     sh """
-                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
                                             --app-id '${env.FEISHU_APP_ID}' \
                                             --app-secret '${env.FEISHU_APP_SECRET}' \
-                                            --chat-id '${env.FEISHU_CHAT_ID}' \
-                                            --message-id '${msgId}' \
+                                            --message-id '${replyMsgId}' \
                                             --message-base64 '${errB64}'
                                     """
                                     return
@@ -266,6 +267,8 @@ pipeline {
                                 }
 
                                 def mrUrl = parsedInfo.mr_url ?: ''
+
+                                // Step 4: Update the processing card with the complete review result
                                 def summaryText = "**🔍 Code Review 报告: ${issueKey}**\n\n"
                                 summaryText += "**项目:** ${project}\n"
                                 summaryText += "**分支:** ${reviewBranch} → ${baseBranch}\n"
@@ -274,51 +277,33 @@ pipeline {
                                 summaryText += "\n${gamText}\n"
                                 summaryText += "\n---\n📎 Jira: ${jiraUrl}"
 
+                                // Append truncated review details if they fit within limits
+                                def MAX_CARD_LEN = 3500
+                                if (summaryText.length() < MAX_CARD_LEN && engineResult.review?.review_text) {
+                                    def detail = engineResult.review.review_text
+                                    def avail = MAX_CARD_LEN - summaryText.length() - 50
+                                    if (avail > 200) {
+                                        if (detail.length() > avail) detail = detail.substring(0, avail) + "\n\n...（详情见 Jenkins 构建日志）"
+                                        summaryText += "\n\n---\n**🔧 Engine 详细报告:**\n${detail}"
+                                    }
+                                }
+                                if (summaryText.length() < MAX_CARD_LEN && gameResult.review?.review_text) {
+                                    def detail = gameResult.review.review_text
+                                    def avail = MAX_CARD_LEN - summaryText.length() - 50
+                                    if (avail > 200) {
+                                        if (detail.length() > avail) detail = detail.substring(0, avail) + "\n\n...（详情见 Jenkins 构建日志）"
+                                        summaryText += "\n\n---\n**🎮 Game 详细报告:**\n${detail}"
+                                    }
+                                }
+
                                 def summaryB64 = b64(summaryText)
                                 sh """
-                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
-                                        --chat-id '${env.FEISHU_CHAT_ID}' \
-                                        --message-id '${msgId}' \
+                                        --message-id '${replyMsgId}' \
                                         --message-base64 '${summaryB64}'
                                 """
-
-                                // Step 5: Reply with engine detail (if any findings)
-                                if (engineResult.review?.review_text) {
-                                    def detail = engineResult.review.review_text
-                                    def maxLen = 3000
-                                    if (detail.length() > maxLen) {
-                                        detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
-                                    }
-                                    def engineB64 = b64("**🔧 Engine 详细报告:**\n${detail}")
-                                    sh """
-                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
-                                            --app-id '${env.FEISHU_APP_ID}' \
-                                            --app-secret '${env.FEISHU_APP_SECRET}' \
-                                            --chat-id '${env.FEISHU_CHAT_ID}' \
-                                            --message-id '${msgId}' \
-                                            --message-base64 '${engineB64}'
-                                    """
-                                }
-
-                                // Step 6: Reply with game detail (if any findings)
-                                if (gameResult.review?.review_text) {
-                                    def detail = gameResult.review.review_text
-                                    def maxLen = 3000
-                                    if (detail.length() > maxLen) {
-                                        detail = detail.substring(0, maxLen) + "\n\n...（剩余内容请在 Jenkins 构建日志中查看）"
-                                    }
-                                    def gameB64 = b64("**🎮 Game 详细报告:**\n${detail}")
-                                    sh """
-                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
-                                            --app-id '${env.FEISHU_APP_ID}' \
-                                            --app-secret '${env.FEISHU_APP_SECRET}' \
-                                            --chat-id '${env.FEISHU_CHAT_ID}' \
-                                            --message-id '${msgId}' \
-                                            --message-base64 '${gameB64}'
-                                    """
-                                }
 
                                 echo "Completed review for ${issueKey}"
                                 // Persist to cross-build dedup state (stored outside workspace to survive git clean)
