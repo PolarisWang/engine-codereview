@@ -153,6 +153,7 @@ pipeline {
                                 echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, engine_base=${engineBase}, project=${project}"
 
                                 // Step 3: Parallel code review (engine + game)
+                                def mrUrl = parsedInfo.mr_url ?: ''
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
                                         --repo '${engineRepo}' \
@@ -161,6 +162,7 @@ pipeline {
                                         --project '${project}' \
                                         --issue-key '${issueKey}' \
                                         --repo-type 'engine' \
+                                        --mr-url '${mrUrl}' \
                                         --workspace '${REVIEW_WORKSPACE}' \
                                         --output '${engFile}'
                                     ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
@@ -170,6 +172,7 @@ pipeline {
                                         --project '${project}' \
                                         --issue-key '${issueKey}' \
                                         --repo-type 'game' \
+                                        --mr-url '${mrUrl}' \
                                         --workspace '${REVIEW_WORKSPACE}' \
                                         --output '${gamFile}'
                                 """
@@ -241,8 +244,6 @@ pipeline {
                                         gamText += "\n✅ 未发现严重问题"
                                     }
                                 }
-
-                                def mrUrl = parsedInfo.mr_url ?: ''
 
                                 // Step 4: Update the processing card with the complete review result
                                 def summaryText = "**🔍 Code Review 报告: ${issueKey}**\n\n"

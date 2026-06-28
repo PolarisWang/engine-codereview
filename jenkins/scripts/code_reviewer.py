@@ -27,6 +27,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 import shutil
 import re
@@ -103,7 +104,58 @@ def ssh_to_https(repo_url):
     return repo_url
 
 
-def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True):
+def gitlab_api_get(path, token):
+    """Make a GitLab API GET request."""
+    url = f"https://gitlab.booming-inc.com/api/v4/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"[gitlab] API error {e.code} for {url[:80]}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[gitlab] Request error: {e}", file=sys.stderr)
+        return None
+
+
+def parse_gitlab_mr_url(url):
+    """Parse a GitLab MR URL to extract project path and MR IID."""
+    m = re.match(r'https://gitlab\.booming-inc\.com/(.+?)/-/merge_requests/(\d+)', url)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
+def get_mr_diff_from_gitlab(mr_url, gitlab_token):
+    """Fetch MR diff from GitLab API. Returns dict with diff_text and changed_files, or None."""
+    project_path, mr_iid = parse_gitlab_mr_url(mr_url)
+    if not project_path:
+        print(f"[gitlab] Cannot parse MR URL: {mr_url}", file=sys.stderr)
+        return None
+    project_encoded = urllib.parse.quote(project_path, safe='')
+    diffs = gitlab_api_get(f"projects/{project_encoded}/merge_requests/{mr_iid}/diffs", gitlab_token)
+    if not diffs:
+        return None
+    diff_parts = []
+    changed_files = []
+    for d in diffs:
+        diff_text = d.get("diff", "")
+        if diff_text:
+            diff_parts.append(diff_text)
+        new_path = d.get("new_path", "")
+        status = d.get("status", "modified")
+        if new_path:
+            status_char = {"added": "A", "deleted": "D", "renamed": "R"}.get(status, "M")
+            changed_files.append(f"{status_char}\t{new_path}")
+    return {
+        "diff_text": "\n".join(diff_parts),
+        "changed_files": changed_files,
+    }
+
+
+def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True, mr_url="", gitlab_token=""):
     """
     Clone (or fetch) repo, checkout branch, return path and diff info.
     Returns dict with: diff_text, changed_files, insertions, deletions, commit_log, branch_exists, branch_merged
@@ -128,10 +180,29 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         os.environ.setdefault("GIT_SSH_COMMAND", "/bin/false")
         repo_url = https_url
 
+    # If MR URL is available, fetch diff directly from GitLab API (most reliable)
+    if mr_url and gitlab_token:
+        print(f"[gitlab] Fetching MR diff from {mr_url}", flush=True)
+        mr_diff = get_mr_diff_from_gitlab(mr_url, gitlab_token)
+        if mr_diff and mr_diff["diff_text"]:
+            print(f"[gitlab] Using MR diff from GitLab API ({len(mr_diff['changed_files'])} files)", flush=True)
+            return {
+                "diff_text": mr_diff["diff_text"],
+                "changed_files": mr_diff["changed_files"],
+                "stats": f"{len(mr_diff['changed_files'])} files changed",
+                "commit_log": f"MR diff from {mr_url}",
+                "branch_exists": True,
+                "branch_merged": False,
+                "repo_dir": repo_dir,
+            }
+        print(f"[gitlab] MR diff unavailable, falling back to git clone/diff", flush=True)
+
     if cache and os.path.isdir(repo_dir):
         print(f"[git] Updating cached repo: {repo_name}")
         run_git([GIT_PATH, "fetch", "origin"], repo_dir, timeout=300)
-        run_git([GIT_PATH, "reset", "--hard"], repo_dir)
+        # Explicitly fetch the review branch to ensure it's up to date
+        run_git([GIT_PATH, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], repo_dir, timeout=60)
+        run_git([GIT_PATH, "reset", "--hard", f"origin/{branch}"], repo_dir)
         rc, _, _ = run_git([GIT_PATH, "checkout", branch], repo_dir)
         if rc != 0:
             rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
@@ -145,7 +216,7 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
             run_git(["rm", "-rf", repo_dir], "/tmp")
         print(f"[git] Cloning repo: {repo_name}")
         rc, out, err = run_git(
-            [GIT_PATH, "clone", "--branch", branch, "--single-branch", repo_url, repo_dir],
+            [GIT_PATH, "clone", "--branch", branch, repo_url, repo_dir],
             "/tmp", timeout=600
         )
         if rc != 0:
@@ -153,7 +224,7 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
             branch_exists = False
             # Branch may not exist remotely — clone default branch
             rc, out, err = run_git(
-                [GIT_PATH, "clone", "--single-branch", repo_url, repo_dir],
+                [GIT_PATH, "clone", repo_url, repo_dir],
                 "/tmp", timeout=600
             )
             if os.path.isdir(repo_dir):
@@ -365,9 +436,11 @@ def main():
 
     # Prepare repo and get diff
     print(f"[{args.repo_type}] Cloning/preparing repo...", flush=True)
+    gitlab_token = os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN", "")
     diff_info = prepare_repo(
         args.repo, args.branch, args.base_branch,
-        args.workspace, args.issue_key
+        args.workspace, args.issue_key,
+        mr_url=args.mr_url, gitlab_token=gitlab_token,
     )
 
     changed_file_count = len([f for f in diff_info["changed_files"] if f])
