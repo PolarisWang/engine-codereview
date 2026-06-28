@@ -91,20 +91,19 @@ pipeline {
                     if (items.isEmpty()) {
                         currentBuild.result = 'SUCCESS'
                     } else {
-                        echo "Processing ${items.size()} detected Jira URLs"
+                        echo "Processing first detected Jira URL (one per build)"
 
                         def issueBuilds = [:]
-                        items.each { item ->
-                            def issueKey = item.issue_key
-                            def jiraUrl = item.jira_url
-                            def msgId = item.message_id
-                            // Use message_id as key (not issue_key) so each topic gets its own review
-                            def buildKey = msgId
-                            issueBuilds[buildKey] = {
-                                def engFile = "${env.WORKSPACE}/result_${buildKey}_engine.json"
-                                def gamFile = "${env.WORKSPACE}/result_${buildKey}_game.json"
-                                def infoFile = "${env.WORKSPACE}/parsed_${buildKey}.json"
-                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_${buildKey}"
+                        // Only process the first (most recent) item per build to avoid duplicates
+                        def firstItem = items[0]
+                        def issueKey = firstItem.issue_key
+                        def jiraUrl = firstItem.jira_url
+                        def msgId = firstItem.message_id
+                        issueBuilds[msgId] = {
+                                def engFile = "${env.WORKSPACE}/result_msgId_engine.json"
+                                def gamFile = "${env.WORKSPACE}/result_msgId_game.json"
+                                def infoFile = "${env.WORKSPACE}/parsed_msgId.json"
+                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_msgId"
 
                                 // Step 1: Reply with processing card in Feishu thread, capture message_id
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
