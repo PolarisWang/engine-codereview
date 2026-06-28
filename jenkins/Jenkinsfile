@@ -100,10 +100,10 @@ pipeline {
                         def jiraUrl = firstItem.jira_url
                         def msgId = firstItem.message_id
                         issueBuilds[msgId] = {
-                                def engFile = "${env.WORKSPACE}/result_msgId_engine.json"
-                                def gamFile = "${env.WORKSPACE}/result_msgId_game.json"
-                                def infoFile = "${env.WORKSPACE}/parsed_msgId.json"
-                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_msgId"
+                                def engFile = "${env.WORKSPACE}/result_${msgId}_engine.json"
+                                def gamFile = "${env.WORKSPACE}/result_${msgId}_game.json"
+                                def infoFile = "${env.WORKSPACE}/parsed_${msgId}.json"
+                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_${msgId}"
 
                                 // Step 1: Reply with processing card in Feishu thread, capture message_id
                                 def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
@@ -282,10 +282,9 @@ pipeline {
                                 """
 
                                 echo "Completed review for ${issueKey}"
-	                            }
+                            }
+                            parallel issueBuilds
                         }
-                        parallel issueBuilds
-                    }
                 }
             }
         }
