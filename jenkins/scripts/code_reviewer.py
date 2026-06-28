@@ -37,41 +37,37 @@ GIT_PATH = shutil.which("git") or "/usr/bin/git"
 
 
 DEFAULT_REVIEW_INSTRUCTIONS = """
-You are a senior game engine engineer reviewing a merge request.
+You are a senior game engine engineer reviewing a merge request. Provide concise findings in Chinese.
 
-## Review Focus Areas
-1. Logic correctness and potential bugs (race conditions, null pointers, type errors)
-2. Memory safety and resource management (leaks, dangling pointers, ownership)
-3. Concurrency and thread safety (shared state, locks, data races)
-4. Performance issues (unnecessary allocations, hot path optimization, algorithm complexity)
-5. API design and interfaces (consistency, backward compatibility, encapsulation)
-6. Error handling and edge cases (unhandled errors, invalid inputs, boundary conditions)
-7. Code style and maintainability (readability, naming, complexity, duplication)
-8. Security concerns (input validation, privilege escalation, data exposure)
-9. Testing coverage (missing tests, untestable code, testability)
-10. Logging and observability (useful error messages, debugability)
+## Review Focus
+1. Logic correctness and potential bugs
+2. Memory safety and resource leaks
+3. Concurrency / thread safety
+4. Performance issues
+5. API design
+6. Error handling and edge cases
+7. Security concerns
 
-## Output Format
-Group findings by severity level. For each finding, use this exact format:
+## Output Format (Chinese)
+Group findings by severity. Each finding:
+
 - **Severity**: 🔴 Critical / 🟡 Warning / ℹ️ Suggestion
 - **File**: path/to/file
-- **Issue**: what the problem is
-- **Suggestion**: how to fix it
+- **问题**: one-line description
+- **建议**: how to fix
 
-Number findings sequentially and continuously across ALL severity groups (e.g., if there are 3 critical items and 2 warnings, the last warning should be #5).
+Keep each finding brief (2-3 lines max). Number findings sequentially (1, 2, 3...).
 
-## Summary
-At the very end, provide a summary table:
-
-## Summary
-| Severity | Count |
-|----------|-------|
+## Summary (in Chinese)
+At the end:
+| 严重程度 | 数量 |
+|---------|------|
 | 🔴 Critical | X |
 | 🟡 Warning | X |
 | ℹ️ Suggestion | X |
-| **Total** | **X** |
+| **合计** | **X** |
 
-IMPORTANT: The number of findings listed under each severity level MUST exactly match the count in the summary table. The Total MUST equal the sum of the three counts.
+IMPORTANT: Counts must match actual findings.
 """
 
 
@@ -342,7 +338,9 @@ Please review this code change. For each finding, provide:
 - **Issue**: what the problem is
 - **Suggestion**: how to fix it
 
-At the end, provide a summary with count of each severity level."""
+At the end, provide a summary with count of each severity level.
+
+IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
 
     payload = json.dumps({
         "model": model,
