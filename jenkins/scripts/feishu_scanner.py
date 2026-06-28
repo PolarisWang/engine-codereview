@@ -126,17 +126,9 @@ def main():
         print(json.dumps({"error": "FEISHU_APP_ID and FEISHU_APP_SECRET required", "items": []}))
         sys.exit(0)
 
-    # ── Load state (last scan timestamps and processed message IDs) ──
+    # ── Load state for time window tracking only, NOT for dedup ──
     state = {}
-    if os.path.exists(args.state_file):
-        try:
-            with open(args.state_file, encoding='utf-8') as f:
-                state = json.load(f)
-        except Exception:
-            state = {}
-
-    processed_ids = set(state.get("processed_ids", []))
-    last_start_time = state.get("last_start_time", 0)
+    last_start_time = 0
 
     # ── Get Feishu token ──
     token = get_tenant_token(args.app_id, args.app_secret)
@@ -182,32 +174,26 @@ def main():
 
     print(f"[feishu] Fetched {len(all_messages)} messages", flush=True)
 
-    # ── Extract Jira URLs from unprocessed messages ──
+    # ── Extract Jira URLs from all topic messages (no processed_ids dedup) ──
     # We only process topic starters (not thread replies)
     items = []
-    new_processed = set(processed_ids)
     for msg in all_messages:
         msg_id = msg.get("message_id", "")
-        if not msg_id or msg_id in processed_ids:
-            continue
 
         # Check if it's a thread reply — skip those
         # Feishu sets thread_id on ALL messages in group chats, but only
-        # thread replies have parent_id set (indicating they're replies in a topic)
+        # thread replies have parent_id set
         if msg.get("parent_id"):
-            new_processed.add(msg_id)
             continue
 
         # Get message content
         msg_type = msg.get("msg_type", "")
         if msg_type not in ("text", "post"):
-            new_processed.add(msg_id)
             continue
 
         body = msg.get("body", {})
         content = body.get("content", "")
         if not content:
-            new_processed.add(msg_id)
             continue
 
         # Extract text from different message types
@@ -217,9 +203,6 @@ def main():
             if msg_type == "text":
                 text = content_dict.get("text", "")
             elif msg_type == "post":
-                # Post content has two possible structures:
-                #   1) {"zh_cn": {"content": [[{tag:"text|a",...}]]}}  (locale-wrapped)
-                #   2) {"title":"", "content": [[{tag:"text|a",...}]]}  (direct)
                 paragraphs = []
                 if isinstance(content_dict, dict):
                     for locale_key in ("zh_cn", "en_us"):
@@ -228,7 +211,6 @@ def main():
                             paragraphs = pc["content"]
                             break
                     if not paragraphs and content_dict.get("content"):
-                        # Direct structure — content is the paragraph list itself
                         raw = content_dict["content"]
                         if isinstance(raw, list) and len(raw) > 0:
                             paragraphs = raw
@@ -237,18 +219,16 @@ def main():
                         if seg.get("tag") == "text":
                             text += seg.get("text", "")
                         elif seg.get("tag") == "a":
-                            text += seg.get("href", "")  # extract URL from links
+                            text += seg.get("href", "")
         except (json.JSONDecodeError, TypeError, AttributeError):
             text = str(content)
 
         if not text:
-            new_processed.add(msg_id)
             continue
 
         # Check for Jira URLs
         jira_matches = extract_jira_urls(text)
         if not jira_matches:
-            new_processed.add(msg_id)
             continue
 
         # Found a Jira URL in this message — this is a review candidate
@@ -263,19 +243,9 @@ def main():
                 "sender_name": sender.get("name", "") if isinstance(sender, dict) else "",
                 "create_time": msg.get("create_time", ""),
             })
-            new_processed.add(msg_id)
 
-        # Mark message as processed (even if we already added it above)
-        new_processed.add(msg_id)
-
-    # ── Save state ──
-    # Keep last 1000 processed IDs, trim oldest
-    processed_list = list(new_processed)
-    if len(processed_list) > 1000:
-        processed_list = processed_list[-1000:]
-
+    # ── Save state (only time window, no processed_ids) ──
     state = {
-        "processed_ids": processed_list,
         "last_scan_time": now_sec,
         "last_start_time": window_start,
     }

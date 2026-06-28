@@ -92,35 +92,9 @@ pipeline {
                         currentBuild.result = 'SUCCESS'
                     } else {
                         echo "Processing ${items.size()} detected Jira URLs"
-                        // Deduplicate by issue_key: only process the first message per issue
-                        def uniqueIssues = items.groupBy { it.issue_key }.collect { k, v -> v[0] }
-
-                        // Cross-build dedup: check if we've already reviewed these issues
-                        // by reading the reviewed_issues state file
-                        def processedStateFile = "${env.HOME}/.codereview-reviewed.json"
-                        def reviewedIssues = [:]
-                        if (fileExists(processedStateFile)) {
-                            try {
-                                reviewedIssues = readJSON(file: processedStateFile)
-                            } catch (Exception e) {
-                                reviewedIssues = [:]
-                            }
-                        }
-                        def unprocessedIssues = uniqueIssues.findAll { item ->
-                            !reviewedIssues.containsKey(item.issue_key)
-                        }
-                        if (unprocessedIssues.size() < uniqueIssues.size()) {
-                            echo "Filtered ${uniqueIssues.size() - unprocessedIssues.size()} already-reviewed issues"
-                        }
-                        if (unprocessedIssues.isEmpty()) {
-                            echo "All issues already reviewed in previous builds"
-                            currentBuild.result = 'SUCCESS'
-                            return
-                        }
-                        echo "Processing ${unprocessedIssues.size()} new Jira issues"
 
                         def issueBuilds = [:]
-                        unprocessedIssues.each { item ->
+                        items.each { item ->
                             def issueKey = item.issue_key
                             def jiraUrl = item.jira_url
                             def msgId = item.message_id
@@ -306,15 +280,7 @@ pipeline {
                                 """
 
                                 echo "Completed review for ${issueKey}"
-                                // Persist to cross-build dedup state (stored outside workspace to survive git clean)
-                                def pStateFile = "${env.HOME}/.codereview-reviewed.json"
-                                def revState = [:]
-                                if (fileExists(pStateFile)) {
-                                    try { revState = readJSON(file: pStateFile) } catch (Exception e) {}
-                                }
-                                revState[issueKey] = "${currentBuild.number}"
-                                writeJSON(file: pStateFile, json: revState)
-                            }
+	                            }
                         }
                         parallel issueBuilds
                     }
