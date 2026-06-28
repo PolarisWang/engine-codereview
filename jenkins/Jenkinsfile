@@ -50,6 +50,7 @@ pipeline {
         ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
         GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
         REVIEWED_STATE_FILE = "${env.WORKSPACE}/.codereview-feishu-state.json"   // Feishu scanner state (processed msg IDs)
+        REVIEWED_MSG_IDS_FILE = "${env.HOME}/.codereview-processed-msg-ids.json" // Cross-build dedup of processed message IDs
 
         // GitLab token for HTTPS clone + MR branch detection
         GITLAB_TOKEN = "${env.GITLAB_TOKEN ?: ''}"
@@ -86,6 +87,15 @@ pipeline {
                     """
                     scanResult = readJSON(file: SCAN_RESULT_FILE)
                     items = scanResult.items ?: []
+
+                    // Filter out already-processed message IDs
+                    if (fileExists(REVIEWED_MSG_IDS_FILE)) {
+                        def reviewedData = readJSON(file: REVIEWED_MSG_IDS_FILE)
+                        def processedIds = reviewedData.processed_ids ?: []
+                        echo "Filtering ${processedIds.size()} already-processed message IDs"
+                        items = items.findAll { item -> !(item.message_id in processedIds) }
+                    }
+
                     echo "Found ${items.size()} Jira URLs to review"
 
                     if (items.isEmpty()) {
@@ -282,6 +292,21 @@ pipeline {
                                 """
 
                                 echo "Completed review for ${issueKey}"
+
+                                // Persist message_id to prevent duplicate processing
+                                def reviewedData = [:]
+                                if (fileExists(REVIEWED_MSG_IDS_FILE)) {
+                                    reviewedData = readJSON(file: REVIEWED_MSG_IDS_FILE)
+                                }
+                                def processedIds = reviewedData.processed_ids ?: []
+                                if (!(msgId in processedIds)) {
+                                    processedIds.add(msgId)
+                                    if (processedIds.size() > 500) {
+                                        processedIds = processedIds[-500..-1]
+                                    }
+                                    writeJSON(file: REVIEWED_MSG_IDS_FILE, json: [processed_ids: processedIds])
+                                    echo "Persisted message_id ${msgId} as processed"
+                                }
                             }
                             parallel issueBuilds
                         }
