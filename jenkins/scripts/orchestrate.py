@@ -185,15 +185,29 @@ def run(args):
                 "--chat-id", chat_id, "--message-base64", _b64_str("reviewing...")])
             reply_msg_id = _extract_msg_id(out, rc)
     else:
-        progress = "🤖 **正在 Review...**\n已收到，正在拉取代码并进行 AI 审查，请稍候..."
-        rc, out, _ = _run_py("feishu_notifier.py", [
-            "reply-message", "--app-id", app_id, "--app-secret", app_secret,
-            "--chat-id", chat_id, "--message-id", key,
-            "--message-base64", _b64_str(progress)])
-        reply_msg_id = _extract_msg_id(out, rc)
-        pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
-                                  render_msg_id=reply_msg_id)
-        _log('PARSING', 'RUNNING', key, getattr(args, "jira_key", ""), '', '', 'progress card replied')
+        # Scan mode: we want ONE card per topic that evolves through the review
+        # ("Reviewing..." -> FAILED/SKIPPED -> DONE), so a retry reuses the topic's
+        # existing render_msg_id card instead of posting a fresh reply each run.
+        # This prevents a pile-up of stale failure cards under the same message.
+        existing_card = (topic or {}).get("render_msg_id") if topic is not None else None
+        if existing_card:
+            # Reuse the card already tied to this topic: update it in place.
+            _update_card_text(app_id, app_secret, existing_card,
+                              "🤖 **正在 Review（重试）...**\n重新拉取代码并进行 AI 审查，请稍候...")
+            reply_msg_id = existing_card
+            pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
+                                      render_msg_id=reply_msg_id)
+            _log('PARSING', 'RUNNING', key, getattr(args, "jira_key", ""), '', '', 'reusing card in place (retry)')
+        else:
+            progress = "🤖 **正在 Review...**\n已收到，正在拉取代码并进行 AI 审查，请稍候..."
+            rc, out, _ = _run_py("feishu_notifier.py", [
+                "reply-message", "--app-id", app_id, "--app-secret", app_secret,
+                "--chat-id", chat_id, "--message-id", key,
+                "--message-base64", _b64_str(progress)])
+            reply_msg_id = _extract_msg_id(out, rc)
+            pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
+                                      render_msg_id=reply_msg_id)
+            _log('PARSING', 'RUNNING', key, getattr(args, "jira_key", ""), '', '', 'progress card replied')
 
     # 2. Parse Jira. `jira_url` was resolved during topic-add above.
     info = _parse_jira(jira_url, jira_host, jira_token, gitlab_token)
@@ -283,6 +297,11 @@ def _send_reply(app_id, app_secret, reply_msg_id, text):
     _run_py("feishu_notifier.py", [
         "update-reply", "--app-id", app_id, "--app-secret", app_secret,
         "--message-id", reply_msg_id, "--message-base64", _b64_str(text)])
+
+
+def _update_card_text(app_id, app_secret, card_msg_id, text):
+    """Update an existing card message in place (single-card-per-topic behaviour)."""
+    _send_reply(app_id, app_secret, card_msg_id, text)
 
 
 def _parse_jira(jira_url, host, token, gitlab_token):
