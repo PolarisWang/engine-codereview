@@ -26,6 +26,12 @@ pipeline {
     agent { label 'code-review' }
 
     options {
+        // Prevents two scans from racing (duplicate reviews) and manual runs from
+        // overlapping a scan. KNOWN TRADE-OFF: a long manual (JIRA_URL) build holds
+        // this lock, so every-minute cron scans queue behind it (starvation/latency).
+        // Preferred fix (see docs/jenkins-credentials.md / ops notes): split into
+        // separate `codereview-scan` (cron) and `codereview-manual` (manual) jobs so
+        // a long manual review cannot block message scanning.
         disableConcurrentBuilds()
     }
 

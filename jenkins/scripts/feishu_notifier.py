@@ -262,6 +262,7 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
     sev = ((result or {}).get("review") or {}).get("severity_counts") or {}
     changed = len((result or {}).get("changed_files") or [])
     stats = (result or {}).get("stats") or ""
+    review_text = ((result or {}).get("review") or {}).get("review_text") or ""
     error = (((result or {}).get("review") or {}).get("error")
              or (result or {}).get("error") or "")
     branch_merged = (result or {}).get("branch_merged") or False
@@ -269,7 +270,8 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
     mr_state = (result or {}).get("mr_state") or ""
 
     text = f"{repo_icon} **{repo_label} 仓库**"
-    if error:
+    if error and not review_text:
+        # Total failure — no usable review output at all.
         text += f" ❌ 审查失败\n原因: {error}"
     elif branch_exists is False:
         text += f" ⏭️ 跳过审查\n原因: 分支 `{review_branch}` 在远程仓库中不存在（可能已被删除或从未创建）"
@@ -294,6 +296,9 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
             text += f"\nℹ️ Suggestion: {sev['suggestion']}"
         if not sev.get("critical") and not sev.get("warning") and not sev.get("suggestion"):
             text += "\n✅ 未发现严重问题"
+        if error and review_text:
+            # Partial results — batches succeeded but at least one failed.
+            text += f"\n⚠️ 部分批次的审查失败: {error}（已展示成功的部分）"
     return text
 
 

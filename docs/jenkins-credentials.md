@@ -78,6 +78,27 @@ environment {
 
 - 不要把任何密钥提交进 `config.yaml`、`.env` 或 `Jenkinsfile` 源码。
 - `feishu-bot/.env` 已被 `.gitignore` 忽略；若历史提交曾泄露过密钥，请联系运维轮换。
-- `code_reviewer.py` 现通过 `git -c http.extraheader` 注入 GitLab 鉴权，token 不会写入
-  git remote URL 或 `git remote -v`。残留工作区如有旧 `https://user:token@host` 的
-  remote，脚本会自动脱敏。
+- `code_reviewer.py` 通过 `GIT_ASKPASS` 辅助脚本（`jenkins/scripts/git_askpass.sh`）注入 GitLab 鉴权，
+  token 仅通过环境变量传递，**不会**写入 git remote URL、`git remote -v`、命令行参数或日志。
+  若 `REVIEW_WORKSPACE` 缓存目录中残留了历史 `https://user:token@host` 格式的 remote，
+  脚本会自动脱敏清理。
+
+---
+
+## 并发与作业拆分（运维建议）
+
+`Jenkinsfile` 用 `disableConcurrentBuilds()` 防止扫描/审查并发（避免重复 review）。
+
+**已知取舍**：如果一次手动（`JIRA_URL`）审查因大仓库/大 diff 耗时很长（例：克隆大仓库 +
+批量 LLM 可能十几分钟），由于每日 cron 是每分钟触发，该时段密集的 cron 扫描会在队列里排队，
+扫描会延迟、消息处理被饿急。
+
+**推荐拆分**：把「扫描」与「手动审查」拆成两个 Jenkins job，各用同一份 `Jenkinsfile`/脚本，
+但 cron 只挂在扫描 job 上；手动 job 不带 cron。这样一次长手动审查不会阻塞消息扫描。
+
+- 扫描 job `codereview-scan`：触发 `cron('* * * * *')`，不带 `JIRA_URL`（纯扫描模式）。
+- 手动 job `codereview-manual`：无 cron，只接受 `JIRA_URL` + `FEISHU_REPLY_MSG_ID` 参数。
+
+若保持单 job：可接受「一次长审查阻塞扫描」的延迟，系统仍是正确的（重叠窗口 + message_id 去重
+保证不漏不重，只是晚处理）。如需更激进可去掉 `disableConcurrentBuilds()` 并依赖 cursor + 
+`processed_ids` 去重，但不建议——并发竞态更难排查。

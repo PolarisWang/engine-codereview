@@ -147,28 +147,37 @@ def _resolve_git_token():
     return os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN") or ""
 
 
-def _auth_header(token):
-    """Build the AUTHORIZATION header value for GitLab HTTPS (Basic <b64>)."""
-    import base64
+# Path to the git askpass helper (sibling script). Token is delivered via env,
+# never on the command line or in the URL.
+_ASKPASS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git_askpass.sh")
+
+
+def _auth_env(token):
+    """Env vars that carry the GitLab credentials for the askpass helper."""
     user = os.environ.get("GITLAB_USER", "gitlab-ci-token")
-    return "AUTHORIZATION: Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+    return {
+        "GIT_ASKPASS": _ASKPASS_PATH,
+        "GIT_TERMINAL_PROMPT": "0",
+        "CR_GITLAB_USER": user,
+        "CR_GITLAB_TOKEN": token or "",
+    }
 
 
 def git_cmd(subcmd, token, cwd=None, timeout=600):
     """
-    Run a git command, injecting HTTP auth via -c http.extraheader when a token
-    is present. Token is passed via git config, NOT embedded in the URL, so it
-    never appears in `ps`, `git remote -v`, logs, etc.
+    Run a git command, authenticating via a GIT_ASKPASS helper so the token is
+    never on the command line (no `-c http.extraheader`, no URL embedding), which
+    keeps it out of `ps`, `git remote -v`, config, and process-log capture.
 
     subcmd: list starting after `git`, e.g. ["clone", "--branch", x, url, dir]
     Returns (returncode, stdout, stderr).
     """
-    cmd = [GIT_PATH]
+    cmd = [GIT_PATH] + subcmd
+    env = os.environ.copy()
     if token:
-        cmd += ["-c", f"http.extraheader={_auth_header(token)}"]
-    cmd += subcmd
+        env.update(_auth_env(token))
     result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout
+        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout, env=env
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
@@ -560,10 +569,12 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
             total[k] += counts[k]
 
     if not all_text and first_error:
-        # Every batch failed — surface the error as the result
+        # Every batch failed — surface the error as the result.
+        # review_text stays empty so the renderer shows "❌ 审查失败"
+        # (a non-empty review_text would be mistaken for partial results).
         return {
             "summary": f"API error: {first_error}",
-            "review_text": f"审查请求失败: {first_error}",
+            "review_text": "",
             "severity_counts": {},
             "error": first_error,
         }
