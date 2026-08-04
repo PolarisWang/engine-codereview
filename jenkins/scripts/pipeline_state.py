@@ -149,15 +149,29 @@ def add_topic(path, *, message_id, jira_key, project="", jira_url="",
               mode="scan", text_preview="", sender_id="", sender_name="",
               build_number=None):
     """
-    Create a SCANNED/RUNNING topic record. Idempotent: if message_id already
-    exists, the existing record is returned unchanged (do NOT reset an
-    in-progress or completed review when the overlap window re-scans it).
+    Create a SCANNED/RUNNING topic record.
+
+    - mode=scan: idempotent — an existing record (in-progress or DONE) is left
+      unchanged so the overlap window can't clobber it. The dedup filter treats
+      terminal records as already-processed.
+    - mode=manual: an existing TERMINAL record (DONE/FAILED) is RESET to a fresh
+      SCANNED/RUNNING state — a manual re-review of the same issue is an explicit
+      restart and should re-run (and pass the phase-order guard on the first
+      transition).
     """
     state = load_state(path)
-    if message_id not in state["topics"]:
+    existing = state["topics"].get(message_id)
+    if existing is None:
         state["topics"][message_id] = _topic_default(
             message_id, jira_key, project, jira_url, mode, build_number,
             text_preview, sender_id, sender_name)
+        state["updated_at"] = _now_iso()
+        save_state(state, path)
+    elif mode == "manual" and existing.get("phase") in TERMINAL_PHASES:
+        # Manual restart: reset a terminal record so the review re-runs.
+        fresh = _topic_default(message_id, jira_key, project, jira_url, "manual",
+                               build_number, text_preview, sender_id, sender_name)
+        state["topics"][message_id] = fresh
         state["updated_at"] = _now_iso()
         save_state(state, path)
     return state["topics"][message_id]
@@ -412,8 +426,6 @@ def main(argv=None):
                        mr_url=args.mr_url, build_number=args.build_number)
         except ValueError as e:
             print(f"[warn] {e} (kept current state)", file=sys.stderr)
-        print(log_line(phase=args.to, status=args.status, topic=args.key,
-                       issue=args.key.split(":")[0]))
     elif args.command == "repo":
         sev = {}
         if args.severity_json:
@@ -425,8 +437,6 @@ def main(argv=None):
                  error=args.error, skip_reason=args.skip_reason,
                  result_file=args.result_file, severity_counts=sev,
                  stats=args.stats, changed_files=args.changed_files)
-        print(log_line(phase="REPO", status=args.status, topic=args.key,
-                       repo=args.repo, detail=args.skip_reason or args.error))
     elif args.command == "query":
         query(path, key=args.key or None, as_json=args.json)
 

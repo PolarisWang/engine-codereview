@@ -33,6 +33,13 @@ def psCmd(extraArgs) {
     sh "${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py ${extraArgs} --state-file '${PIPELINE_STATE_FILE}'"
 }
 
+// Shell-quote a string for safe embedding in psCmd's sh (escapes single quotes
+// and newlines). Prevents free-text (error/skip_reason/stats/paths) from breaking
+// or injecting into the shell command line.
+def shq(s) {
+    return "'" + (s.toString().replaceAll("'", "\\\\'").replaceAll("\\r?\\n", " ")) + "'"
+}
+
 // Re-render the in-flight Feishu card with the current topic state (idempotent:
 // PATCHes the same render_msg_id in place). Failures are non-fatal (WARN only).
 def updateStateCard(msgId) {
@@ -61,7 +68,7 @@ def updateStateCard(msgId) {
 def recordRepoState(msgId, repo, resultFile, result, reviewBranch, baseBranch) {
     def resultNull = (result == null || result instanceof net.sf.json.JSONNull || result == [:])
     if (resultNull) {
-        psCmd("repo --key '${msgId}' --repo ${repo} --status FAILED --error 'no result file'")
+        psCmd("repo --key ${shq(msgId)} --repo ${repo} --status FAILED --error ${shq('no result file')}")
         codereviewLog('REPO', 'FAILED', msgId, '', '', repo, 'no result file')
         return
     }
@@ -75,17 +82,17 @@ def recordRepoState(msgId, repo, resultFile, result, reviewBranch, baseBranch) {
     def stats = result.stats ?: ''
 
     if (!branchExists) {
-        psCmd("repo --key '${msgId}' --repo ${repo} --status SKIPPED --skip-reason 'branch ${reviewBranch} not remote' --result-file '${resultFile}'")
+        psCmd("repo --key ${shq(msgId)} --repo ${repo} --status SKIPPED --skip-reason ${shq('branch ' + reviewBranch + ' not remote')} --result-file ${shq(resultFile)}")
         codereviewLog('REPO', 'SKIPPED', msgId, '', '', repo, 'branch not remote')
     } else if (branchMerged) {
-        psCmd("repo --key '${msgId}' --repo ${repo} --status SKIPPED --skip-reason 'already merged' --result-file '${resultFile}'")
+        psCmd("repo --key ${shq(msgId)} --repo ${repo} --status SKIPPED --skip-reason ${shq('already merged')} --result-file ${shq(resultFile)}")
         codereviewLog('REPO', 'SKIPPED', msgId, '', '', repo, 'already merged')
     } else if (changed == 0 && !err) {
-        psCmd("repo --key '${msgId}' --repo ${repo} --status SKIPPED --skip-reason 'no changes vs ${baseBranch}' --result-file '${resultFile}'")
+        psCmd("repo --key ${shq(msgId)} --repo ${repo} --status SKIPPED --skip-reason ${shq('no changes vs ' + baseBranch)} --result-file ${shq(resultFile)}")
         codereviewLog('REPO', 'SKIPPED', msgId, '', '', repo, 'no diff changes')
     } else {
         // SUCCESS (partial-error is carried in the error field, matching render).
-        psCmd("repo --key '${msgId}' --repo ${repo} --status SUCCESS --error '${err ?: ''}' --result-file '${resultFile}' --severity-json '${sevJson}' --stats '${stats}' --changed-files '${changed}'")
+        psCmd("repo --key ${shq(msgId)} --repo ${repo} --status SUCCESS --error ${shq(err)} --result-file ${shq(resultFile)} --severity-json ${shq(sevJson)} --stats ${shq(stats)} --changed-files ${shq(changed)}")
         if (err) {
             codereviewLog('REPO', 'PARTIAL', msgId, '', '', repo, err)
         } else {
@@ -210,7 +217,7 @@ pipeline {
                         def jiraUrl = firstItem.jira_url
                         def msgId = firstItem.message_id
                         // Topic birth: record pipeline state (SCANNED).
-                        psCmd("add --key '${msgId}' --jira-key '${issueKey}' --jira-url '${jiraUrl}' --mode scan --text '${firstItem.text ?: ''}' --sender-id '${firstItem.sender_id ?: ''}' --sender-name '${firstItem.sender_name ?: ''}'")
+                        psCmd("add --key ${shq(msgId)} --jira-key ${shq(issueKey)} --jira-url ${shq(jiraUrl)} --mode scan --text ${shq(firstItem.text ?: '')} --sender-id ${shq(firstItem.sender_id ?: '')} --sender-name ${shq(firstItem.sender_name ?: '')}")
                         codereviewLog('SCANNED', 'RUNNING', msgId, issueKey, '', '', 'topic discovered')
                         issueBuilds[msgId] = {
                                 def engFile = "${env.WORKSPACE}/result_${msgId}_engine.json"
@@ -247,8 +254,9 @@ pipeline {
                                 """
                                 def parsedInfo = readJSON(file: infoFile)
                                 if (parsedInfo.containsKey('error')) {
-                                    psCmd("transition --key '${msgId}' --to FAILED --status FAILED --error 'parse failed: ${parsedInfo.error.replace(\"'\",\"'\")}'")
+                                    psCmd("transition --key ${shq(msgId)} --to FAILED --status FAILED --error ${shq('parse failed: ' + parsedInfo.error)}")
                                     codereviewLog('PARSING', 'FAILED', msgId, issueKey, '', '', 'jira parse failed')
+                                    updateStateCard(msgId)   // refresh in-flight card to FAILED
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
                                     def errB64 = b64(errMsg)
                                     sh """
@@ -270,14 +278,14 @@ pipeline {
                                 def project = parsedInfo.project
                                 echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, engine_base=${engineBase}, project=${project}"
                                 // PARSED: branch/base/project resolved.
-                                psCmd("transition --key '${msgId}' --to PARSING --status RUNNING --review-branch '${reviewBranch}' --base-branch '${baseBranch}'")
+                                psCmd("transition --key ${shq(msgId)} --to PARSING --status RUNNING --review-branch ${shq(reviewBranch)} --base-branch ${shq(baseBranch)}")
                                 codereviewLog('PARSED', 'RUNNING', msgId, issueKey, project, '', "branch=${reviewBranch}->${baseBranch}")
 
-                                // Step 3: code review (engine + game) — REVIEWING + repos RUNNING
+                                // Step 3: code review (engine + game). Scan mode runs both in a
+                                // single sh, so per-repo RUNNING is not observable here — the
+                                // terminal states are recorded by recordRepoState after the sh.
                                 codereviewLog('REVIEWING', 'RUNNING', msgId, issueKey, project, '', 'code review started')
                                 psCmd("transition --key '${msgId}' --to REVIEWING --status RUNNING")
-                                psCmd("repo --key '${msgId}' --repo engine --status RUNNING")
-                                psCmd("repo --key '${msgId}' --repo game --status RUNNING")
                                 def mrUrl = parsedInfo.mr_url ?: ''
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
@@ -394,7 +402,7 @@ pipeline {
                     // Manual mode topic record. Use the Jira URL as the key (no
                     // message_id is known yet); issue key resolved after parse.
                     def manTopic = params.JIRA_URL ?: 'manual-topic'
-                    psCmd("add --key '${manTopic}' --jira-url '${params.JIRA_URL}' --mode manual")
+                    psCmd("add --key ${shq(manTopic)} --jira-url ${shq(params.JIRA_URL)} --mode manual")
                     codereviewLog('MANUAL', 'RUNNING', manTopic, '', '', '', 'manual review started')
 
                 script {
@@ -453,7 +461,7 @@ pipeline {
 
                     // Manual topic: record PARSED + resolved branch/base/project.
                     def manTopic = params.JIRA_URL ?: 'manual-topic'
-                    psCmd("transition --key '${manTopic}' --to PARSING --status RUNNING --review-branch '${env.REVIEW_BRANCH}' --base-branch '${env.BASE_BRANCH}' --mr-url '${env.MR_URL}'")
+                    psCmd("transition --key ${shq(manTopic)} --to PARSING --status RUNNING --review-branch ${shq(env.REVIEW_BRANCH)} --base-branch ${shq(env.BASE_BRANCH)} --mr-url ${shq(env.MR_URL)}")
                     codereviewLog('PARSED', 'RUNNING', manTopic, env.ISSUE_KEY, env.PROJECT, '', "branch=${env.REVIEW_BRANCH}->${env.BASE_BRANCH}")
                 }
             }

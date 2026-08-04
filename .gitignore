@@ -1,6 +1,9 @@
 # Secrets & Environment
-feishu-bot/.env
 .env
+.env.*
+
+# Historical investigation notes (not part of the codebase)
+BUILD_5695_5696_ANSWER.md
 
 # Claude Code work directory
 .claude/
