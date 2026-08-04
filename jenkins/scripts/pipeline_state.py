@@ -465,7 +465,8 @@ def main(argv=None):
 
     p = sub.add_parser("add", help="Create (idempotently) a topic record", parents=[common])
     p.add_argument("--key", required=True)
-    p.add_argument("--jira-key", required=True)
+    p.add_argument("--jira-key", default="",
+                   help="Jira issue key; defaults to --key when omitted (e.g. manual mode)")
     p.add_argument("--project", default="")
     p.add_argument("--jira-url", default="")
     p.add_argument("--mode", default="scan", choices=["scan", "manual"])
@@ -514,7 +515,8 @@ def main(argv=None):
             or DEFAULT_STATE_FILE)
 
     if args.command == "add":
-        add_topic(path, message_id=args.key, jira_key=args.jira_key,
+        add_topic(path, message_id=args.key,
+                  jira_key=(args.jira_key or args.key),
                   project=args.project, jira_url=args.jira_url, mode=args.mode,
                   text_preview=args.text, sender_id=args.sender_id,
                   sender_name=args.sender_name, build_number=args.build_number)
