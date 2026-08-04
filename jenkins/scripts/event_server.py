@@ -38,9 +38,9 @@ if SCRIPTS_DIR not in sys.path:
 
 try:
     from flask import Flask, request, jsonify
+    _HAS_FLASK = True
 except ImportError:
-    sys.stderr.write("event_server.py requires flask (or the agent python has it)\n")
-    sys.exit(1)
+    _HAS_FLASK = False
 
 import common
 
@@ -192,22 +192,105 @@ def _handle_message_event(event):
     msg_id = message.get("message_id", "")
     parent_id = message.get("parent_id") or ""   # None/'' -> topic starter
     text = _text_of(message)
+    _route(msg_id, parent_id, text)
 
-    # Common orchestrate base args (orchestrate.py uses --pipeline-state-file/--workspace).
+
+# ── Long-connection (WebSocket) mode — no public callback URL needed ─────────
+#
+# Feishu's open platform supports receiving events over a persistent WebSocket
+# ("长连接") initiated FROM our side, so the server does NOT need a public IP /
+# callback URL. We register a handler for im.message.receive_v1 and normalize the
+# lark-oapi message dataclass into the same routing used by the webhook mode.
+
+def _lark_message_to_route(lark_message):
+    """Map a lark-oapi ws P2ImMessageReceiveV1.message onto the routing fields.
+    Returns (msg_id, parent_id, chat_type, text) or None if not group/text."""
+    try:
+        msg_type = getattr(lark_message, "message_type", "") or ""
+        chat_type = getattr(lark_message, "chat_type", "") or ""
+        msg_id = getattr(lark_message, "message_id", "") or ""
+        parent_id = getattr(lark_message, "parent_id", "") or ""
+        raw_content = getattr(lark_message, "content", "") or ""
+        if msg_type == "text":
+            cd = json.loads(raw_content) if isinstance(raw_content, str) else (raw_content or {})
+            text = (cd or {}).get("text", "")
+        elif msg_type == "post":
+            text = _post_text(raw_content)
+        else:
+            text = ""
+    except Exception as e:
+        print(f"[event] parse lark message failed: {e}", file=sys.stderr)
+        return None
+    return msg_id, parent_id, chat_type, text
+
+
+def _post_text(raw_content):
+    """Extract text from a post content JSON string."""
+    try:
+        cd = json.loads(raw_content) if isinstance(raw_content, str) else (raw_content or {})
+        para = (cd or {}).get("content") or []
+        parts = []
+        for p in para:
+            for seg in p:
+                if seg.get("tag") == "text":
+                    parts.append(seg.get("text", ""))
+                elif seg.get("tag") == "a":
+                    parts.append(seg.get("href", ""))
+        return "".join(parts)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+
+def on_p2_im_message_receive(data):
+    """WS event callback for im.message.receive_v1."""
+    try:
+        event = data.event
+        if not event:
+            print("[event] ws event missing", file=sys.stderr)
+            return
+        routed = _lark_message_to_route(event.message)
+        if not routed:
+            return
+        msg_id, parent_id, chat_type, text = routed
+        if chat_type != "group":
+            return
+        _route(msg_id, parent_id, text)
+    except Exception as e:
+        print(f"[event] ws handler error: {e}", file=sys.stderr)
+
+
+def _route(msg_id, parent_id, text):
+    """Shared single-link routing: new topic with Jira -> run; reply -> interact."""
     base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
-
     if not parent_id:
-        # New topic: only act if it contains a Jira URL.
         if _is_jira_topic(text):
             print(f"[event] NEW TOPIC {msg_id}: {text[:80]}", flush=True)
             _run_orchestrate(["run", "--key", msg_id, "--mode", "scan", "--text", text[:200]] + base)
         else:
-            print(f"[event] ignore new topic (no Jira URL) {msg_id}", flush=True)
+            print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
-        # Reply / @bot in a topic thread -> interaction.
         print(f"[event] REPLY {msg_id} to parent {parent_id}: {text[:80]}", flush=True)
         _run_orchestrate(["interact", "--key", parent_id, "--reply", text[:500],
                           "--reply-msg-id", msg_id] + base)
+
+
+def run_ws():
+    """Start the long-connection event listener (no public callback URL needed)."""
+    import lark_oapi
+    from lark_oapi.ws import Client as WSClient
+    app_id = os.environ.get("FEISHU_APP_ID") or _config().get("event", {}).get("app_id", "")
+    app_secret = os.environ.get("FEISHU_APP_SECRET") or _config().get("event", {}).get("app_secret", "")
+    if not app_id or not app_secret:
+        print("[event] FEISHU_APP_ID / FEISHU_APP_SECRET required for ws mode", file=sys.stderr)
+        sys.exit(1)
+    print(f"[event] long-connection mode (no callback URL needed), state={_state_file()}", flush=True)
+    client = WSClient(app_id=app_id, app_secret=app_secret, log_level=lark_oapi.LogLevel.INFO)
+    client.on_event("im.message.receive_v1", on_p2_im_message_receive)
+    client.start()
+    # block forever (lark SDK keeps the WS alive / reconnects)
+    import time
+    while True:
+        time.sleep(3600)
 
 
 @app.route("/", methods=["GET"])
@@ -219,15 +302,26 @@ def health():
 
 def main():
     parser = argparse.ArgumentParser(description="Feishu real-time event server")
+    parser.add_argument("--mode", choices=["ws", "webhook"], default="ws",
+                        help="Event source: 'ws' = long-connection (no public URL, "
+                             "default), 'webhook' = Flask callback endpoint")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8085)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+
+    if args.mode == "ws":
+        run_ws()
+        return
+
+    # webhook mode (requires flask + a public/ reachable callback URL)
+    if not _HAS_FLASK:
+        print("[event] webhook mode needs flask; install it or use --mode ws", file=sys.stderr)
+        sys.exit(1)
     cfg = _config()
-    host = args.host
     port = args.port or int(cfg.get("event", {}).get("port", 8085))
-    print(f"[event] listening on {host}:{port}, state={_state_file()}", flush=True)
-    app.run(host=host, port=port, debug=args.debug, threaded=False)
+    print(f"[event] webhook mode listening on {args.host}:{port}, state={_state_file()}", flush=True)
+    app.run(host=args.host, port=port, debug=args.debug, threaded=False)
 
 
 if __name__ == "__main__":

@@ -4,93 +4,82 @@
 用户发新话题（带 Jira URL）→ 立即审查；用户 @机器人 / 话题内回复 → 实时作答，
 实现"review 后给修复选项 + 对话"的交互能力。
 
-> 需要先在飞书开放平台后台配置事件订阅，让消息事件回调到本服务。
+### ⭐ 推荐：长连接模式（无需公网 IP / 回调 URL）
+
+本机**没有公网 IP**，飞书回调 URL 无法直达。因此用飞书的**长连接（WebSocket）**接收事件：
+
+- 事件服务**主动连接飞书的 WebSocket**，飞书把消息事件推送到这条长连接上。
+- **不需要公网 IP、域名、回调 URL、HTTPS 反代。**
+- 实时性一样（秒级），单触发链路设计不变。
+- 启动：`event_server.py --mode ws`（默认），依赖 `lark_oapi`（已装）。
+
+飞书后台只需：**开启 `im.message.receive_v1` 事件订阅，订阅方式选「长连接」，无需填回调地址。**
+
+> 备选：`--mode webhook`（Flask 回调端点）仍保留，但本环境无公网，推荐用长连接。
 
 ---
 
-## 一次性依赖（已具备 / 需确认）
+## 一次性依赖
 
 | 项 | 状态 |
 |----|------|
-| app_id / app_secret | ✅ 已有（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`） |
-| 本机端口可监听 | ✅ event_server 监听 `0.0.0.0:8085` |
-| 回调可达性 | ⚠️ 见下「回调 URL」；需要飞书能访问到该端点 |
-| verification token / encrypt key | 需在飞书后台生成并填到配置 |
+| app_id / app_secret | ✅ `FEISHU_APP_ID` / `FEISHU_APP_SECRET` |
+| `lark_oapi` | ✅ 已安装（长连接用） |
+| 公网 IP / 回调 URL | ❌ 不需要（长连接） |
 
 ---
 
-## 步骤 1：飞书开放平台配置事件订阅
+## 步骤 1：飞书开放平台开启「长连接」事件订阅（无公网）
 
-1. 打开飞书开放平台后台：`https://open.feishu.cn/app/<app_id>/event`（或 开发者后台 → 应用 → 事件与回调）。
-2. 在「事件订阅」→「订阅方式」，选 **将事件发送至开发者服务器**（自定义机器人 / 自建应用）。
-3. **请求地址（回调 URL）**：填事件服务的地址，**末尾要有 `/webhook/event`**：
-   - 内网可达时：`http://10.10.1.173:8085/webhook/event`
-   - 若飞书要求公网 HTTPS：需要一层 HTTPS 反代把 `https://<域名>/webhook/event` 转发到本机 `8085/webhook/event`（见「HTTPS 反代」）。飞书对回调要求通常需要公网+HTTPS。
-4. 点「保存」，飞书会向该 URL 发一个 `url_verify`（type=url_verify）请求做验证：event_server 会原样返回 `challenge`，验证即通过。
-5. 记下后台显示的 **Verification Token** 和 **Encrypt Key**（若启用加密）。
-6. 在**「事件」**里订阅 `接收消息 im.message.receive_v1`（在「消息与群组」分类下），启用。
+1. 打开飞书开放平台后台：`https://open.feishu.cn/app/<app_id>/event`（或 开发者后台 → 你的应用 → 事件与回调）。
+2. **「事件订阅」→「订阅方式」**：选「**长连接**」（WebSocket / Long Connection）。
+   - ⚠️ **不要**选「请求地址 / Webhook URL 回调」——那需要公网可达。
+3. 左侧「**事件**」→ 搜索并订阅「**接收消息** `im.message.receive_v1`」→ 启用。
+4. 确认应用已开通相关权限（`im:message` 等，读消息/发消息）且已被拉进目标话题群。
+
+> 长连接模式通常也支持自动重连；飞书后台一般还能看到「长连接状态」。
 
 ---
 
-## 步骤 2：把 token / key 填进配置
+## 步骤 2：配置 app 凭据
 
-把后台的 Verification Token / Encrypt Key 填到 `config.yaml` 的 `event:` 块：
+长连接需要 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`：
+
+- 写入 `.env`（`/home/debian/agent/engine-codereview/.env`），或
+- config.yaml 的 `event:` 块加 `app_id` / `app_secret`，或直接设环境变量。
 
 ```yaml
 event:
-  port: 8085
-  verification_token: "<后台VerificationToken>"
-  encrypt_key: "<后台EncryptKey>"   # 若启用了加密；未启用留空
+  # app_id / app_secret: 事件服务长连接用
+  # app_id: cli_xxx
+  # app_secret: xxx
   state_file: /root/.codereview-pipeline-state.json
 ```
 
-或通过环境变量注入（`.env` / systemd）：`FEISHU_VERIFICATION_TOKEN`、`FEISHU_ENCRYPT_KEY`。
-event_server 会优先读 env，其次读 config.yaml。
+（长连接模式无需 verification token / encrypt key —— 那是 webhook 回调模式用的。）
 
 ---
 
-## 步骤 3：启动事件服务
+## 步骤 3：启动事件服务（长连接）
 
-复用 systemd unit `deploy/feishu-event.service`：
+```bash
+cd /home/debian/agent/engine-codereview
+# 前台调试
+FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=<secret> \
+  python3 jenkins/scripts/event_server.py --mode ws
+# 看到 "long-connection mode" 且无报错 = 已连上飞书长连接
+```
 
+常驻（systemd）：
 ```bash
 sudo cp deploy/feishu-event.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now feishu-event
-# 观察日志
 journalctl -u feishu-event -f
 ```
-
-手动启动（调试）：
-```bash
-cd jenkins/scripts && python3 event_server.py --host 0.0.0.0 --port 8085
-```
+（该 service 已用 `--mode ws`。）
 
 ---
-
-## HTTPS 反代（若飞书要求公网 HTTPS）
-
-若飞书后台要求 `https://` 回调，在本机（或网关）加一层反代转发：
-
-- **nginx**（若本机可装）：
-```nginx
-server {
-  listen 443 ssl;
-  server_name cr-callback.example.com;
-  ssl_certificate     /path/cert.pem;
-  ssl_certificate_key /path/key.pem;
-  location /webhook/event {
-    proxy_pass http://127.0.0.1:8085;
-    proxy_set_header Host $host;
-  }
-}
-```
-- 或任何已有的 ingress / 云负载均衡转发 `https://<域名>/webhook/event → 10.10.1.173:8085/webhook/event`。
-
-回调 URL 就填 `https://<域名>/webhook/event`。
-
----
-
 ## 交互指令约定（用户在本话题内回复）
 
 默认审查完成后，卡片末尾会追加交互提示。用户在**该话题 thread 内 @机器人** 回复：
@@ -109,6 +98,6 @@ server {
 
 ## 故障与兜底
 
-- **事件服务挂了**：飞书不再实时回调 → 现有 Jenkins cron 扫描仍按周期处理新话题（兜底），靠 `pipeline_state` 的 processed/terminal 去重，不会重复。
-- **验证失败**：若后台提示 URL 验证失败，检查：URL 末尾 `/webhook/event`、端口可达、verification token 匹配。
-- **消息没触发**：确认后台已订阅 `im.message.receive_v1` 且应用已被拉入目标群，事件通知开启。
+- **事件服务挂了**：长连接断开 → 现有 Jenkins cron 扫描仍按周期处理新话题（兜底），靠 `pipeline_state` 的 processed/terminal 去重，不会重复。长连接断开会由 `lark_oapi` 自动重连。
+- **收不到事件**：确认后台**订阅方式选的是「长连接」**（而非 Webhook/回调 URL），且已开启 `im.message.receive_v1`、应用已被拉入目标群。查看日志应有 `[event] NEW TOPIC ...` / `[event] REPLY ...` 路由行。
+- **应用未应答**：确认启动时 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 正确、`lark_oapi` 已装；后台「长连接」状态应显示已连接。
