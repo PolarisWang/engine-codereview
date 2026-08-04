@@ -242,13 +242,14 @@ def _post_text(raw_content):
 
 
 def on_p2_im_message_receive(data):
-    """WS event callback for im.message.receive_v1."""
+    """WS event handler for im.message.receive_v1 (receives a P2ImMessageReceiveV1)."""
     try:
-        event = data.event
-        if not event:
-            print("[event] ws event missing", file=sys.stderr)
+        # data is the P2ImMessageReceiveV1; route via its message payload.
+        message = _p2_message_payload(data)
+        if not message:
+            print("[event] ws event missing message", file=sys.stderr)
             return
-        routed = _lark_message_to_route(event.message)
+        routed = _lark_message_to_route(message)
         if not routed:
             return
         msg_id, parent_id, chat_type, text = routed
@@ -257,6 +258,19 @@ def on_p2_im_message_receive(data):
         _route(msg_id, parent_id, text)
     except Exception as e:
         print(f"[event] ws handler error: {e}", file=sys.stderr)
+
+
+def _p2_message_payload(data):
+    """Extract the raw message dict-like from a P2ImMessageReceiveV1.
+
+    lark-oapi wraps the payload; `data.event.message` is the message object. We
+    wrap it so _lark_message_to_route can use getattr on it unchanged."""
+    try:
+        event = getattr(data, "event", None)
+        message = getattr(event, "message", None)
+        return message
+    except Exception:
+        return None
 
 
 def _route(msg_id, parent_id, text):
@@ -284,8 +298,17 @@ def run_ws():
         print("[event] FEISHU_APP_ID / FEISHU_APP_SECRET required for ws mode", file=sys.stderr)
         sys.exit(1)
     print(f"[event] long-connection mode (no callback URL needed), state={_state_file()}", flush=True)
-    client = WSClient(app_id=app_id, app_secret=app_secret, log_level=lark_oapi.LogLevel.INFO)
-    client.on_event("im.message.receive_v1", on_p2_im_message_receive)
+
+    # Register the im.message.receive_v1 handler on an EventDispatcherHandler and
+    # pass it into the ws.Client (older lark-oapi builds used client.on_event; the
+    # supported path is an event_handler on the Client constructor).
+    from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+    handler = EventDispatcherHandler.builder("", "") \
+        .register_p2_im_message_receive_v1(on_p2_im_message_receive) \
+        .build()
+    client = WSClient(app_id=app_id, app_secret=app_secret,
+                      log_level=lark_oapi.LogLevel.INFO,
+                      event_handler=handler)
     client.start()
     # block forever (lark SDK keeps the WS alive / reconnects)
     import time
