@@ -270,7 +270,6 @@ pipeline {
                     psCmd("add --key ${shq(manTopic)} --jira-url ${shq(params.JIRA_URL)} --mode manual")
                     codereviewLog('MANUAL', 'RUNNING', manTopic, '', '', '', 'manual review started')
 
-                script {
                     sh """
                         ${PYTHON} ${SCRIPTS_DIR}/jira_parser.py \
                             --jira-url '${params.JIRA_URL}' \
