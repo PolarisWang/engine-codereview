@@ -139,6 +139,9 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         "last_error": "",
         "render_msg_id": "",
         "build_number": build_number,
+        "retry_count": 0,
+        "next_retry_at": "",       # ISO — earliest time the scan may retry this topic
+        "failed_exhausted": False,  # True once retries are exhausted (stop auto-retry)
         "repos": {"engine": _repo_default(), "game": _repo_default()},
     }
 
@@ -242,6 +245,72 @@ def transition(path, key, *, to, status, last_error="", render_msg_id=None,
     state["updated_at"] = _now_iso()
     save_state(state, path)
     return topic
+
+
+# ── Retry with exponential backoff ───────────────────────────────────────────
+
+# Backoff schedule (seconds) between automatic retries of a failed topic, by
+# attempt index. After exhausting this list the topic is marked failed_exhausted
+# (no more auto-retry until a human resets it or a new scan adds it fresh).
+RETRY_BACKOFF_SECONDS = [60, 300, 900, 3600, 7200]  # 1m, 5m, 15m, 1h, 2h
+
+
+def record_failure(path, key, error=""):
+    """
+    Record a topic failure: increment retry_count, compute the next allowed retry
+    time (exponential backoff), and set failed_exhausted when the schedule runs
+    out. Returns the topic dict.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        topic = _topic_default(key, key, "", "", "scan", None, "", "", "")
+        state["topics"][key] = topic
+    if error:
+        topic["last_error"] = error
+
+    attempt = int(topic.get("retry_count") or 0)
+    topic["retry_count"] = attempt + 1
+    attempted_at = time.time()
+
+    idx = attempt  # index into schedule for the *next* retry's delay
+    if idx < len(RETRY_BACKOFF_SECONDS):
+        delay = RETRY_BACKOFF_SECONDS[idx]
+        topic["next_retry_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.localtime(attempted_at + delay))
+        topic["failed_exhausted"] = False
+    else:
+        topic["next_retry_at"] = ""
+        topic["failed_exhausted"] = True
+
+    topic["phase"] = "FAILED"
+    topic["status"] = "FAILED"
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
+
+
+def can_retry(path, key):
+    """
+    Return True if a failed topic may be retried now (backoff elapsed, not
+    exhausted). Also returns True if the topic isn't in a failed state.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return True
+    if topic.get("failed_exhausted"):
+        return False
+    nxt = topic.get("next_retry_at") or ""
+    if not nxt:
+        # No pending schedule -> either not failed or immediate retry allowed.
+        return True
+    try:
+        nxt_ts = time.mktime(time.strptime(nxt, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return True
+    return time.time() >= nxt_ts
 
 
 # ── Per-repo status ──────────────────────────────────────────────────────────
@@ -358,6 +427,30 @@ def query(path, key=None, as_json=False):
     print(f"{len(topics)} topic(s)")
 
 
+def status(path):
+    """Print a compact ops overview: counts of topics by phase/status, plus the
+    currently-running and exhausted-failed ones (for alerting/monitoring)."""
+    topics = list_topics(path)
+    running = [t for t in topics if t.get("status") == "RUNNING"]
+    done = [t for t in topics if t.get("phase") == "DONE"]
+    failed = [t for t in topics if t.get("phase") == "FAILED"]
+    exhausted = [t for t in topics if t.get("failed_exhausted")]
+    skipped = [t for t in topics if t.get("status") == "SKIPPED"]
+    print(f"topics={len(topics)} running={len(running)} done={len(done)} "
+          f"failed={len(failed)} skipped={len(skipped)} exhausted={len(exhausted)}")
+    if running:
+        print("RUNNING:")
+        for t in running:
+            print(f"  - {t.get('message_id','')} ({t.get('jira_key','')}) {t.get('phase','')}")
+    if exhausted:
+        print("EXHAUSTED (need attention / might alert):")
+        for t in exhausted:
+            print(f"  - {t.get('message_id','')} ({t.get('jira_key','')}) error={t.get('last_error','')[:80]}")
+    # For scanning the state (non-interactive), return counts so callers can alert.
+    return {"topics": len(topics), "running": len(running), "done": len(done),
+            "failed": len(failed), "exhausted": len(exhausted)}
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -408,6 +501,14 @@ def main(argv=None):
     p.add_argument("--key", default="")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("status", parents=[common],
+                       help="Ops overview: counts by phase/status + alerts")
+
+    p = sub.add_parser("fail", parents=[common],
+                       help="Record a topic failure with exponential-backoff retry set")
+    p.add_argument("--key", required=True)
+    p.add_argument("--error", default="")
+
     args = parser.parse_args(argv)
     path = (args.state_file or os.environ.get("PIPELINE_STATE_FILE")
             or DEFAULT_STATE_FILE)
@@ -418,6 +519,9 @@ def main(argv=None):
                   text_preview=args.text, sender_id=args.sender_id,
                   sender_name=args.sender_name, build_number=args.build_number)
         print(f"[ok] topic {args.key} add (or already exists)")
+    elif args.command == "fail":
+        record_failure(path, args.key, args.error)
+        print(f"[ok] topic {args.key} recorded failure; retry={can_retry(path, args.key)}")
     elif args.command == "transition":
         try:
             transition(path, args.key, to=args.to, status=args.status,
@@ -439,6 +543,8 @@ def main(argv=None):
                  stats=args.stats, changed_files=args.changed_files)
     elif args.command == "query":
         query(path, key=args.key or None, as_json=args.json)
+    elif args.command == "status":
+        status(path)
 
 
 if __name__ == "__main__":

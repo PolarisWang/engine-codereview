@@ -40,31 +40,10 @@ def shq(s) {
     return "'" + (s.toString().replaceAll("'", "\\\\'").replaceAll("\\r?\\n", " ")) + "'"
 }
 
-// Re-render the in-flight Feishu card with the current topic state (idempotent:
-// PATCHes the same render_msg_id in place). Failures are non-fatal (WARN only).
-def updateStateCard(msgId) {
-    try {
-        def msgFile = "${env.WORKSPACE}/.state_${msgId}.json"
-        sh("${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py query --key '${msgId}' --state-file '${PIPELINE_STATE_FILE}' > ${msgFile}")
-        def topic = readJSON(file: msgFile)
-        def rmId = topic.render_msg_id ?: ''
-        if (rmId == '') { return }
-        def cardB64 = sh(script: "${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py render-state --topic-file '${msgFile}' --message-base64", returnStdout: true).trim()
-        sh """
-            ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
-                --app-id '${env.FEISHU_APP_ID}' \
-                --app-secret '${env.FEISHU_APP_SECRET}' \
-                --message-id '${rmId}' \
-                --message-base64 '${cardB64}'
-        """
-    } catch (Exception e) {
-        echo "WARN: updateStateCard failed for ${msgId}: ${e}"
-    }
-}
-
 // Record one repo's terminal state into pipeline state from its result file.
 // SUCCESS (with optional partial error), SKIPPED or FAILED are derived from the
-// code_reviewer output contract.
+// code_reviewer output contract. Used by manual mode's stage post-blocks (scan
+// mode records repo states from orchestrate.py instead).
 def recordRepoState(msgId, repo, resultFile, result, reviewBranch, baseBranch) {
     def resultNull = (result == null || result instanceof net.sf.json.JSONNull || result == [:])
     if (resultNull) {
@@ -195,8 +174,10 @@ pipeline {
                         if (termJson) {
                             def topics = readJSON(text: termJson)
                             if (topics instanceof List) {
+                                // DONE and SKIPPED are terminal (no auto-retry). FAILED is
+                                // retryable and handled by the backoff filter below.
                                 terminalKeys = topics.findAll { t ->
-                                    t.phase in ['DONE', 'FAILED'] || t.status == 'SKIPPED'
+                                    t.phase == 'DONE' || t.status == 'SKIPPED'
                                 }.collect { t -> t.message_id }
                             }
                         }
@@ -204,6 +185,38 @@ pipeline {
                     def doneIds = (processedIds + terminalKeys) as Set
                     echo "Filtering ${doneIds.size()} already-processed message IDs (processed=${processedIds.size()} terminal=${terminalKeys.size()})"
                     items = items.findAll { item -> !(item.message_id in doneIds) }
+
+                    // Retry backoff: a FAILED topic is reprocessed only once its
+                    // exponential-backoff window has elapsed and it isn't exhausted.
+                    // (DONE/SKIPPED/processed were already filtered above; UNKNOWN → allow.)
+                    def topicStates = [:]
+                    if (fileExists(PIPELINE_STATE_FILE)) {
+                        def allJson = sh(script: "${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py query --json --state-file '${PIPELINE_STATE_FILE}'", returnStdout: true).trim()
+                        if (allJson) {
+                            def allTopics = readJSON(text: allJson)
+                            if (allTopics instanceof List) {
+                                for (t in allTopics) { topicStates[t.message_id] = t }
+                            }
+                        }
+                    }
+                    def nowEpoch = (long)(System.currentTimeMillis() / 1000)
+                    def retryableFilter = { item ->
+                        def st = topicStates[item.message_id]
+                        if (st == null) return true
+                        if (st.failed_exhausted == true) return false
+                        if (st.phase != 'FAILED') return true
+                        def nxt = (st.next_retry_at ?: '') as String
+                        if (nxt == '') return true   // no schedule → allow immediate retry
+                        // Parse ISO next_retry_at (local) into epoch.
+                        try {
+                            def fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss")
+                            def nxtEpoch = fmt.parse(nxt).getTime() / 1000
+                            return nowEpoch >= (long)nxtEpoch
+                        } catch (Exception e) {
+                            return true
+                        }
+                    }
+                    items = items.findAll(retryableFilter)
 
                     if (items.isEmpty()) {
                         currentBuild.result = 'SUCCESS'
@@ -216,176 +229,28 @@ pipeline {
                         def issueKey = firstItem.issue_key
                         def jiraUrl = firstItem.jira_url
                         def msgId = firstItem.message_id
-                        // Topic birth: record pipeline state (SCANNED).
+                        // Topic birth: record pipeline state (SCANNED); then drive the whole
+                        // review from Python (orchestrate.py) — single source of flow logic.
                         psCmd("add --key ${shq(msgId)} --jira-key ${shq(issueKey)} --jira-url ${shq(jiraUrl)} --mode scan --text ${shq(firstItem.text ?: '')} --sender-id ${shq(firstItem.sender_id ?: '')} --sender-name ${shq(firstItem.sender_name ?: '')}")
                         codereviewLog('SCANNED', 'RUNNING', msgId, issueKey, '', '', 'topic discovered')
-                        issueBuilds[msgId] = {
-                                def engFile = "${env.WORKSPACE}/result_${msgId}_engine.json"
-                                def gamFile = "${env.WORKSPACE}/result_${msgId}_game.json"
-                                def infoFile = "${env.WORKSPACE}/parsed_${msgId}.json"
-                                def replyMsgIdFile = "${env.WORKSPACE}/.reply_msg_id_${msgId}"
-
-                                // Step 1: Reply with processing card in Feishu thread, capture message_id
-                                def progressText = "🤖 **正在 Review...**\n已收到 ${issueKey}，正在拉取代码并进行 AI 审查，请稍候..."
-                                def progressB64 = b64(progressText)
-                                sh """
-                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py reply-message \
-                                        --app-id '${env.FEISHU_APP_ID}' \
-                                        --app-secret '${env.FEISHU_APP_SECRET}' \
-                                        --chat-id '${env.FEISHU_CHAT_ID}' \
-                                        --message-id '${msgId}' \
-                                        --message-base64 '${progressB64}' > ${replyMsgIdFile}
-                                """
-                                def replyResp = readJSON(file: replyMsgIdFile)
-                                def replyMsgId = replyResp.message_id ?: ''
-                                // Record the in-flight reply msg id + advance to PARSING.
-                                // (render_msg_id lets later stage transitions live-update the card.)
-                                psCmd("transition --key '${msgId}' --to PARSING --status RUNNING --render-msg-id '${replyMsgId}'")
-                                codereviewLog('PARSING', 'RUNNING', msgId, issueKey, '', '', 'progress card replied')
-
-                                // Step 2: Parse Jira → project + MR info
-                                sh """
-                                    ${PYTHON} ${SCRIPTS_DIR}/jira_parser.py \
-                                        --jira-url '${jiraUrl}' \
-                                        --jira-host '${env.JIRA_HOST}' \
-                                        --jira-token '${env.JIRA_TOKEN}' \
-                                        --gitlab-token '${env.GITLAB_TOKEN}' \
-                                        > ${infoFile}
-                                """
-                                def parsedInfo = readJSON(file: infoFile)
-                                if (parsedInfo.containsKey('error')) {
-                                    psCmd("transition --key ${shq(msgId)} --to FAILED --status FAILED --error ${shq('parse failed: ' + parsedInfo.error)}")
-                                    codereviewLog('PARSING', 'FAILED', msgId, issueKey, '', '', 'jira parse failed')
-                                    updateStateCard(msgId)   // refresh in-flight card to FAILED
-                                    def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
-                                    def errB64 = b64(errMsg)
-                                    sh """
-                                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
-                                            --app-id '${env.FEISHU_APP_ID}' \
-                                            --app-secret '${env.FEISHU_APP_SECRET}' \
-                                            --message-id '${replyMsgId}' \
-                                            --message-base64 '${errB64}'
-                                    """
-                                    return
-                                }
-                                def mrInfo = parsedInfo.mr_info
-                                if (mrInfo instanceof net.sf.json.JSONNull) mrInfo = null
-                                def reviewBranch = mrInfo?.branch ?: issueKey
-                                def baseBranch = mrInfo?.target_branch ?: parsedInfo.default_branch ?: 'master'
-                                def engineBase = parsedInfo.engine_default_branch ?: baseBranch
-                                def engineRepo = parsedInfo.engine_repo
-                                def gameRepo = parsedInfo.game_repo
-                                def project = parsedInfo.project
-                                echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, engine_base=${engineBase}, project=${project}"
-                                // PARSED: branch/base/project resolved.
-                                psCmd("transition --key ${shq(msgId)} --to PARSING --status RUNNING --review-branch ${shq(reviewBranch)} --base-branch ${shq(baseBranch)}")
-                                codereviewLog('PARSED', 'RUNNING', msgId, issueKey, project, '', "branch=${reviewBranch}->${baseBranch}")
-
-                                // Step 3: code review (engine + game). Scan mode runs both in a
-                                // single sh, so per-repo RUNNING is not observable here — the
-                                // terminal states are recorded by recordRepoState after the sh.
-                                codereviewLog('REVIEWING', 'RUNNING', msgId, issueKey, project, '', 'code review started')
-                                psCmd("transition --key '${msgId}' --to REVIEWING --status RUNNING")
-                                def mrUrl = parsedInfo.mr_url ?: ''
-                                sh """
-                                    ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
-                                        --repo '${engineRepo}' \
-                                        --branch '${reviewBranch}' \
-                                        --base-branch '${engineBase}' \
-                                        --project '${project}' \
-                                        --issue-key '${issueKey}' \
-                                        --repo-type 'engine' \
-                                        --mr-url '${mrUrl}' \
-                                        --workspace '${REVIEW_WORKSPACE}' \
-                                        --output '${engFile}'
-                                    ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
-                                        --repo '${gameRepo}' \
-                                        --branch '${reviewBranch}' \
-                                        --base-branch '${baseBranch}' \
-                                        --project '${project}' \
-                                        --issue-key '${issueKey}' \
-                                        --repo-type 'game' \
-                                        --mr-url '${mrUrl}' \
-                                        --workspace '${REVIEW_WORKSPACE}' \
-                                        --output '${gamFile}'
-                                """
-                                def engineResult = fileExists(engFile) ? readJSON(file: engFile) : [:]
-                                def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
-
-                                // Record per-repo terminal state into pipeline state (scan mode:
-                                // engine+game run in one sh, so both resolve here).
-                                recordRepoState(msgId, 'engine', engFile, engineResult, reviewBranch, baseBranch)
-                                recordRepoState(msgId, 'game', gamFile, gameResult, reviewBranch, baseBranch)
-
-                                // Step 4: Render the summary via feishu_notifier.render-summary
-                                // (single source of truth for the markdown; was previously
-                                // ~100 lines of duplicated Groovy here and in post{}).
-                                def engRespFile = "${env.WORKSPACE}/.eng_update_${msgId}"
-                                def renderOut = "${env.WORKSPACE}/.rendered_${msgId}.md"
-                                def mrState = parsedInfo.mr_info?.state ?: ""
-                                sh """
-                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py render-summary \
-                                        --issue-key '${issueKey}' \
-                                        --project '${project}' \
-                                        --branch '${reviewBranch}' \
-                                        --base-branch '${baseBranch}' \
-                                        --jira-url '${jiraUrl}' \
-                                        --mr-url '${mrUrl}' \
-                                        --mr-state '${mrState}' \
-                                        --engine-file '${engFile}' \
-                                        --game-file '${gamFile}' \
-                                        --message-base64 \
-                                        --output '${renderOut}' \
-                                        > ${engRespFile}
-                                """
-                                def summaryText = readFile(renderOut)
-                                echo "Completed review for ${issueKey}"
-
-                                // Live-update the in-flight card to show repo terminal states
-                                // (one re-render at REVIEWING completion, before final summary).
-                                updateStateCard(msgId)
-
-                                // Send final summary, then record NOTIFYING → DONE/FAILED.
-                                // If the notification itself fails, mark the build FAILURE so
-                                // build status reflects whether users were actually notified.
-                                codereviewLog('NOTIFY', 'RUNNING', msgId, issueKey, project, '', 'sending final summary')
-                                psCmd("transition --key '${msgId}' --to NOTIFYING --status RUNNING")
-                                def updateSend = sh script: """
-                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
-                                        --app-id '${env.FEISHU_APP_ID}' \
-                                        --app-secret '${env.FEISHU_APP_SECRET}' \
-                                        --message-id '${replyMsgId}' \
-                                        --message-base64 '${b64(summaryText)}'
-                                """, returnStatus: true
-                                if (updateSend != 0) {
-                                    echo "WARN: Feishu update-reply failed (status ${updateSend})"
-                                    currentBuild.result = 'FAILURE'
-                                    psCmd("transition --key '${msgId}' --to FAILED --status FAILED --error 'feishu update-reply failed (status ${updateSend})'")
-                                    codereviewLog('NOTIFY', 'FAILED', msgId, issueKey, project, '', 'final update-reply failed')
-                                } else {
-                                    psCmd("transition --key '${msgId}' --to DONE --status SUCCESS")
-                                    codereviewLog('DONE', 'SUCCESS', msgId, issueKey, project, '', 'review complete')
-                                }
-
-                                // Persist message_id to prevent duplicate processing
-                                // (legacy dedup path retained during migration; the state
-                                // file's DONE/FAILED status is the new dedup signal).
-                                def reviewedData = [:]
-                                if (fileExists(REVIEWED_MSG_IDS_FILE)) {
-                                    reviewedData = readJSON(file: REVIEWED_MSG_IDS_FILE)
-                                }
-                                def processedIds = reviewedData.processed_ids ?: []
-                                if (!(msgId in processedIds)) {
-                                    processedIds.add(msgId)
-                                    if (processedIds.size() > 500) {
-                                        processedIds = processedIds[-500..-1]
-                                    }
-                                    writeJSON(file: REVIEWED_MSG_IDS_FILE, json: [processed_ids: processedIds])
-                                    echo "Persisted message_id ${msgId} as processed"
-                                }
-                            }
-                            parallel issueBuilds
+                        def orchRc = sh script: """
+                            ${PYTHON} ${SCRIPTS_DIR}/orchestrate.py run \
+                                --key ${shq(msgId)} \
+                                --mode scan \
+                                --workspace '${REVIEW_WORKSPACE}' \
+                                --pipeline-state-file '${PIPELINE_STATE_FILE}' \
+                                --jira-key ${shq(issueKey)} \
+                                --jira-url ${shq(jiraUrl)} \
+                                --text ${shq(firstItem.text ?: '')} \
+                                --sender-id ${shq(firstItem.sender_id ?: '')} \
+                                --sender-name ${shq(firstItem.sender_name ?: '')}
+                        """, returnStatus: true
+                        if (orchRc != 0) {
+                            echo "orchestrate.py run failed for ${msgId} (rc ${orchRc})"
+                            // Keep message un-processed so it can be retried by a later scan
+                            // (unless it already reached a terminal FAILED via the state file).
                         }
+                    }
                 }
             }
         }

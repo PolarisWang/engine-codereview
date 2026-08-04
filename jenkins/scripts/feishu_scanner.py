@@ -143,13 +143,8 @@ def main():
         data = resp.get("data", {})
         items = data.get("items", [])
         print(f"[feishu] Page: {len(items)} messages (has_more={data.get('has_more')})", flush=True)
-        if items and not page_token and len(all_messages) < 2:
-            # Print first message as debug sample
-            sample = items[0]
-            print(f"[feishu] Sample: id={sample.get('message_id','')} type={sample.get('msg_type','')} "
-                  f"chat_id={sample.get('chat_id','')} thread_id={sample.get('thread_id','')} "
-                  f"parent_id={sample.get('parent_id','')} "
-                  f"sender_type={sample.get('sender',{}).get('sender_type','') if isinstance(sample.get('sender'), dict) else '?'}", flush=True)
+        # Detailed per-message sample dropped to avoid PII/noise (message_id,
+        # sender ids etc. are not needed in the build log).
         all_messages.extend(items)
 
         if not data.get("has_more"):

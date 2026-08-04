@@ -577,6 +577,7 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
             "review_text": "",
             "severity_counts": {},
             "error": first_error,
+            "batches": num_batches,
         }
 
     return {
@@ -584,6 +585,7 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
         "review_text": "\n\n".join(all_text),
         "severity_counts": total,
         "error": first_error,   # non-None if at least one batch failed (partial results)
+        "batches": num_batches,
     }
 
 
@@ -601,6 +603,8 @@ def main():
     parser.add_argument("--workspace", default="/tmp/codereview-workspace",
                         help="Workspace directory")
     parser.add_argument("--output", help="Write result JSON to file")
+    parser.add_argument("--dry", action="store_true",
+                        help="Compute the diff hash only (no LLM call); for result caching")
     parser.add_argument("--mr-url", default="", help="Merge request URL")
     args = parser.parse_args()
 
@@ -619,6 +623,10 @@ def main():
     changed_file_count = len([f for f in diff_info["changed_files"] if f])
     print(f"[{args.repo_type}] Diff: {changed_file_count} files changed", flush=True)
 
+    # Diff hash for result caching: unchanged diff -> reuse cached review (no LLM).
+    import hashlib
+    diff_hash = hashlib.sha1((diff_info["diff_text"] or "").encode("utf-8")).hexdigest()
+
     if not diff_info["diff_text"]:
         result = {
             "project": args.project,
@@ -627,6 +635,7 @@ def main():
             "branch": args.branch,
             "base_branch": args.base_branch,
             "mr_url": args.mr_url or "",
+            "diff_hash": diff_hash,
             "changed_files": diff_info["changed_files"],
             "stats": diff_info["stats"],
             "branch_exists": diff_info["branch_exists"],
@@ -638,25 +647,47 @@ def main():
             },
         }
     else:
-        # Code review via Claude
-        print(f"[{args.repo_type}] Sending to Claude API for review...", flush=True)
-        review_result = review_with_claude(
-            diff_info, config, args.project, args.issue_key, args.repo_type
-        )
-        result = {
-            "project": args.project,
-            "issue_key": args.issue_key,
-            "repo_type": args.repo_type,
-            "branch": args.branch,
-            "base_branch": args.base_branch,
-            "mr_url": args.mr_url or "",
-            "changed_files": diff_info["changed_files"],
-            "stats": diff_info["stats"],
-            "commits": diff_info["commit_log"],
-            "branch_exists": diff_info["branch_exists"],
-            "branch_merged": diff_info["branch_merged"],
-            "review": review_result,
-        }
+        # Dry mode: report the diff hash + diff shape without calling the LLM,
+        # so the orchestrator can decide whether a cached review can be reused.
+        if args.dry:
+            os.makedirs(args.workspace, exist_ok=True)
+            result = {
+                "project": args.project,
+                "issue_key": args.issue_key,
+                "repo_type": args.repo_type,
+                "branch": args.branch,
+                "base_branch": args.base_branch,
+                "mr_url": args.mr_url or "",
+                "diff_hash": diff_hash,
+                "changed_files": diff_info["changed_files"],
+                "stats": diff_info["stats"],
+                "commits": diff_info["commit_log"],
+                "branch_exists": diff_info["branch_exists"],
+                "branch_merged": diff_info["branch_merged"],
+                "dry": True,
+                "review": None,
+            }
+        else:
+            # Code review via Claude
+            print(f"[{args.repo_type}] Sending to Claude API for review...", flush=True)
+            review_result = review_with_claude(
+                diff_info, config, args.project, args.issue_key, args.repo_type
+            )
+            result = {
+                "project": args.project,
+                "issue_key": args.issue_key,
+                "repo_type": args.repo_type,
+                "branch": args.branch,
+                "base_branch": args.base_branch,
+                "mr_url": args.mr_url or "",
+                "diff_hash": diff_hash,
+                "changed_files": diff_info["changed_files"],
+                "stats": diff_info["stats"],
+                "commits": diff_info["commit_log"],
+                "branch_exists": diff_info["branch_exists"],
+                "branch_merged": diff_info["branch_merged"],
+                "review": review_result,
+            }
 
     output_json = json.dumps(result, indent=2, ensure_ascii=False)
 
