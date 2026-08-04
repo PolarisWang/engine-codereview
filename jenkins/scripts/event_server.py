@@ -68,39 +68,45 @@ def _workspace():
         os.environ.get("REVIEW_WORKSPACE", "/root/codereview-workspace")
 
 
-app = Flask(__name__)
+app = None
 
 
-# ── URL verification / secure dispatch ───────────────────────────────────────
+# ── URL verification / secure dispatch (webhook mode only) ───────────────────
+# ws (long-connection) mode does NOT need Flask. To keep the module importable in
+# environments without flask (e.g. the CI agent container), we only build the
+# Flask app + routes when flask is actually installed.
 
-@app.route("/webhook/event", methods=["POST"])
-def feishu_event():
-    data = request.get_json(silent=True) or {}
+if _HAS_FLASK:
+    app = Flask(__name__)
 
-    # Feishu sends a URL-verify challenge on first setup.
-    if data.get("type") == "url_verify":
-        if request.args.get("challenge"):
-            return jsonify({"challenge": request.args["challenge"]})
-        return jsonify({"challenge": data.get("challenge", "")})
+    @app.route("/webhook/event", methods=["POST"])
+    def feishu_event():
+        data = request.get_json(silent=True) or {}
 
-    # Encrypted payload (Encrypt Key configured) — decrypt if present.
-    if data.get("encrypt"):
-        data = _decrypt(data["encrypt"])
-        if data is None:
-            return jsonify({"code": 0})
+        # Feishu sends a URL-verify challenge on first setup.
+        if data.get("type") == "url_verify":
+            if request.args.get("challenge"):
+                return jsonify({"challenge": request.args["challenge"]})
+            return jsonify({"challenge": data.get("challenge", "")})
 
-    # Verify request token (Feishu event v1 includes a 'token').
-    expected = _env("FEISHU_VERIFICATION_TOKEN", "") or _config().get("event", {}).get("verification_token", "")
-    if expected and data.get("token") != expected:
-        return jsonify({"error": "invalid token"}), 403
+        # Encrypted payload (Encrypt Key configured) — decrypt if present.
+        if data.get("encrypt"):
+            data = _decrypt(data["encrypt"])
+            if data is None:
+                return jsonify({"code": 0})
 
-    event = data.get("event", {})
-    event_type = event.get("type", data.get("type", ""))
-    if event_type == "im.message.receive_v1":
-        _handle_message_event(event)
+        # Verify request token (Feishu event v1 includes a 'token').
+        expected = _env("FEISHU_VERIFICATION_TOKEN", "") or _config().get("event", {}).get("verification_token", "")
+        if expected and data.get("token") != expected:
+            return jsonify({"error": "invalid token"}), 403
 
-    # Acknowledge immediately (Feishu requires a 200 within 3s).
-    return jsonify({"code": 0})
+        event = data.get("event", {})
+        event_type = event.get("type", data.get("type", ""))
+        if event_type == "im.message.receive_v1":
+            _handle_message_event(event)
+
+        # Acknowledge immediately (Feishu requires a 200 within 3s).
+        return jsonify({"code": 0})
 
 
 def _decrypt(encrypted_b64):
@@ -316,9 +322,10 @@ def run_ws():
         time.sleep(3600)
 
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "feishu-event-server"})
+if _HAS_FLASK:
+    @app.route("/", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok", "service": "feishu-event-server"})
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
