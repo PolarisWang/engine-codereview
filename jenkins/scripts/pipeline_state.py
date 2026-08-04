@@ -143,6 +143,10 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         "next_retry_at": "",       # ISO — earliest time the scan may retry this topic
         "failed_exhausted": False,  # True once retries are exhausted (stop auto-retry)
         "repos": {"engine": _repo_default(), "game": _repo_default()},
+        # Multi-turn agent session (design-3): cross-message dialog memory + patches.
+        "chat_history": [],         # list of {"role":"user|assistant","content":"..."}
+        "pending_patch": None,      # {"file","diff","repo","created_at", "push_pending": bool} awaiting @ok/@confirm push
+        "applied_patches": [],      # list of {"file","diff","repo","commit","applied_at"}
     }
 
 
@@ -411,6 +415,79 @@ def set_repo(path, key, repo, *, status, error="", skip_reason="",
     state["updated_at"] = _now_iso()
     save_state(state, path)
     return topic
+
+
+# ── Multi-turn agent session (design-3) ──────────────────────────────────────
+
+MAX_CHAT_HISTORY = 40   # cap stored message turns to bound context/cost
+
+
+def append_chat(path, key, message):
+    """
+    Append one chat message {"role","content"} to a topic's chat_history.
+    Trims to the newest MAX_CHAT_HISTORY entries.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    history = topic.setdefault("chat_history", [])
+    if isinstance(history, list):
+        history.append(message)
+        if len(history) > MAX_CHAT_HISTORY:
+            topic["chat_history"] = history[-MAX_CHAT_HISTORY:]
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
+
+
+def set_pending_patch(path, key, patch):
+    """
+    Set (or clear) the topic's pending_patch. patch is a dict or None.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    topic["pending_patch"] = patch
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
+
+
+def record_applied_patch(path, key, patch):
+    """
+    Move a confirmed/executed patch into applied_patches (append) and clear
+    pending_patch. patch includes {"file","diff","repo","commit","applied_at"}.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    applied = topic.setdefault("applied_patches", [])
+    if isinstance(applied, list):
+        applied.append(patch)
+    topic["pending_patch"] = None
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
+
+
+def pop_last_applied_patch(path, key):
+    """Remove and return the most recently applied patch (for @撤销)."""
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    applied = topic.get("applied_patches") or []
+    patch = applied.pop() if applied else None
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return patch
 
 
 # ── Structured log line ──────────────────────────────────────────────────────

@@ -378,72 +378,389 @@ def _build_status_text(topic):
 
 # ── Interaction (reply/chat round-trip) ─────────────────────────────────────
 
+# ── Multi-turn agent (design-3): no-side-effect Agent + guarded Executor ───────
+#
+# Agent decides next tool call via LLM tool_use (auto). Side-effect-free tools
+# are executed inline and their results fed back (loop). The only side-effect
+# tool (apply_patch / push_changes) is NOT executed by the Agent — it stages a
+# pending_patch and waits for explicit user confirmation (@ok / @confirm push).
+
+AGENT_TOOLS = [
+    {
+        "name": "get_status",
+        "description": "Get the current review status of this topic (phase, per-repo severity, retry).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_findings",
+        "description": "List the code review findings for this topic (file, severity, issue, suggestion).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "generate_patch_preview",
+        "description": "Generate a unified-diff patch preview that fixes a specific finding. Specify the finding's file (or 'all' for critical findings).",
+        "input_schema": {"type": "object",
+                         "properties": {"target": {"type": "string",
+                                                   "description": "file path to fix, or 'all' for critical findings"}},
+                         "required": ["target"]},
+    },
+    {
+        "name": "re_review",
+        "description": "Re-run the code review for this topic (reuses diff-hash cache if unchanged).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "answer",
+        "description": "Answer the user's question about this review/topic.",
+        "input_schema": {"type": "object",
+                         "properties": {"question": {"type": "string"}}, "required": ["question"]},
+    },
+    {
+        # Side-effect (write) — staged, NOT auto-executed. Requires @ok then @confirm push.
+        "name": "apply_patch",
+        "description": "PROPOSE a patch to fix one or more findings. This writes to the local review checkout ONLY after the user replies @ok, and pushes to the review branch ONLY after @confirm push. Never execute automatically.",
+        "input_schema": {"type": "object",
+                         "properties": {"target": {"type": "string",
+                                                   "description": "file (or 'all') to fix"}},
+                         "required": ["target"]},
+    },
+]
+
+AGENT_MAX_ROUNDS = 6           # max tool-call rounds per user message
+AGENT_MAX_TOKEN = 1000         # max output tokens per agent LLM turn
+
+
+def _agent_llm(messages, system, api_key, base_url, model,
+               tools=AGENT_TOOLS, max_tokens=AGENT_MAX_TOKEN):
+    """One agent LLM turn with tools. Returns (text, tool_use_list) — one is non-empty."""
+    import urllib.request, urllib.error
+    payload = {
+        "model": model, "max_tokens": max_tokens, "system": system,
+        "messages": messages,
+        "tools": tools, "tool_choice": {"type": "auto"},
+    }
+    req = urllib.request.Request(
+        f"{base_url}/v1/messages", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "x-api-key": api_key,
+                 "anthropic-version": "2023-06-01"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"[agent] llm HTTP {e.code}: {e.read().decode()[:300]}", file=sys.stderr)
+        return None, []
+    except Exception as e:
+        print(f"[agent] llm err: {e}", file=sys.stderr)
+        return None, []
+    text = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
+    tools = [b for b in result.get("content", []) if b.get("type") == "tool_use"]
+    return text.strip(), tools
+
+
+def _agent_system(topic, api_key):
+    """Build the agent system prompt with topic context (read-only)."""
+    return (
+        "You are a code-review assistant operating in a Feishu topic. The user's "
+        "message is @-addressed to you. You may call tools to gather info or propose "
+        "fixes. Rules:\n"
+        "- Call side-effect-free tools (get_status/get_findings/generate_patch_preview/"
+        "re_review/answer) freely; use their results to continue.\n"
+        "- To change code, use apply_patch, which only PROPOSES — it is NOT executed "
+        "automatically; the user must confirm with @ok, then @confirm push for remote.\n"
+        "- Reply in Chinese, concise. When done, give a plain-text final answer.\n"
+        f"- Topic context: {topic.get('jira_key','')} ({topic.get('project','')}), "
+        f"branch {topic.get('review_branch','')} -> {topic.get('base_branch','')}."
+    )
+
+
 def interact(args):
     """
-    Handle a user reply / @bot in a topic thread (driven by the event server).
+    Multi-turn agent handler for a reply / @bot in a topic thread.
 
-    Routes the reply text to an action and updates the SAME topic card in place:
-      1/生成修复补丁预览, 2/重新审查, 3 <kw>/解释某 finding, /状态, or free-form
-      question answered against the topic's diff + review context.
+    Handles confirmation gating first (@ok / @confirm push / @撤销 / @revert), then
+    runs a bounded agent loop: LLM decides tool calls; side-effect-free tools are
+    executed inline and their results fed back; apply_patch stages a pending_patch
+    (not auto-executed). Final text updates the SAME topic card + chat_history.
     """
-    key = args.key                 # parent topic message_id
+    key = args.key
     reply_text = (args.reply or "").strip()
     workspace = args.workspace
     state_file = args.pipeline_state_file or os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
-    # env for LLM call if we answer free-form questions
     api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
     base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
     model = _env("ANTHROPIC_MODEL") or "deepseek-v4-flash"
 
     topic = pipeline_state.get_topic(state_file, key)
     if topic is None:
-        return 0  # unknown topic — nothing to reply to
+        return 0
     render_id = topic.get("render_msg_id") or ""
-
-    # Load existing review findings (from saved result files) for context.
     eng_findings, gam_findings = _load_findings(workspace, key)
+    all_findings = (eng_findings or []) + (gam_findings or [])
 
-    lower = reply_text.lower()
-    answer = None
-    action = "unknown"
+    # ── Confirmation gating (user replies to a staged action) ───────────────
+    low = reply_text.lower()
+    pending = topic.get("pending_patch") or {}
+    is_ok = low in ("@ok", "ok", "好的", "执行", "确认")
+    is_confirm_push = low in ("@confirm push", "确认push", "@push", "推")
+    is_rollback = low in ("@撤销", "@revert", "撤销", "回退")
 
-    if reply_text.startswith("1") or "修复" in reply_text and "补丁" in reply_text:
-        action = "fix_preview"
-        answer = _build_fix_patch_preview(topic, (eng_findings or []) + (gam_findings or []))
-    elif reply_text.startswith("2") or "重审" in reply_text or "重新" in reply_text:
-        action = "re-review"
-        # Re-run the full review; reuse diff-hash cache if unchanged.
-        jira_url = topic.get("jira_url") or key
-        # Re-run run() by re-invoking this script's own logic would recurse; instead
-        # do a targeted re-run reusing _review_repos via a fresh run.
-        answer = "🔄 正在重新审查…请稍候，结果会更新到本帖。"
-        # Fire a background re-run of the scan flow for this topic.
-        _spawn_rerun(key, workspace, state_file, jira_url, app_id, app_secret)
-    elif reply_text.startswith("3 ") or "解释" in reply_text or "为什么" in reply_text:
-        action = "explain"
-        keyword = reply_text[2:].strip() if reply_text.startswith("3 ") else \
-            (reply_text.split("解释", 1)[1].strip() if "解释" in reply_text else "")
-        answer = _answer_question(keyword, (eng_findings or []) + (gam_findings or []),
-                                  api_key, base_url, model)
-    elif reply_text in ("/状态", "/status", "状态"):
-        action = "status"
-        answer = _build_status_text(topic)
-    elif reply_text:
-        action = "question"
-        answer = _answer_question(reply_text, (eng_findings or []) + (gam_findings or []),
-                                  api_key, base_url, model)
-    else:
-        answer = "请回复指令：`1` 修复预览 / `2` 重审 / `3 <关键词>` 解释 / `/状态` / 直接提问。"
+    if pending:
+        if is_ok:
+            # stage #1: apply locally.
+            return _confirm_apply(key, topic, workspace, state_file, app_id, app_secret)
+        if low in ("@confirm push", "确认push", "@push"):
+            return _confirm_push(key, topic, state_file, app_id, app_secret)
+        if is_rollback:
+            return _rollback(key, topic, workspace, state_file, app_id, app_secret)
 
-    # Update the SAME card (or reply a new one if no card yet).
-    if answer:
-        if render_id and app_id and app_secret:
-            _update_card_text(app_id, app_secret, render_id, answer)
-        else:
-            _log(action.upper(), 'RUN', key, "", "", "", f"interaction: {action}")
+    # Also handle @撤销 globally (rollback last applied patch even without pending).
+    if is_rollback:
+        return _rollback(key, topic, workspace, state_file, app_id, app_secret)
+
+    # ── Agent loop ──────────────────────────────────────────────────────────
+    history = topic.get("chat_history") or []
+    messages = list(history) + [{"role": "user", "content": reply_text}]
+    system = _agent_system(topic, api_key)
+    all_msgs = list(messages)
+
+    for _round in range(AGENT_MAX_ROUNDS):
+        text, calls = _agent_llm(all_msgs, system, api_key, base_url, model)
+        if not text and not calls:
+            # hard failure
+            answer = "⚠️ 暂时无法处理（LLM 调用失败）。可用 `重新审查` / `查看状态`。"
+            _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret)
+            return 0
+        if calls:
+            # Execute the requested tools (side-effect-free), feed results back.
+            all_msgs.append({"role": "assistant", "content": f"[tool_use: {[c.get('name') for c in calls]}]"})
+            any_side_effect = False
+            for c in calls:
+                name = c.get("name")
+                inp = c.get("input") or {}
+                result, side_effect = _exec_tool(name, inp, topic, workspace, all_findings,
+                                                 state_file, api_key, base_url, model)
+                all_msgs.append({"role": "user", "content": f"[tool {name} result]\n{result}"})
+                if side_effect:
+                    any_side_effect = True
+            if any_side_effect:
+                # apply_patch staged a pending_patch -> confirm card already written; end this turn.
+                return 0
+            continue
+        # Final plain text.
+        _finalize(key, text, render_id, all_msgs + [{"role": "assistant", "content": text}],
+                  state_file, app_id, app_secret)
+        return 0
+
+    # Loop exhausted.
+    _finalize(key, "已达本轮工具调用上限，请分步询问。", render_id, all_msgs,
+              state_file, app_id, app_secret)
     return 0
+
+
+def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
+               api_key, base_url, model):
+    """Execute one agent tool. Returns (result_text, side_effect_bool)."""
+    if name == "get_status":
+        return _build_status_text(topic), False
+    if name == "get_findings":
+        if not all_findings:
+            return "（该话题暂无 findings）", False
+        return "\n".join(f"- [{f.get('severity')}] {f.get('file')}: {f.get('issue','')}"
+                         for f in all_findings[:25]), False
+    if name == "generate_patch_preview":
+        target = (inp.get("target") or "").strip()
+        return _build_patch_preview_target(all_findings, target), False
+    if name == "re_review":
+        jira_url = topic.get("jira_url") or key_source(topic)
+        _spawn_rerun(key_source(topic), workspace, state_file, jira_url,
+                     _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"))
+        return "已触发重新审查（后台运行），结果会更新到本帖。", False
+    if name == "answer":
+        q = (inp.get("question") or "").strip()
+        return _answer_question(q or "请补充说明", all_findings, api_key, base_url, model), False
+    if name == "apply_patch":
+        # STAGE a patch (side-effect). The actual write waits for @ok (then @confirm push).
+        target = (inp.get("target") or "all").strip()
+        patch = _build_patch_target(all_findings, target)
+        pipeline_state.set_pending_patch(state_file, key_source(topic), {
+            "file": target, "diff": patch.get("diff", ""), "target": target,
+            "created_at": "now",
+        })
+        return ("补丁已提议（未应用）。请回复 `@ok` 应用到本地 checkout；"
+                "如需推送到远程 review 分支再回复 `@confirm push`。" + _confirm_patch_card(patch)), True
+    return "（未知工具）", False
+
+
+def key_source(topic):
+    return topic.get("message_id") or ""
+
+
+def _build_patch_preview_target(findings, target):
+    """Generate a unified-diff patch preview for `target` (file or 'all' critical)."""
+    subset = _select_findings(findings, target)
+    if not subset:
+        return "（没有匹配 target 的 finding 可生成补丁。）"
+    # We don't have the real file text here; produce a suggestion-based preview.
+    lines = ["## 建议修复（基于 finding 的 suggestion，非实际 diff）：\n"]
+    for f in subset[:8]:
+        lines.append(f"- `{f.get('file')}` [{f.get('severity')}]: {f.get('issue','')}\n"
+                     f"  建议: {f.get('suggestion','')}")
+    return "\n".join(lines)
+
+
+def _build_patch_target(findings, target):
+    subset = _select_findings(findings, target)
+    return {"diff": "\n".join(
+        f"--- {f.get('file')}\n+++ {f.get('file')} (suggested)\n{f.get('suggestion','')}"
+        for f in subset[:8]) or "（无）"}
+
+
+def _select_findings(findings, target):
+    target = (target or "all").strip().lower()
+    if target in ("all", "critical"):
+        return [f for f in findings if (f.get('severity') or '').lower() in ("critical", "high")]
+    return [f for f in findings if target in (f.get('file') or '').lower()]
+
+
+def _confirm_patch_card(patch):
+    d = patch.get("diff") or ""
+    return "\n\n**待应用补丁（预览）：**\n" + (d[:600] if d else "（无具体补丁）") + \
+        "\n\n> 回复 `@ok` 应用本地 / `@confirm push` 推 remote / `@撤销` 取消"
+
+
+def _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret):
+    """Persist chat history + update the same card with the final answer."""
+    pipeline_state.append_chat(state_file, key, {"role": "user", "content": "（本轮交互）"})
+    pipeline_state.append_chat(state_file, key, {"role": "assistant", "content": answer})
+    if answer and render_id and app_id and app_secret:
+        _update_card_text(app_id, app_secret, render_id, answer)
+
+
+# ── Guarded side-effect executors (design-3): local apply + remote push + rollback ──
+
+# Protected branch names: never push to these.
+PROTECTED_BRANCHES = {"main", "master", "dev", "develop", "release", "stage", "prod"}
+
+
+def _resolve_repo_checkout(workspace, topic, repo):
+    """
+    Locate a topic repo's git checkout under workspace. Returns (checkout_dir, real_repo_name)
+    or None. Mirrors code_reviewer.prepare_repo naming (url basename minus .git), tried for
+    both engine and game repos; repo selects which one.
+    """
+    repos = {}
+    for r in ("engine", "game"):
+        url = topic.get(f"{r}_repo") or topic.get("repos", {}).get(r, {}).get("repo_url") or ""
+        if url:
+            repos[r] = url
+    url = repos.get(repo) or (list(repos.values())[0] if repos else "")
+    if not url:
+        return None, None
+    name = url.rstrip("/").split("/")[-1].replace(".git", "")
+    candidate = os.path.join(workspace, name)
+    if os.path.isdir(os.path.join(candidate, ".git")):
+        return candidate, name
+    return candidate, name
+
+
+def _run_git(args, cwd):
+    """Run git in a checkout; returns (rc, out, err)."""
+    import subprocess
+    try:
+        r = subprocess.run(["git"] + args, capture_output=True, text=True, cwd=cwd, timeout=120)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret):
+    """User said @ok: apply the staged pending_patch to the LOCAL checkout (git apply)."""
+    pending = topic.get("pending_patch") or {}
+    if not pending:
+        return 0
+    render = topic.get("render_msg_id") or ""
+    # Determine which repo the patch targets (best-effort from file/repo).
+    repo = pending.get("repo") or "game" if "validate_commit" in pending.get("file", "") else "engine"
+    checkout, name = _resolve_repo_checkout(workspace, topic, repo)
+    diff = pending.get("_diff") or ""  # staged actual diff body
+    if not os.path.isdir(os.path.join(checkout or "", ".git")):
+        _update_card_text(app_id, app_secret, render,
+                          f"⚠️ 无法定位该仓库 checkout（{name or '?'}），未应用补丁。")
+        return 0
+    # Path whitelist is implicit: git apply runs inside the checkout dir only.
+    rc, out, err = _run_git(["apply", "--check"], checkout)
+    # Capture pre-apply HEAD for rollback.
+    _, head_before, _ = _run_git(["rev-parse", "HEAD"], checkout)
+    # Apply via a temp patch file piped into git apply.
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+        f.write(diff or "# empty")
+        patch_file = f.name
+    rc2, out2, err2 = _run_git(["apply", patch_file], checkout)
+    import os as _os
+    _os.unlink(patch_file) if _os.path.exists(patch_file) else None
+    if rc2 != 0:
+        _update_card_text(app_id, app_secret, render,
+                          f"❌ 本地应用补丁失败: {err2 or out2}\n回复 `@撤销` 可回退。")
+        return 0
+    # Record as applied (commit ref for rollback).
+    pipeline_state.record_applied_patch(state_file, key, {
+        "file": pending.get("file", ""), "repo": repo,
+        "commit_before": head_before, "applied_at": "now",
+    })
+    _update_card_text(app_id, app_secret, render,
+                      "✅ 补丁已应用到本地 checkout。\n"
+                      "如需推送到远程 review 分支，回复 `@confirm push`。\n"
+                      "如需回退，回复 `@撤销`。")
+    return 0
+
+
+def _confirm_push(key, topic, state_file, app_id, app_secret):
+    """User said @confirm push: push applied changes to the review branch (protected-safe)."""
+    render = topic.get("render_msg_id") or ""
+    branch = topic.get("review_branch") or ""
+    if branch in PROTECTED_BRANCHES or not branch:
+        _update_card_text(app_id, app_secret, render,
+                          f"⚠️ 分支 `{branch or '?'}` 受保护或未知，拒绝推送。")
+        return 0
+    # Resolve checkout by engine (or first known repo).
+    checkout, name = _resolve_repo_checkout(os.environ.get("CODEREVIEW_WORKSPACE", "/root/codereview-workspace"),
+                                            topic, "engine")
+    if not os.path.isdir(os.path.join(checkout or "", ".git")):
+        _update_card_text(app_id, app_secret, render, "⚠️ 无法定位仓库 checkout，未推送。")
+        return 0
+    rc, out, err = _run_git(["add", "-A"], checkout)
+    rc, out, err = _run_git(["commit", "-m", f"[codereview-agent] apply review fix for {key}"], checkout)
+    rc, out, err = _run_git(["push", "origin", f"HEAD:{branch}"], checkout)
+    if rc != 0:
+        _update_card_text(app_id, app_secret, render, f"❌ 推送失败: {err or out}")
+        return 0
+    _update_card_text(app_id, app_secret, render, f"✅ 已推送到远程分支 `{branch}`。可用 `@撤销` 回退。")
+    return 0
+
+
+def _rollback(key, topic, workspace, state_file, app_id, app_secret):
+    """User said @撤销: revert the most recently applied local patch (git revert/checkout)."""
+    render = topic.get("render_msg_id") or ""
+    pipeline_state.set_pending_patch(state_file, key, None)  # drop any pending
+    patch = pipeline_state.pop_last_applied_patch(state_file, key)
+    if not patch:
+        _update_card_text(app_id, app_secret, render, "ℹ️ 没有可回退的已应用补丁。")
+        return 0
+    repo = patch.get("repo", "engine")
+    checkout, _ = _resolve_repo_checkout(workspace, topic, repo)
+    before = patch.get("commit_before") or ""
+    if before and os.path.isdir(os.path.join(checkout or "", ".git")):
+        _run_git(["reset", "--hard", before], checkout)
+        _update_card_text(app_id, app_secret, render, "✅ 已回退（本地 reset 到应用前）。")
+    else:
+        _update_card_text(app_id, app_secret, render, "⚠️ 补丁记录缺失 checkout，无法自动回退，请手动处理。")
+    return 0
+
+
+
 
 
 def _load_findings(workspace, key):
