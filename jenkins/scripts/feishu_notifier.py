@@ -360,6 +360,84 @@ def cmd_render_summary(args):
         print(text)
 
 
+# ── Live status card rendering ───────────────────────────────────────────────
+# A compact "state card" shown as the in-flight Feishu thread reply, re-rendered
+# in-place at phase transitions (idempotent — one card, edited).
+
+_REPO_BADGE = {
+    "PENDING": "⏳ 等待",
+    "RUNNING": "🔄 审查中",
+    "SUCCESS": "✅ 完成",
+    "SKIPPED": "⏭️ 跳过",
+    "FAILED": "❌ 失败",
+}
+
+
+def _sev_summary(sev_counts):
+    sev = sev_counts or {}
+    parts = []
+    if sev.get("critical"):
+        parts.append(f"🔴 {sev['critical']}")
+    if sev.get("warning"):
+        parts.append(f"🟡 {sev['warning']}")
+    if sev.get("suggestion"):
+        parts.append(f"ℹ️ {sev['suggestion']}")
+    return " · ".join(parts) if parts else ""
+
+
+def render_state_card(topic):
+    """
+    Build the live-update Feishu card markdown from a topic record (the JSON
+    produced by pipeline_state.py). Shows overall phase/status and per-repo
+    badges + severity counts.
+    """
+    jira = topic.get("jira_key") or topic.get("message_id") or ""
+    phase = topic.get("phase") or ""
+    status = topic.get("status") or ""
+    repos = topic.get("repos") or {}
+
+    lines = []
+    lines.append(f"🔄 **Code Review Pipeline: {jira}**")
+    lines.append(f"阶段: **{phase}** · 状态: **{status}**")
+    if topic.get("last_error"):
+        lines.append(f"⚠️ {topic['last_error']}")
+    lines.append("")
+    for repo in ("engine", "game"):
+        r = repos.get(repo) or {}
+        badge = _REPO_BADGE.get(r.get("status"), r.get("status", "?"))
+        name = {"engine": "🔧 Engine", "game": "🎮 Game"}.get(repo, repo)
+        sev = _sev_summary(r.get("severity_counts"))
+        if r.get("skip_reason"):
+            lines.append(f"{name}: {badge} — {r['skip_reason']}")
+        elif r.get("error"):
+            lines.append(f"{name}: {badge} — {r['error']}")
+        elif sev:
+            lines.append(f"{name}: {badge} ({sev})")
+        else:
+            lines.append(f"{name}: {badge}")
+    if topic.get("render_msg_id"):
+        lines.append("")
+        lines.append(f"已关联回复卡片: `{topic['render_msg_id']}`")
+    return "\n".join(lines)
+
+
+def cmd_render_state(args):
+    """Render a live status card from a pipeline_state topic JSON file."""
+    try:
+        with open(args.topic_file, encoding="utf-8") as f:
+            topic = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        topic = {}
+    text = render_state_card(topic)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+    if args.message_base64:
+        print(base64.b64encode(text.encode("utf-8")).decode("utf-8"))
+    else:
+        print(text)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def cmd_webhook(args):
@@ -522,6 +600,12 @@ def main():
     p.add_argument("--message-base64", action="store_true",
                    help="Print the rendered markdown as Base64 on stdout")
 
+    # ── render-state (live status card from a pipeline_state topic JSON) ──
+    p = sub.add_parser("render-state", help="Render live status card from a topic record")
+    p.add_argument("--topic-file", required=True, help="Path to a topic JSON (pipeline_state query single)")
+    p.add_argument("--output", default="")
+    p.add_argument("--message-base64", action="store_true")
+
     args = parser.parse_args()
 
     if args.command == "webhook":
@@ -538,6 +622,8 @@ def main():
         cmd_update_reply(args)
     elif args.command == "render-summary":
         cmd_render_summary(args)
+    elif args.command == "render-state":
+        cmd_render_state(args)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,78 @@ def b64(s) {
     return java.util.Base64.getEncoder().encodeToString(s.toString().getBytes("UTF-8"))
 }
 
+// Structured build-log line, greppable via: grep '[CODEREVIEW]'
+def codereviewLog(phase, status, topic='', issue='', project='', repo='', detail='') {
+    def parts = [phase ?: '', status ?: '']
+    echo "[CODEREVIEW] phase=${parts[0]} status=${parts[1]}" + (topic ? " topic=${topic}" : "") + (issue ? " issue=${issue}" : "") + (project ? " project=${project}" : "") + (repo ? " repo=${repo}" : "") + (detail ? " detail=${detail}" : "")
+}
+
+// Invoke pipeline_state.py as a CLI subcommand (fire-and-forget state updates).
+def psCmd(extraArgs) {
+    sh "${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py ${extraArgs} --state-file '${PIPELINE_STATE_FILE}'"
+}
+
+// Re-render the in-flight Feishu card with the current topic state (idempotent:
+// PATCHes the same render_msg_id in place). Failures are non-fatal (WARN only).
+def updateStateCard(msgId) {
+    try {
+        def msgFile = "${env.WORKSPACE}/.state_${msgId}.json"
+        sh("${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py query --key '${msgId}' --state-file '${PIPELINE_STATE_FILE}' > ${msgFile}")
+        def topic = readJSON(file: msgFile)
+        def rmId = topic.render_msg_id ?: ''
+        if (rmId == '') { return }
+        def cardB64 = sh(script: "${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py render-state --topic-file '${msgFile}' --message-base64", returnStdout: true).trim()
+        sh """
+            ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
+                --app-id '${env.FEISHU_APP_ID}' \
+                --app-secret '${env.FEISHU_APP_SECRET}' \
+                --message-id '${rmId}' \
+                --message-base64 '${cardB64}'
+        """
+    } catch (Exception e) {
+        echo "WARN: updateStateCard failed for ${msgId}: ${e}"
+    }
+}
+
+// Record one repo's terminal state into pipeline state from its result file.
+// SUCCESS (with optional partial error), SKIPPED or FAILED are derived from the
+// code_reviewer output contract.
+def recordRepoState(msgId, repo, resultFile, result, reviewBranch, baseBranch) {
+    def resultNull = (result == null || result instanceof net.sf.json.JSONNull || result == [:])
+    if (resultNull) {
+        psCmd("repo --key '${msgId}' --repo ${repo} --status FAILED --error 'no result file'")
+        codereviewLog('REPO', 'FAILED', msgId, '', '', repo, 'no result file')
+        return
+    }
+    def review = result.review ?: [:]
+    def err = review.error ?: result.error ?: ''
+    def branchMerged = result.branch_merged ?: false
+    def branchExists = result.containsKey('branch_exists') ? result.branch_exists : true
+    def sev = review.severity_counts ?: [:]
+    def sevJson = "{\"critical\":${sev.critical ?: 0},\"warning\":${sev.warning ?: 0},\"suggestion\":${sev.suggestion ?: 0}}"
+    def changed = (result.changed_files ?: []).size()
+    def stats = result.stats ?: ''
+
+    if (!branchExists) {
+        psCmd("repo --key '${msgId}' --repo ${repo} --status SKIPPED --skip-reason 'branch ${reviewBranch} not remote' --result-file '${resultFile}'")
+        codereviewLog('REPO', 'SKIPPED', msgId, '', '', repo, 'branch not remote')
+    } else if (branchMerged) {
+        psCmd("repo --key '${msgId}' --repo ${repo} --status SKIPPED --skip-reason 'already merged' --result-file '${resultFile}'")
+        codereviewLog('REPO', 'SKIPPED', msgId, '', '', repo, 'already merged')
+    } else if (changed == 0 && !err) {
+        psCmd("repo --key '${msgId}' --repo ${repo} --status SKIPPED --skip-reason 'no changes vs ${baseBranch}' --result-file '${resultFile}'")
+        codereviewLog('REPO', 'SKIPPED', msgId, '', '', repo, 'no diff changes')
+    } else {
+        // SUCCESS (partial-error is carried in the error field, matching render).
+        psCmd("repo --key '${msgId}' --repo ${repo} --status SUCCESS --error '${err ?: ''}' --result-file '${resultFile}' --severity-json '${sevJson}' --stats '${stats}' --changed-files '${changed}'")
+        if (err) {
+            codereviewLog('REPO', 'PARTIAL', msgId, '', '', repo, err)
+        } else {
+            codereviewLog('REPO', 'SUCCESS', msgId, '', '', repo, "${changed} files, ${stats}")
+        }
+    }
+}
+
 pipeline {
     agent { label 'code-review' }
 
@@ -57,6 +129,8 @@ pipeline {
         GAME_RESULT_FILE = "${env.WORKSPACE}/game_result.json"
         REVIEWED_STATE_FILE = "${env.WORKSPACE}/.codereview-feishu-state.json"   // Feishu scanner state (processed msg IDs)
         REVIEWED_MSG_IDS_FILE = "${env.HOME}/.codereview-processed-msg-ids.json" // Cross-build dedup of processed message IDs
+        // Topic-level pipeline state record (survives builds; NOT touched by cleanup).
+        PIPELINE_STATE_FILE = "${env.HOME}/.codereview-pipeline-state.json"
 
         // GitLab token for HTTPS clone + MR branch detection
         GITLAB_TOKEN = "${env.GITLAB_TOKEN ?: ''}"
@@ -99,15 +173,30 @@ pipeline {
                     scanResult = readJSON(file: SCAN_RESULT_FILE)
                     items = scanResult.items ?: []
 
-                    // Filter out already-processed message IDs
+                    // Filter out already-processed message IDs.
+                    // Dual-source dedup (migration window): legacy processed_ids ∪
+                    // topics already in a terminal phase in the pipeline-state file.
+                    // Whichever mechanism records first wins; both converge.
+                    def processedIds = []
                     if (fileExists(REVIEWED_MSG_IDS_FILE)) {
                         def reviewedData = readJSON(file: REVIEWED_MSG_IDS_FILE)
-                        def processedIds = reviewedData.processed_ids ?: []
-                        echo "Filtering ${processedIds.size()} already-processed message IDs"
-                        items = items.findAll { item -> !(item.message_id in processedIds) }
+                        processedIds = reviewedData.processed_ids ?: []
                     }
-
-                    echo "Found ${items.size()} Jira URLs to review"
+                    def terminalKeys = []
+                    if (fileExists(PIPELINE_STATE_FILE)) {
+                        def termJson = sh(script: "${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py query --json --state-file '${PIPELINE_STATE_FILE}'", returnStdout: true).trim()
+                        if (termJson) {
+                            def topics = readJSON(text: termJson)
+                            if (topics instanceof List) {
+                                terminalKeys = topics.findAll { t ->
+                                    t.phase in ['DONE', 'FAILED'] || t.status == 'SKIPPED'
+                                }.collect { t -> t.message_id }
+                            }
+                        }
+                    }
+                    def doneIds = (processedIds + terminalKeys) as Set
+                    echo "Filtering ${doneIds.size()} already-processed message IDs (processed=${processedIds.size()} terminal=${terminalKeys.size()})"
+                    items = items.findAll { item -> !(item.message_id in doneIds) }
 
                     if (items.isEmpty()) {
                         currentBuild.result = 'SUCCESS'
@@ -120,6 +209,9 @@ pipeline {
                         def issueKey = firstItem.issue_key
                         def jiraUrl = firstItem.jira_url
                         def msgId = firstItem.message_id
+                        // Topic birth: record pipeline state (SCANNED).
+                        psCmd("add --key '${msgId}' --jira-key '${issueKey}' --jira-url '${jiraUrl}' --mode scan --text '${firstItem.text ?: ''}' --sender-id '${firstItem.sender_id ?: ''}' --sender-name '${firstItem.sender_name ?: ''}'")
+                        codereviewLog('SCANNED', 'RUNNING', msgId, issueKey, '', '', 'topic discovered')
                         issueBuilds[msgId] = {
                                 def engFile = "${env.WORKSPACE}/result_${msgId}_engine.json"
                                 def gamFile = "${env.WORKSPACE}/result_${msgId}_game.json"
@@ -139,6 +231,10 @@ pipeline {
                                 """
                                 def replyResp = readJSON(file: replyMsgIdFile)
                                 def replyMsgId = replyResp.message_id ?: ''
+                                // Record the in-flight reply msg id + advance to PARSING.
+                                // (render_msg_id lets later stage transitions live-update the card.)
+                                psCmd("transition --key '${msgId}' --to PARSING --status RUNNING --render-msg-id '${replyMsgId}'")
+                                codereviewLog('PARSING', 'RUNNING', msgId, issueKey, '', '', 'progress card replied')
 
                                 // Step 2: Parse Jira → project + MR info
                                 sh """
@@ -151,6 +247,8 @@ pipeline {
                                 """
                                 def parsedInfo = readJSON(file: infoFile)
                                 if (parsedInfo.containsKey('error')) {
+                                    psCmd("transition --key '${msgId}' --to FAILED --status FAILED --error 'parse failed: ${parsedInfo.error.replace(\"'\",\"'\")}'")
+                                    codereviewLog('PARSING', 'FAILED', msgId, issueKey, '', '', 'jira parse failed')
                                     def errMsg = "❌ **Review Failed**: ${issueKey}\n无法解析 Jira 信息: ${parsedInfo.error}"
                                     def errB64 = b64(errMsg)
                                     sh """
@@ -171,8 +269,15 @@ pipeline {
                                 def gameRepo = parsedInfo.game_repo
                                 def project = parsedInfo.project
                                 echo "Review ${issueKey}: branch=${reviewBranch}, base=${baseBranch}, engine_base=${engineBase}, project=${project}"
+                                // PARSED: branch/base/project resolved.
+                                psCmd("transition --key '${msgId}' --to PARSING --status RUNNING --review-branch '${reviewBranch}' --base-branch '${baseBranch}'")
+                                codereviewLog('PARSED', 'RUNNING', msgId, issueKey, project, '', "branch=${reviewBranch}->${baseBranch}")
 
-                                // Step 3: Parallel code review (engine + game)
+                                // Step 3: code review (engine + game) — REVIEWING + repos RUNNING
+                                codereviewLog('REVIEWING', 'RUNNING', msgId, issueKey, project, '', 'code review started')
+                                psCmd("transition --key '${msgId}' --to REVIEWING --status RUNNING")
+                                psCmd("repo --key '${msgId}' --repo engine --status RUNNING")
+                                psCmd("repo --key '${msgId}' --repo game --status RUNNING")
                                 def mrUrl = parsedInfo.mr_url ?: ''
                                 sh """
                                     ${PYTHON} ${SCRIPTS_DIR}/code_reviewer.py \
@@ -199,6 +304,11 @@ pipeline {
                                 def engineResult = fileExists(engFile) ? readJSON(file: engFile) : [:]
                                 def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
 
+                                // Record per-repo terminal state into pipeline state (scan mode:
+                                // engine+game run in one sh, so both resolve here).
+                                recordRepoState(msgId, 'engine', engFile, engineResult, reviewBranch, baseBranch)
+                                recordRepoState(msgId, 'game', gamFile, gameResult, reviewBranch, baseBranch)
+
                                 // Step 4: Render the summary via feishu_notifier.render-summary
                                 // (single source of truth for the markdown; was previously
                                 // ~100 lines of duplicated Groovy here and in post{}).
@@ -223,9 +333,15 @@ pipeline {
                                 def summaryText = readFile(renderOut)
                                 echo "Completed review for ${issueKey}"
 
-                                // Send final summary, then persist message_id.
+                                // Live-update the in-flight card to show repo terminal states
+                                // (one re-render at REVIEWING completion, before final summary).
+                                updateStateCard(msgId)
+
+                                // Send final summary, then record NOTIFYING → DONE/FAILED.
                                 // If the notification itself fails, mark the build FAILURE so
                                 // build status reflects whether users were actually notified.
+                                codereviewLog('NOTIFY', 'RUNNING', msgId, issueKey, project, '', 'sending final summary')
+                                psCmd("transition --key '${msgId}' --to NOTIFYING --status RUNNING")
                                 def updateSend = sh script: """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
                                         --app-id '${env.FEISHU_APP_ID}' \
@@ -236,9 +352,16 @@ pipeline {
                                 if (updateSend != 0) {
                                     echo "WARN: Feishu update-reply failed (status ${updateSend})"
                                     currentBuild.result = 'FAILURE'
+                                    psCmd("transition --key '${msgId}' --to FAILED --status FAILED --error 'feishu update-reply failed (status ${updateSend})'")
+                                    codereviewLog('NOTIFY', 'FAILED', msgId, issueKey, project, '', 'final update-reply failed')
+                                } else {
+                                    psCmd("transition --key '${msgId}' --to DONE --status SUCCESS")
+                                    codereviewLog('DONE', 'SUCCESS', msgId, issueKey, project, '', 'review complete')
                                 }
 
                                 // Persist message_id to prevent duplicate processing
+                                // (legacy dedup path retained during migration; the state
+                                // file's DONE/FAILED status is the new dedup signal).
                                 def reviewedData = [:]
                                 if (fileExists(REVIEWED_MSG_IDS_FILE)) {
                                     reviewedData = readJSON(file: REVIEWED_MSG_IDS_FILE)
@@ -267,6 +390,13 @@ pipeline {
                 expression { params.JIRA_URL != null && params.JIRA_URL != '' }
             }
             steps {
+                script {
+                    // Manual mode topic record. Use the Jira URL as the key (no
+                    // message_id is known yet); issue key resolved after parse.
+                    def manTopic = params.JIRA_URL ?: 'manual-topic'
+                    psCmd("add --key '${manTopic}' --jira-url '${params.JIRA_URL}' --mode manual")
+                    codereviewLog('MANUAL', 'RUNNING', manTopic, '', '', '', 'manual review started')
+
                 script {
                     sh """
                         ${PYTHON} ${SCRIPTS_DIR}/jira_parser.py \
@@ -320,6 +450,11 @@ pipeline {
 
                     // Persist FEISHU_REPLY_MSG_ID to file for post block access
                     writeFile(file: "${env.WORKSPACE}/.feishu_reply_msg_id", text: "${params.FEISHU_REPLY_MSG_ID ?: ''}", encoding: "UTF-8")
+
+                    // Manual topic: record PARSED + resolved branch/base/project.
+                    def manTopic = params.JIRA_URL ?: 'manual-topic'
+                    psCmd("transition --key '${manTopic}' --to PARSING --status RUNNING --review-branch '${env.REVIEW_BRANCH}' --base-branch '${env.BASE_BRANCH}' --mr-url '${env.MR_URL}'")
+                    codereviewLog('PARSED', 'RUNNING', manTopic, env.ISSUE_KEY, env.PROJECT, '', "branch=${env.REVIEW_BRANCH}->${env.BASE_BRANCH}")
                 }
             }
         }
@@ -329,6 +464,16 @@ pipeline {
         // ──────────────────────────────────────────────
         stage('Code Review') {
             when { expression { env.ISSUE_KEY != null && env.ISSUE_KEY != '' } }
+            steps {
+                script {
+                    // Manual mode: REVIEWING + repos RUNNING (true parallel here).
+                    def manTopic = params.JIRA_URL ?: 'manual-topic'
+                    psCmd("transition --key '${manTopic}' --to REVIEWING --status RUNNING")
+                    psCmd("repo --key '${manTopic}' --repo engine --status RUNNING")
+                    psCmd("repo --key '${manTopic}' --repo game --status RUNNING")
+                    codereviewLog('REVIEWING', 'RUNNING', manTopic, env.ISSUE_KEY, env.PROJECT, '', 'code review started')
+                }
+            }
             parallel {
                 stage('Engine Repo') {
                     steps {
@@ -351,12 +496,22 @@ pipeline {
                         }
                     }
                     post {
+                        success {
+                            script {
+                                def manTopic = params.JIRA_URL ?: 'manual-topic'
+                                def engRes = fileExists(ENGINE_RESULT_FILE) ? readJSON(file: ENGINE_RESULT_FILE) : [:]
+                                recordRepoState(manTopic, 'engine', ENGINE_RESULT_FILE, engRes, env.REVIEW_BRANCH, env.ENGINE_BASE_BRANCH)
+                            }
+                        }
                         failure {
                             script {
                                 writeJSON(file: ENGINE_RESULT_FILE, json: [
                                     project: env.PROJECT, issue_key: env.ISSUE_KEY,
                                     repo_type: 'engine', error: 'Review failed'
                                 ])
+                                def manTopic = params.JIRA_URL ?: 'manual-topic'
+                                psCmd("repo --key '${manTopic}' --repo engine --status FAILED --error 'review stage failed'")
+                                codereviewLog('REPO', 'FAILED', manTopic, env.ISSUE_KEY, env.PROJECT, 'engine', 'review stage failure')
                             }
                         }
                     }
@@ -383,12 +538,22 @@ pipeline {
                         }
                     }
                     post {
+                        success {
+                            script {
+                                def manTopic = params.JIRA_URL ?: 'manual-topic'
+                                def gamRes = fileExists(GAME_RESULT_FILE) ? readJSON(file: GAME_RESULT_FILE) : [:]
+                                recordRepoState(manTopic, 'game', GAME_RESULT_FILE, gamRes, env.GAME_MR_BRANCH ?: env.REVIEW_BRANCH, env.GAME_BASE_BRANCH)
+                            }
+                        }
                         failure {
                             script {
                                 writeJSON(file: GAME_RESULT_FILE, json: [
                                     project: env.PROJECT, issue_key: env.ISSUE_KEY,
                                     repo_type: 'game', error: 'Review failed'
                                 ])
+                                def manTopic = params.JIRA_URL ?: 'manual-topic'
+                                psCmd("repo --key '${manTopic}' --repo game --status FAILED --error 'review stage failed'")
+                                codereviewLog('REPO', 'FAILED', manTopic, env.ISSUE_KEY, env.PROJECT, 'game', 'review stage failure')
                             }
                         }
                     }
@@ -593,6 +758,12 @@ pipeline {
                     writeJSON(file: REVIEWED_STATE_FILE, json: [reviewed: reviewed])
                     echo "Marked ${env.ISSUE_KEY} as reviewed"
                 }
+
+                // Manual mode: mark DONE after successful notification.
+                def manTopic = params.JIRA_URL ?: 'manual-topic'
+                psCmd("transition --key '${manTopic}' --to NOTIFYING --status RUNNING")
+                psCmd("transition --key '${manTopic}' --to DONE --status SUCCESS")
+                codereviewLog('DONE', 'SUCCESS', manTopic, env.ISSUE_KEY, env.PROJECT, '', 'manual review complete')
             }
         }
 
@@ -623,12 +794,20 @@ pipeline {
                                 --message-base64 '${msgB64}'
                         """
                     }
+
+                    // Manual mode: mark FAILED (build failed).
+                    def manTopic = params.JIRA_URL ?: 'manual-topic'
+                    def hadTopic = fileExists(PIPELINE_STATE_FILE)
+                    if (hadTopic) {
+                        psCmd("transition --key '${manTopic}' --to FAILED --status FAILED --error 'build failed'")
+                        codereviewLog('MANUAL', 'FAILED', manTopic, env.ISSUE_KEY, env.PROJECT, '', 'manual build failure')
+                    }
                 }
             }
         }
 
         cleanup {
-            sh "rm -rf ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id ${env.WORKSPACE}/.rendered_*.md ${env.WORKSPACE}/.eng_update_* ${env.WORKSPACE}/result_*.json ${env.WORKSPACE}/parsed_*.json ${env.WORKSPACE}/.reply_msg_id_* || true"
+            sh "rm -rf ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id ${env.WORKSPACE}/.rendered_*.md ${env.WORKSPACE}/.eng_update_* ${env.WORKSPACE}/result_*.json ${env.WORKSPACE}/parsed_*.json ${env.WORKSPACE}/.reply_msg_id_* ${env.WORKSPACE}/.state_*.json || true"
         }
     }
 }
