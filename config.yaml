@@ -35,6 +35,9 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git"
     default_branch: main
+    # engine_default_branch: optional override — engine repo's base may differ
+    # from the game repo's default_branch (e.g. "rage/master"). Uncomment to set.
+    # engine_default_branch: rage/master
 
 # ============================================================
 # Repository mirror dir (where Jenkins clones repos for review)

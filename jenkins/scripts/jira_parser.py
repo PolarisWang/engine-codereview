@@ -14,51 +14,14 @@ import json
 import os
 import re
 import sys
-import urllib.request
-import urllib.error
 import urllib.parse
 
+# Shared helpers: config from config.yaml, Jira URL pattern, HTTP with retry
+from common import load_config, get_project, get_projects, get_claude_config, \
+    JIRA_URL_PATTERN, http_request
 
-# ── Built-in project config (no external file dependency) ────────────────────
-
-PROJECT_CONFIG = {
-    "EV": {
-        "jira_project_key": "EV",
-        "name": "EngineVerse",
-        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/chaos.git",
-        "game_repo": "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git",
-        "default_branch": "dev",
-    },
-    "CB2": {
-        "jira_project_key": "CB2",
-        "name": "CB2",
-        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/chaos-cb-2.git",
-        "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/conquerors-blade-2.git",
-        "default_branch": "master",
-    },
-    "Mars": {
-        "jira_project_key": "MARS",
-        "name": "Mars",
-        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/mars/chaos-mars.git",
-        "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/mars/mars.git",
-        "default_branch": "master",
-    },
-    "Rage": {
-        "jira_project_key": "RAGE",
-        "name": "Rage",
-        "engine_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git",
-        "game_repo": "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git",
-        "default_branch": "master",
-        "engine_default_branch": "rage/master",
-    },
-}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-def load_config():
-    """Return built-in project config (no YAML dependency)."""
-    return {"projects": PROJECT_CONFIG}
-
 
 def jira_request(path, host, token):
     """Make an authenticated Jira API request.
@@ -68,39 +31,22 @@ def jira_request(path, host, token):
     headers = {"Accept": "application/json"}
 
     # Try 1: Bearer token (PAT)
-    req = urllib.request.Request(url, headers={**headers, "Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        if e.code not in (401, 403):
-            return None
+    resp = http_request("GET", url, headers={**headers, "Authorization": f"Bearer {token}"})
+    if resp is not None:
+        return resp
 
     # Try 2: Basic auth (in case token is pre-encoded base64 of user:apitoken)
-    req = urllib.request.Request(url, headers={**headers, "Authorization": f"Basic {token}"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return None
-    except Exception as e:
-        return None
+    return http_request("GET", url, headers={**headers, "Authorization": f"Basic {token}"})
 
 
 def gitlab_api_get(path, token):
     """Make a GitLab API GET request."""
     url = f"https://gitlab.booming-inc.com/api/v4/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print(f"[gitlab] API error {e.code} for {url[:80]}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"[gitlab] Request error: {e}", file=sys.stderr)
-        return None
+    resp = http_request("GET", url, headers=headers)
+    if resp is None:
+        print(f"[gitlab] API request failed for {url[:80]}", file=sys.stderr)
+    return resp
 
 
 def parse_gitlab_mr_url(url):
@@ -268,8 +214,6 @@ def main():
 
     config = load_config()
     gitlab_token = args.gitlab_token or os.environ.get("GITLAB_TOKEN", "")
-
-    # Step 1: Extract issue key
     issue_key = extract_issue_key(args.jira_url)
     if not issue_key:
         print(json.dumps({"error": "Could not extract Jira issue key from URL"}))

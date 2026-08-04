@@ -17,20 +17,14 @@ import subprocess
 import sys
 import tempfile
 import time
-
-import argparse
-import json
-import os
-import subprocess
-import sys
-import tempfile
-import time
-import urllib.request
-import urllib.error
 import urllib.parse
 
 import shutil
 import re
+
+# Shared helpers: config.yaml loading, Jira pattern, HTTP with retry
+from common import load_config, JIRA_URL_PATTERN, http_request
+from common import get_claude_config, get_workspace_config
 
 # Resolve git path explicitly (agent may not have it on PATH)
 GIT_PATH = shutil.which("git") or "/usr/bin/git"
@@ -72,12 +66,15 @@ IMPORTANT: Counts must match actual findings.
 
 
 def load_config():
-    """Return minimal config (no YAML needed)."""
+    """Load config from config.yaml (common), falling back to env for model."""
+    cfg = get_claude_config()
     return {
         "claude": {
-            "model": os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
-            "max_tokens": 8192,
-            "review_instructions": DEFAULT_REVIEW_INSTRUCTIONS.strip(),
+            "model": cfg.get("model")
+                     or os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+            "max_tokens": cfg.get("max_tokens", 8192),
+            "review_instructions": cfg.get("review_instructions")
+                                   or DEFAULT_REVIEW_INSTRUCTIONS.strip(),
         }
     }
 
@@ -101,19 +98,13 @@ def ssh_to_https(repo_url):
 
 
 def gitlab_api_get(path, token):
-    """Make a GitLab API GET request."""
+    """Make a GitLab API GET request (with retry)."""
     url = f"https://gitlab.booming-inc.com/api/v4/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print(f"[gitlab] API error {e.code} for {url[:80]}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"[gitlab] Request error: {e}", file=sys.stderr)
-        return None
+    resp = http_request("GET", url, headers=headers)
+    if resp is None:
+        print(f"[gitlab] API request failed for {url[:80]}", file=sys.stderr)
+    return resp
 
 
 def parse_gitlab_mr_url(url):
@@ -151,6 +142,37 @@ def get_mr_diff_from_gitlab(mr_url, gitlab_token):
     }
 
 
+def _resolve_git_token():
+    """Resolve a GitLab token from env (without ever logging it)."""
+    return os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN") or ""
+
+
+def _auth_header(token):
+    """Build the AUTHORIZATION header value for GitLab HTTPS (Basic <b64>)."""
+    import base64
+    user = os.environ.get("GITLAB_USER", "gitlab-ci-token")
+    return "AUTHORIZATION: Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+
+
+def git_cmd(subcmd, token, cwd=None, timeout=600):
+    """
+    Run a git command, injecting HTTP auth via -c http.extraheader when a token
+    is present. Token is passed via git config, NOT embedded in the URL, so it
+    never appears in `ps`, `git remote -v`, logs, etc.
+
+    subcmd: list starting after `git`, e.g. ["clone", "--branch", x, url, dir]
+    Returns (returncode, stdout, stderr).
+    """
+    cmd = [GIT_PATH]
+    if token:
+        cmd += ["-c", f"http.extraheader={_auth_header(token)}"]
+    cmd += subcmd
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
 def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True, mr_url="", gitlab_token=""):
     """
     Clone (or fetch) repo, checkout branch, return path and diff info.
@@ -161,20 +183,18 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
     branch_exists = True
     branch_merged = False
 
-    # Always convert SSH→HTTPS and use token auth for GitLab
+    # Always convert SSH→HTTPS for GitLab, keep the URL clean (no token).
+    # Auth is injected per-command via git_cmd() — never embedded in the URL.
     if repo_url.startswith("git@"):
         https_url = ssh_to_https(repo_url)
         print(f"[git] Converting to HTTPS: {https_url}", flush=True)
-        gitlab_user = os.environ.get("GITLAB_USER", "gitlab-ci-token")
-        gitlab_token = os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN", "")
-        if gitlab_token:
-            https_url = https_url.replace("https://", f"https://{gitlab_user}:{gitlab_token}@")
-            print(f"[git] Using token auth for GitLab", flush=True)
-        else:
-            print(f"[git] WARNING: No GITLAB_TOKEN set, clone may fail", flush=True)
-            https_url = https_url.replace("https://", "https://git:@")
         os.environ.setdefault("GIT_SSH_COMMAND", "/bin/false")
         repo_url = https_url
+
+    if not gitlab_token:
+        gitlab_token = _resolve_git_token()
+    if not gitlab_token:
+        print(f"[git] WARNING: No GITLAB_TOKEN set, clone may fail", flush=True)
 
     # If MR URL is available, fetch diff directly from GitLab API (most reliable)
     if mr_url and gitlab_token:
@@ -193,91 +213,107 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
             }
         print(f"[gitlab] MR diff unavailable, falling back to git clone/diff", flush=True)
 
+    tok = gitlab_token
     if cache and os.path.isdir(repo_dir):
         print(f"[git] Updating cached repo: {repo_name}")
-        run_git([GIT_PATH, "fetch", "origin"], repo_dir, timeout=300)
+        git_cmd(["fetch", "origin"], tok, repo_dir, timeout=300)
         # Explicitly fetch the review branch to ensure it's up to date
-        run_git([GIT_PATH, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], repo_dir, timeout=60)
-        run_git([GIT_PATH, "reset", "--hard", f"origin/{branch}"], repo_dir)
-        rc, _, _ = run_git([GIT_PATH, "checkout", branch], repo_dir)
+        git_cmd(["fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], tok, repo_dir, timeout=60)
+        git_cmd(["reset", "--hard", f"origin/{branch}"], tok, repo_dir)
+        rc, _, _ = git_cmd(["checkout", branch], tok, repo_dir)
         if rc != 0:
-            rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
+            rc, _, _ = git_cmd(["checkout", "-b", branch, f"origin/{branch}"], tok, repo_dir)
         if rc != 0:
             branch_exists = False
-            run_git([GIT_PATH, "checkout", base_branch], repo_dir)
-            run_git([GIT_PATH, "pull", "origin", base_branch], repo_dir)
-            rc, _, _ = run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir)
+            git_cmd(["checkout", base_branch], tok, repo_dir)
+            if "/" in base_branch:
+                git_cmd(["fetch", "origin", f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"], tok, repo_dir)
+            else:
+                git_cmd(["fetch", "origin", base_branch], tok, repo_dir)
+            git_cmd(["reset", "--hard", f"origin/{base_branch}"], tok, repo_dir)
+            rc, _, _ = git_cmd(["checkout", "-b", branch, f"origin/{branch}"], tok, repo_dir)
     else:
         if os.path.isdir(repo_dir):
             run_git(["rm", "-rf", repo_dir], "/tmp")
         print(f"[git] Cloning repo: {repo_name}")
-        rc, out, err = run_git(
-            [GIT_PATH, "clone", "--branch", branch, repo_url, repo_dir],
-            "/tmp", timeout=600
+        rc, out, err = git_cmd(
+            ["clone", "--branch", branch, repo_url, repo_dir],
+            tok, "/tmp", timeout=600
         )
         if rc != 0:
             print(f"[git] Clone failed for '{branch}': {err[:300]}", flush=True)
             branch_exists = False
             # Branch may not exist remotely — clone default branch
-            rc, out, err = run_git(
-                [GIT_PATH, "clone", repo_url, repo_dir],
-                "/tmp", timeout=600
+            rc, out, err = git_cmd(
+                ["clone", repo_url, repo_dir],
+                tok, "/tmp", timeout=600
             )
             if os.path.isdir(repo_dir):
-                run_git([GIT_PATH, "checkout", "-b", branch, f"origin/{branch}"], repo_dir, timeout=30)
+                git_cmd(["checkout", "-b", branch, f"origin/{branch}"], tok, repo_dir, timeout=30)
 
     # Ensure base_branch ref is available
     # Handle branch names containing "/" (e.g., "rage/master") by using explicit refspec
     if "/" in base_branch:
         fetch_ref = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"
-        run_git([GIT_PATH, "fetch", "origin", fetch_ref], repo_dir)
+        git_cmd(["fetch", "origin", fetch_ref], tok, repo_dir)
     else:
-        run_git([GIT_PATH, "fetch", "origin", base_branch], repo_dir)
+        git_cmd(["fetch", "origin", base_branch], tok, repo_dir)
     # Get merge-base for accurate diff
-    rc, merge_base, _ = run_git(
-        [GIT_PATH, "merge-base", branch, f"origin/{base_branch}"], repo_dir
+    rc, merge_base, _ = git_cmd(
+        ["merge-base", branch, f"origin/{base_branch}"], tok, repo_dir
     )
     if rc != 0:
         print("[git] merge-base failed, falling back to origin/base")
         merge_base = f"origin/{base_branch}"
 
     # Generate diff
-    rc, diff_text, _ = run_git(
-        [GIT_PATH, "diff", merge_base + "..." + branch, "--", "."], repo_dir
+    rc, diff_text, _ = git_cmd(
+        ["diff", merge_base + "..." + branch, "--", "."], tok, repo_dir
     )
     if not diff_text:
         # Try direct diff
-        rc, diff_text, _ = run_git(
-            [GIT_PATH, "diff", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
+        rc, diff_text, _ = git_cmd(
+            ["diff", f"origin/{base_branch}...{branch}", "--", "."], tok, repo_dir
         )
 
     # Changed files list
-    rc, changed_files_str, _ = run_git(
-        [GIT_PATH, "diff", "--name-status", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
+    rc, changed_files_str, _ = git_cmd(
+        ["diff", "--name-status", f"origin/{base_branch}...{branch}"], tok, repo_dir
     )
     changed_files = [line for line in changed_files_str.split("\n") if line.strip()]
 
     # Stats
-    rc, stats_str, _ = run_git(
-        [GIT_PATH, "diff", "--shortstat", f"origin/{base_branch}...{branch}", "--", "."], repo_dir
+    rc, stats_str, _ = git_cmd(
+        ["diff", "--shortstat", f"origin/{base_branch}...{branch}"], tok, repo_dir
     )
 
     # Commit log
-    rc, commit_log, _ = run_git(
-        [GIT_PATH, "log", f"origin/{base_branch}..{branch}", "--oneline", "--no-decorate"], repo_dir
+    rc, commit_log, _ = git_cmd(
+        ["log", f"origin/{base_branch}..{branch}", "--oneline", "--no-decorate"], tok, repo_dir
     )
 
     # Detect if branch is merged (branch exists but no new commits vs base)
     if not diff_text and branch_exists:
-        rc, merge_base_commit, _ = run_git(
-            [GIT_PATH, "merge-base", branch, f"origin/{base_branch}"], repo_dir
+        rc, merge_base_commit, _ = git_cmd(
+            ["merge-base", branch, f"origin/{base_branch}"], tok, repo_dir
         )
-        rc, head_commit, _ = run_git(
-            [GIT_PATH, "rev-parse", branch], repo_dir
+        rc, head_commit, _ = git_cmd(
+            ["rev-parse", branch], tok, repo_dir
         )
         if merge_base_commit == head_commit:
             branch_merged = True
             print(f"[git] Branch '{branch}' is fully merged into '{base_branch}' (HEAD at merge-base)", flush=True)
+
+    # Clean any real token from the cached remote URL (in case a legacy clone persisted `https://user:token@host`).
+    # This prevents the token from leaking via `git remote -v` / logs going forward.
+    try:
+        rc, origin_url, _ = run_git([GIT_PATH, "remote", "get-url", "origin"], repo_dir)
+        if rc == 0 and origin_url and re.search(r'https://[^/@]+:[^/@]*@', origin_url):
+            clean = re.sub(r'https://[^/@]+:[^/@]*@', 'https://', origin_url)
+            run_git([GIT_PATH, "remote", "set-url", "origin", clean], repo_dir)
+            print("[git] Sanitized embedded credentials from cached origin URL", flush=True)
+    except Exception:
+        pass
 
     return {
         "diff_text": diff_text,
@@ -290,11 +326,120 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
     }
 
 
+def _split_diff_by_files(diff_text):
+    """
+    Split a `git diff` output into per-file blocks, preserving file boundaries.
+
+    Returns list of block strings. Each block starts with its `diff --git` header
+    and includes every hunk that belongs to it.
+    """
+    if not diff_text:
+        return []
+    parts = diff_text.split("\ndiff --git ")
+    blocks = []
+    for i, part in enumerate(parts):
+        part = part.strip("\n")
+        if not part:
+            continue
+        if i == 0:
+            blocks.append(part)
+        else:
+            blocks.append("diff --git " + part)
+    return blocks
+
+
+def _group_into_batches(blocks, max_batch_chars):
+    """
+    Group file blocks into batches, each staying under max_batch_chars
+    (a single oversized file becomes its own batch, possibly further truncated).
+    Returns list of batches; each batch is a string.
+    """
+    batches = []
+    cur = []
+    cur_len = 0
+    for block in blocks:
+        block_len = len(block)
+        # If a single block alone exceeds the budget, flush it as its own batch
+        # (truncation happens later, per batch, in the caller).
+        if cur and cur_len + block_len > max_batch_chars:
+            batches.append("\n".join(cur))
+            cur = []
+            cur_len = 0
+        cur.append(block)
+        cur_len += block_len
+    if cur:
+        batches.append("\n".join(cur))
+    return batches
+
+
+def _count_severities(review_text):
+    """Count findings by severity heading patterns, with emoji fallback."""
+    critical = len(re.findall(r'🔴\s*(?:Critical|关键)', review_text))
+    warning = len(re.findall(r'🟡\s*(?:Warning|警告)', review_text))
+    suggestion = len(re.findall(r'ℹ️?\s*(?:Suggestion|建议)', review_text))
+    if critical == 0 and warning == 0 and suggestion == 0:
+        critical = review_text.count("🔴")
+        warning = review_text.count("🟡")
+        suggestion = review_text.count("ℹ️")
+    return {"critical": critical, "warning": warning, "suggestion": suggestion}
+
+
+def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
+                    max_output_tokens):
+    """
+    Single LLM API call. Returns (review_text, error_message).
+    error_message is None on success.
+    """
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": max_output_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }).encode("utf-8")
+
+    # Use the shared retry-enabled HTTP helper: the LLM call is the most
+    # latency/transience-prone step, so give it extra attempts and a long timeout.
+    result = http_request(
+        "POST",
+        f"{base_url}/v1/messages",
+        raw_body=payload.decode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        timeout=180,
+        retries=3,
+        backoff=2.0,
+    )
+    if result is None:
+        return None, "LLM API request failed after retries"
+
+    # Extract response text
+    try:
+        if "content" in result:
+            review_text = "".join(
+                block.get("text", "") for block in result["content"]
+                if block.get("type") == "text"
+            )
+        else:
+            review_text = result.get("completion", json.dumps(result))
+    except Exception:
+        review_text = json.dumps(result)
+    return review_text, None
+
+
 def review_with_claude(diff_info, config, project, issue_key, repo_type):
     """
-    Call LLM API to review the diff (using urllib, no external deps).
-    Returns structured review results.
+    Call LLM API to review the diff.
+
+    For large diffs, the input is split into multiple per-file batches so every
+    changed file is covered (no silent trailing truncation). Batch results are
+    aggregated into a single review_text and summed severity counts.
     """
+    max_batch_chars = 60000   # input chars per LLM call (token-adjacent budget)
+    max_diff_total = 400000   # hard cap on total diff processed (defensive)
+
     if not diff_info["diff_text"]:
         return {
             "summary": "No diff found — no changes or branch up to date with base.",
@@ -304,9 +449,6 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
         }
 
     diff_text = diff_info["diff_text"]
-    max_diff_chars = 80000
-    if len(diff_text) > max_diff_chars:
-        diff_text = diff_text[:max_diff_chars] + f"\n\n... [truncated, original {len(diff_text)} chars]"
 
     api_key = (os.environ.get("ANTHROPIC_AUTH_TOKEN") or
                os.environ.get("ANTHROPIC_API_KEY") or "")
@@ -314,22 +456,79 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
         return {"summary": "ANTHROPIC_AUTH_TOKEN not set", "findings": [], "severity_counts": {}}
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-    model = os.environ.get("ANTHROPIC_MODEL") or "deepseek-v4-flash"
+    model = config["claude"]["model"]
+    max_output_tokens = config["claude"]["max_tokens"]
+    system_prompt = config["claude"]["review_instructions"] \
+                    or DEFAULT_REVIEW_INSTRUCTIONS.strip()
 
-    system_prompt = DEFAULT_REVIEW_INSTRUCTIONS.strip()
+    # Split into per-file blocks and group into batches
+    blocks = _split_diff_by_files(diff_text)
+    if not blocks:
+        blocks = [diff_text]
+    batches = _group_into_batches(blocks, max_batch_chars)
 
-    user_prompt = f"""Project: {project} ({repo_type} repository)
+    # Defensive: even batches over budget get truncated per-batch, but cap the
+    # total amount of diff actually sent to avoid runaway token cost.
+    if len(diff_text) > max_diff_total:
+        diff_text = diff_text[:max_diff_total] + f"\n\n... [truncated, original {len(diff_text)} chars]"
+        blocks = _split_diff_by_files(diff_text)
+        batches = _group_into_batches(blocks, max_batch_chars)
+        print(f"[review] Diff exceeds {max_diff_total} chars; reviewing truncated view", flush=True)
+
+    changed_files = diff_info.get("changed_files") or []
+    commits = diff_info.get("commit_log") or ""
+    num_batches = len(batches)
+    print(f"[review] Splitting into {num_batches} batch(es)", flush=True)
+
+    all_text = []
+    total = {"critical": 0, "warning": 0, "suggestion": 0}
+    first_error = None
+
+    for idx, batch_diff in enumerate(batches, start=1):
+        # A single batch may still exceed the budget (e.g. one giant file) —
+        # truncate per-batch so a record-breaking file cannot blow the token cap.
+        truncated_flag = False
+        original_len = len(batch_diff)
+        if original_len > max_batch_chars:
+            batch_diff = batch_diff[:max_batch_chars] + \
+                f"\n\n... [truncated, this batch original {original_len} chars]"
+            truncated_flag = True
+
+        if num_batches > 1:
+            user_prompt = f"""Project: {project} ({repo_type} repository)
+Issue: {issue_key}
+Review part {idx} of {num_batches}{' (truncated)' if truncated_flag else ''}.
+
+Commits in this branch:
+{commits}
+
+Diff (part {idx}):
+```diff
+{batch_diff}
+```
+
+Review the code in this part. For each finding, provide:
+- **Severity**: 🔴 Critical / 🟡 Warning / ℹ️ Suggestion
+- **File**: the file path
+- **Issue**: what the problem is
+- **Suggestion**: how to fix it
+
+At the end of THIS part, give a count of each severity level for the findings in this part.
+
+IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
+        else:
+            user_prompt = f"""Project: {project} ({repo_type} repository)
 Issue: {issue_key}
 
 Changed files:
-{chr(10).join(diff_info["changed_files"])}
+{chr(10).join(changed_files)}
 
 Commits in this branch:
-{diff_info["commit_log"]}
+{commits}
 
 Diff:
 ```diff
-{diff_text}
+{batch_diff}
 ```
 
 Please review this code change. For each finding, provide:
@@ -342,76 +541,41 @@ At the end, provide a summary with count of each severity level.
 
 IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
 
-    payload = json.dumps({
-        "model": model,
-        "max_tokens": 8192,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }).encode("utf-8")
+        review_text, err = _call_llm_batch(
+            system_prompt, user_prompt, api_key, base_url, model, max_output_tokens
+        )
+        if err:
+            if not first_error:
+                first_error = err
+            print(f"[review] Batch {idx}/{num_batches} failed: {err}", flush=True)
+            continue
 
-    req = urllib.request.Request(
-        f"{base_url}/v1/messages",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")[:500]
-        return {
-            "summary": f"API error: HTTP {e.code}",
-            "review_text": f"HTTP {e.code}: {error_body}",
-            "severity_counts": {},
-            "error": f"HTTP {e.code}: {error_body}",
-        }
-    except Exception as e:
-        return {
-            "summary": f"API error: {e}",
-            "review_text": None,
-            "severity_counts": {},
-            "error": str(e),
-        }
-
-    # Extract response content
-    try:
-        if "content" in result:
-            review_text = "".join(
-                block.get("text", "") for block in result["content"]
-                if block.get("type") == "text"
-            )
+        if num_batches > 1:
+            all_text.append(f"### 第 {idx}/{num_batches} 部分\n{review_text}")
         else:
-            review_text = result.get("completion", json.dumps(result))
-    except Exception:
-        review_text = json.dumps(result)
+            all_text.append(review_text)
 
-    # Count findings by severity heading patterns (more accurate than emoji count)
-    critical = len(re.findall(r'🔴\s*(?:Critical|关键)', review_text))
-    warning = len(re.findall(r'🟡\s*(?:Warning|警告)', review_text))
-    suggestion = len(re.findall(r'ℹ️?\s*(?:Suggestion|建议)', review_text))
+        counts = _count_severities(review_text)
+        for k in total:
+            total[k] += counts[k]
 
-    # Fallback to emoji counting if pattern didn't match
-    if critical == 0 and warning == 0 and suggestion == 0:
-        critical = review_text.count("🔴")
-        warning = review_text.count("🟡")
-        suggestion = review_text.count("ℹ️")
+    if not all_text and first_error:
+        # Every batch failed — surface the error as the result
+        return {
+            "summary": f"API error: {first_error}",
+            "review_text": f"审查请求失败: {first_error}",
+            "severity_counts": {},
+            "error": first_error,
+        }
 
     return {
         "summary": "",
-        "review_text": review_text,
-        "severity_counts": {
-            "critical": critical,
-            "warning": warning,
-            "suggestion": suggestion,
-        },
-        "error": None,
+        "review_text": "\n\n".join(all_text),
+        "severity_counts": total,
+        "error": first_error,   # non-None if at least one batch failed (partial results)
     }
+
+
 
 
 def main():

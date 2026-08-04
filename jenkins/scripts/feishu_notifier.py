@@ -31,9 +31,10 @@ import json
 import os
 import sys
 import time
-import urllib.request
-import urllib.error
 import base64
+
+# Shared helper: HTTP with retry
+from common import http_request
 
 
 STDIN_PREFIX = "@stdin"
@@ -58,33 +59,18 @@ def read_message_text(args):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _request(method, url, data=None, headers=None, raw_body=None):
-    """HTTP request helper.
+    """HTTP request helper (with retry).
     Args:
         raw_body: Pre-serialized JSON string (takes precedence over data)
         data: Dict to serialize as JSON
     """
     if headers is None:
         headers = {}
-    headers.setdefault("Content-Type", "application/json")
-    if raw_body:
-        body = raw_body.encode("utf-8")
-    elif data:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    else:
-        body = None
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
-                print(f"[WARN] Non-JSON response: {raw[:300]}", file=sys.stderr)
-                return {"code": -1, "msg": "non-json response", "raw": raw.decode("utf-8")[:500]}
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        print(f"[ERROR] HTTP {e.code}: {error_body[:500]}", file=sys.stderr)
-        return None
+    resp = http_request(method, url, data=data, headers=headers, raw_body=raw_body,
+                        timeout=30)
+    if resp is None:
+        print(f"[ERROR] HTTP {method} {url[:80]} failed after retries", file=sys.stderr)
+    return resp
 
 
 def get_tenant_token(app_id, app_secret):
@@ -250,6 +236,125 @@ def build_result_card(issue_key, project, engine_result, game_result, jira_url):
     }
 
 
+# ── Summary text rendering (single source of truth for Jenkinsfile) ──────────
+#
+# This replaces the duplicated markdown-building logic that previously lived in
+# the Jenkinsfile's scan-inline and post paths. Jenkins calls `render-summary`
+# and just sends whatever it produces — rendering now lives in one testable place.
+
+def _parse_file(path):
+    """Load a result JSON file (safely). Returns {} on any failure."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch):
+    """
+    Build the markdown section for one repository (engine or game), mirroring the
+    skip/fail/merged/no-change/clean logic that previously lived in the pipeline.
+    """
+    sev = ((result or {}).get("review") or {}).get("severity_counts") or {}
+    changed = len((result or {}).get("changed_files") or [])
+    stats = (result or {}).get("stats") or ""
+    error = (((result or {}).get("review") or {}).get("error")
+             or (result or {}).get("error") or "")
+    branch_merged = (result or {}).get("branch_merged") or False
+    branch_exists = (result or {}).get("branch_exists", True)
+    mr_state = (result or {}).get("mr_state") or ""
+
+    text = f"{repo_icon} **{repo_label} 仓库**"
+    if error:
+        text += f" ❌ 审查失败\n原因: {error}"
+    elif branch_exists is False:
+        text += f" ⏭️ 跳过审查\n原因: 分支 `{review_branch}` 在远程仓库中不存在（可能已被删除或从未创建）"
+    elif branch_merged:
+        hint = ""
+        if mr_state == "merged":
+            hint = "（GitLab 显示该 MR 已合并）"
+        elif mr_state == "closed":
+            hint = "（GitLab 显示该 MR 已关闭）"
+        text += f" ⏭️ 跳过审查\n原因: 分支 `{review_branch}` 已经合并到 `{base_branch}`，没有新的代码变更{hint}"
+    elif changed == 0:
+        text += f" ⏭️ 跳过审查\n原因: 该分支相对于 {base_branch} 没有代码变更"
+    else:
+        text += f"\n变更文件: {changed} 个"
+        if stats:
+            text += f" ({stats})"
+        if sev.get("critical"):
+            text += f"\n🔴 Critical: {sev['critical']}"
+        if sev.get("warning"):
+            text += f"\n🟡 Warning: {sev['warning']}"
+        if sev.get("suggestion"):
+            text += f"\nℹ️ Suggestion: {sev['suggestion']}"
+        if not sev.get("critical") and not sev.get("warning") and not sev.get("suggestion"):
+            text += "\n✅ 未发现严重问题"
+    return text
+
+
+def build_summary_text(issue_key, project, review_branch, base_branch, jira_url, mr_url,
+                       engine_result, game_result):
+    """
+    Build the final Feishu markdown summary, mirroring the pipeline's online format.
+
+    engine_result/game_result are dicts (or file paths resolved by caller).
+    Returns the markdown string.
+    """
+    summary = f"**🔍 Code Review 报告: {issue_key}**\n\n"
+    summary += f"**项目:** {project}\n"
+    summary += f"**分支:** {review_branch} → {base_branch}\n"
+    if mr_url:
+        summary += f"**MR:** {mr_url}\n"
+    summary += f"\n{build_repo_section('Engine', '🔧', engine_result, review_branch, base_branch)}\n"
+    if game_result:
+        summary += f"\n{build_repo_section('Game', '🎮', game_result, review_branch, base_branch)}\n"
+    summary += f"\n---\n📎 Jira: {jira_url}"
+
+    # Append truncated per-repo review details when they fit within the card limit.
+    MAX = 3500
+    for label, result in (("🔧 Engine", engine_result), ("🎮 Game", game_result)):
+        detail = ((result or {}).get("review") or {}).get("review_text")
+        if not detail:
+            continue
+        if len(summary) >= MAX:
+            break
+        avail = MAX - len(summary) - 50
+        if avail > 200:
+            if len(detail) > avail:
+                detail = detail[:avail] + "\n\n...（详情见 Jenkins 构建日志）"
+            summary += f"\n\n---\n**{label} 详细报告:**\n{detail}"
+    return summary
+
+
+def cmd_render_summary(args):
+    """Render the final review summary markdown from result JSON files."""
+    engine = _parse_file(getattr(args, "engine_file", None))
+    game = _parse_file(getattr(args, "game_file", None))
+    # Inject MR state into repo sections so the merged/closed hint renders correctly.
+    mr_state = getattr(args, "mr_state", "") or ""
+    if mr_state:
+        if engine:
+            engine["mr_state"] = mr_state
+        if game:
+            game["mr_state"] = mr_state
+    text = build_summary_text(
+        args.issue_key, args.project, args.branch, args.base_branch,
+        args.jira_url or "", args.mr_url or "", engine, game,
+    )
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+    if args.message_base64:
+        print(base64.b64encode(text.encode("utf-8")).decode("utf-8"))
+    else:
+        print(text)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def cmd_webhook(args):
@@ -397,6 +502,21 @@ def main():
     p.add_argument("--message-id", required=True)
     p.add_argument("--message-base64", help="Base64-encoded new card text")
 
+    # ── render-summary (build final review markdown; Jenkins sends it) ──
+    p = sub.add_parser("render-summary", help="Render the final review summary markdown")
+    p.add_argument("--issue-key", required=True)
+    p.add_argument("--project", required=True)
+    p.add_argument("--branch", required=True)
+    p.add_argument("--base-branch", required=True)
+    p.add_argument("--jira-url", default="")
+    p.add_argument("--mr-url", default="")
+    p.add_argument("--engine-file", default="", help="Engine result JSON file")
+    p.add_argument("--game-file", default="", help="Game result JSON file")
+    p.add_argument("--mr-state", default="", help="MR state (merged/closed/opened) for skip hints")
+    p.add_argument("--output", default="", help="Write rendered markdown to file")
+    p.add_argument("--message-base64", action="store_true",
+                   help="Print the rendered markdown as Base64 on stdout")
+
     args = parser.parse_args()
 
     if args.command == "webhook":
@@ -411,6 +531,8 @@ def main():
         cmd_update_card(args)
     elif args.command == "update-reply":
         cmd_update_reply(args)
+    elif args.command == "render-summary":
+        cmd_render_summary(args)
 
 
 if __name__ == "__main__":

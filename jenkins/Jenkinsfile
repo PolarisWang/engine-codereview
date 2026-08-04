@@ -57,10 +57,15 @@ pipeline {
         GITLAB_USER = "gitlab-ci-token"
 
         // Feishu Bot API (for topic messages)
+        // NOTE: inject FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_CHAT_ID via
+        // Jenkins credentials (see docs/jenkins-credentials.md). The CHAT_ID
+        // fallback below is a documented hardcoded default.
         FEISHU_APP_ID = "${env.FEISHU_APP_ID ?: ''}"
         FEISHU_APP_SECRET = "${env.FEISHU_APP_SECRET ?: ''}"
         FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_254e95f0687245b9df82ab8bf823ca54'}"
-        // Fallback webhook
+        // Fallback webhook — a live incoming-webhook URL is hardcoded here for
+        // resilience when the Bot API is unavailable (see docs/jenkins-credentials.md).
+        // Prefer injecting FEISHU_WEBHOOK_URL_OVERRIDE via Jenkins credentials.
         FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: 'https://open.feishu.cn/open-apis/bot/v2/hook/f2ec1781-06d2-42c8-91b4-37616d973970'}"
 
         // Jira credentials (injected via Jenkins global env or credentials)
@@ -188,110 +193,44 @@ pipeline {
                                 def engineResult = fileExists(engFile) ? readJSON(file: engFile) : [:]
                                 def gameResult = fileExists(gamFile) ? readJSON(file: gamFile) : [:]
 
-                                // Step 4: Build informative summary (never just "CLEAN")
-                                def engSev = engineResult.review?.severity_counts
-                                if (engSev == null || engSev instanceof net.sf.json.JSONNull) engSev = [:]
-                                def gamSev = gameResult.review?.severity_counts
-                                if (gamSev == null || gamSev instanceof net.sf.json.JSONNull) gamSev = [:]
-                                def engChanged = (engineResult.changed_files ?: []).size()
-                                def gamChanged = (gameResult.changed_files ?: []).size()
-                                def engFiles = (engineResult.changed_files ?: []).collect { line -> line.split("\t").size() > 1 ? line.split("\t")[1] : line.split("\\s+").size() > 1 ? line.split("\\s+")[1] : line }
-                                def gamFiles = (gameResult.changed_files ?: []).collect { line -> line.split("\t").size() > 1 ? line.split("\t")[1] : line.split("\\s+").size() > 1 ? line.split("\\s+")[1] : line }
-                                def engStats = engineResult.stats ?: ""
-                                def gamStats = gameResult.stats ?: ""
-                                def engCommits = engineResult.commits ?: ""
-                                def gamCommits = gameResult.commits ?: ""
-                                def engError = engineResult.review?.error ?: engineResult.error ?: ""
-                                def gamError = gameResult.review?.error ?: gameResult.error ?: ""
-
-                                // Build engine section — determine precise reason for no diff
-                                def engText = ""
-                                def engBranchMerged = engineResult.branch_merged ?: false
-                                def engBranchExists = engineResult.containsKey('branch_exists') ? engineResult.branch_exists : true
+                                // Step 4: Render the summary via feishu_notifier.render-summary
+                                // (single source of truth for the markdown; was previously
+                                // ~100 lines of duplicated Groovy here and in post{}).
+                                def engRespFile = "${env.WORKSPACE}/.eng_update_${msgId}"
+                                def renderOut = "${env.WORKSPACE}/.rendered_${msgId}.md"
                                 def mrState = parsedInfo.mr_info?.state ?: ""
-                                if (engError) {
-                                    engText = "🔧 **Engine 仓库** ❌ 审查失败\n原因: ${engError}"
-                                } else if (!engBranchExists) {
-                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 在远程仓库中不存在（可能已被删除或从未创建）"
-                                } else if (engBranchMerged) {
-                                    def mergedHint = ""
-                                    if (mrState == "merged") mergedHint = "GitLab 显示该 MR 已合并"
-                                    else if (mrState == "closed") mergedHint = "GitLab 显示该 MR 已关闭"
-                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 已经合并到 `${baseBranch}`，没有新的代码变更${mergedHint ? '（' + mergedHint + '）' : ''}"
-                                } else if (engChanged == 0) {
-                                    engText = "🔧 **Engine 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更"
-                                } else {
-                                    engText = "🔧 **Engine 仓库**\n变更文件: ${engChanged} 个"
-                                    if (engStats) engText += " (${engStats})"
-                                    if (engSev.get('critical'))  engText += "\n🔴 Critical: ${engSev.get('critical')}"
-                                    if (engSev.get('warning'))   engText += "\n🟡 Warning: ${engSev.get('warning')}"
-                                    if (engSev.get('suggestion')) engText += "\nℹ️ Suggestion: ${engSev.get('suggestion')}"
-                                    if (!engSev.get('critical') && !engSev.get('warning') && !engSev.get('suggestion')) {
-                                        engText += "\n✅ 未发现严重问题"
-                                    }
-                                }
-
-                                // Build game section
-                                def gamText = ""
-                                def gamBranchMerged = gameResult.branch_merged ?: false
-                                def gamBranchExists = gameResult.containsKey('branch_exists') ? gameResult.branch_exists : true
-                                if (gamError) {
-                                    gamText = "🎮 **Game 仓库** ❌ 审查失败\n原因: ${gamError}"
-                                } else if (!gamBranchExists) {
-                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 在远程仓库中不存在（可能已被删除或从未创建）"
-                                } else if (gamBranchMerged) {
-                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 分支 `${reviewBranch}` 已经合并到 `${baseBranch}`，没有新的代码变更"
-                                } else if (gamChanged == 0) {
-                                    gamText = "🎮 **Game 仓库** ⏭️ 跳过审查\n原因: 该分支相对于 ${baseBranch} 没有代码变更"
-                                } else {
-                                    gamText = "🎮 **Game 仓库**\n变更文件: ${gamChanged} 个"
-                                    if (gamStats) gamText += " (${gamStats})"
-                                    if (gamSev.get('critical'))  gamText += "\n🔴 Critical: ${gamSev.get('critical')}"
-                                    if (gamSev.get('warning'))   gamText += "\n🟡 Warning: ${gamSev.get('warning')}"
-                                    if (gamSev.get('suggestion')) gamText += "\nℹ️ Suggestion: ${gamSev.get('suggestion')}"
-                                    if (!gamSev.get('critical') && !gamSev.get('warning') && !gamSev.get('suggestion')) {
-                                        gamText += "\n✅ 未发现严重问题"
-                                    }
-                                }
-
-                                // Step 4: Update the processing card with the complete review result
-                                def summaryText = "**🔍 Code Review 报告: ${issueKey}**\n\n"
-                                summaryText += "**项目:** ${project}\n"
-                                summaryText += "**分支:** ${reviewBranch} → ${baseBranch}\n"
-                                if (mrUrl) summaryText += "**MR:** ${mrUrl}\n"
-                                summaryText += "\n${engText}\n"
-                                summaryText += "\n${gamText}\n"
-                                summaryText += "\n---\n📎 Jira: ${jiraUrl}"
-
-                                // Append truncated review details if they fit within limits
-                                def MAX_CARD_LEN = 3500
-                                if (summaryText.length() < MAX_CARD_LEN && engineResult.review?.review_text) {
-                                    def detail = engineResult.review.review_text
-                                    def avail = MAX_CARD_LEN - summaryText.length() - 50
-                                    if (avail > 200) {
-                                        if (detail.length() > avail) detail = detail.substring(0, avail) + "\n\n...（详情见 Jenkins 构建日志）"
-                                        summaryText += "\n\n---\n**🔧 Engine 详细报告:**\n${detail}"
-                                    }
-                                }
-                                if (summaryText.length() < MAX_CARD_LEN && gameResult.review?.review_text) {
-                                    def detail = gameResult.review.review_text
-                                    def avail = MAX_CARD_LEN - summaryText.length() - 50
-                                    if (avail > 200) {
-                                        if (detail.length() > avail) detail = detail.substring(0, avail) + "\n\n...（详情见 Jenkins 构建日志）"
-                                        summaryText += "\n\n---\n**🎮 Game 详细报告:**\n${detail}"
-                                    }
-                                }
-
-                                def summaryB64 = b64(summaryText)
                                 sh """
+                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py render-summary \
+                                        --issue-key '${issueKey}' \
+                                        --project '${project}' \
+                                        --branch '${reviewBranch}' \
+                                        --base-branch '${baseBranch}' \
+                                        --jira-url '${jiraUrl}' \
+                                        --mr-url '${mrUrl}' \
+                                        --mr-state '${mrState}' \
+                                        --engine-file '${engFile}' \
+                                        --game-file '${gamFile}' \
+                                        --message-base64 \
+                                        --output '${renderOut}' \
+                                        > ${engRespFile}
+                                """
+                                def summaryText = readFile(renderOut)
+                                echo "Completed review for ${issueKey}"
+
+                                // Send final summary, then persist message_id.
+                                // If the notification itself fails, mark the build FAILURE so
+                                // build status reflects whether users were actually notified.
+                                def updateSend = sh script: """
                                     ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py update-reply \
                                         --app-id '${env.FEISHU_APP_ID}' \
                                         --app-secret '${env.FEISHU_APP_SECRET}' \
                                         --message-id '${replyMsgId}' \
-                                        --message-base64 '${summaryB64}'
-                                """
-
-                                echo "Completed review for ${issueKey}"
+                                        --message-base64 '${b64(summaryText)}'
+                                """, returnStatus: true
+                                if (updateSend != 0) {
+                                    echo "WARN: Feishu update-reply failed (status ${updateSend})"
+                                    currentBuild.result = 'FAILURE'
+                                }
 
                                 // Persist message_id to prevent duplicate processing
                                 def reviewedData = [:]
@@ -474,55 +413,24 @@ pipeline {
                 def gameResult   = fileExists(GAME_RESULT_FILE)   ? readJSON(file: GAME_RESULT_FILE)   : [:]
                 def feishuWebhook = env.FEISHU_WEBHOOK_URL ?: ''
 
-                // Build severity summary with context
-                def buildRepoBlock = { result, repoLabel, repoIcon ->
-                    def sev = result.review?.severity_counts ?: [:]
-                    def changedFiles = (result.changed_files ?: []).size()
-                    def statsStr = result.stats ?: ''
-                    def errorStr = result.review?.error ?: result.error ?: ''
-                    def mrUrl = result.mr_url ?: ''
-                    def branchMerged = result.branch_merged ?: false
-                    def branchExists = result.containsKey('branch_exists') ? result.branch_exists : true
-
-                    def text = "${repoIcon} **${repoLabel} 仓库**\n"
-                    if (errorStr) {
-                        text += "❌ 审查失败\n原因: ${errorStr}\n"
-                    } else if (!branchExists) {
-                        text += "⏭️ 跳过审查\n原因: 分支在远程仓库中不存在（可能已被删除或从未创建）\n"
-                    } else if (branchMerged) {
-                        text += "⏭️ 跳过审查\n原因: 分支已经合并到目标分支，没有新的代码变更\n"
-                    } else if (changedFiles == 0) {
-                        text += "⏭️ 跳过审查\n原因: 该分支相对于目标分支没有代码变更\n"
-                    } else {
-                        text += "变更文件: ${changedFiles} 个"
-                        if (statsStr) text += " (${statsStr})"
-                        text += "\n"
-                        if (sev.get('critical'))  text += "🔴 Critical: ${sev.get('critical')}  "
-                        if (sev.get('warning'))   text += "🟡 Warning: ${sev.get('warning')}  "
-                        if (sev.get('suggestion')) text += "\nℹ️ Suggestion: ${sev.get('suggestion')}"
-                        if (!sev.get('critical') && !sev.get('warning') && !sev.get('suggestion')) {
-                            text += "✅ 未发现严重问题"
-                        }
-                    }
-                    if (mrUrl) text += "\nMR: ${mrUrl}"
-                    return text
-                }
-
-                def engineSev = ""
-                def gameSev   = ""
-
-                def topicParts = []
-                topicParts.add("**🔍 Code Review: ${env.ISSUE_KEY}**")
-                topicParts.add("项目: ${env.PROJECT}")
-                topicParts.add("分支: ${env.REVIEW_BRANCH} → ${env.BASE_BRANCH}")
-                topicParts.add("Jira: ${params.JIRA_URL}")
-                topicParts.add("")
-                topicParts.add(buildRepoBlock(engineResult, 'Engine', '🔧'))
-                if (gameResult) {
-                    topicParts.add("")
-                    topicParts.add(buildRepoBlock(gameResult, 'Game', '🎮'))
-                }
-                def topicText = topicParts.join('\n')
+                // Render the summary via feishu_notifier.render-summary (single source of truth).
+                // This replaces the former inline `buildRepoBlock`/topicParts duplication.
+                def mrStateForPost = readJSON(file: PARSED_INFO_FILE)?.mr_info?.state ?: ''
+                def topicText = sh(
+                    script: """
+                        ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py render-summary \
+                            --issue-key '${env.ISSUE_KEY}' \
+                            --project '${env.PROJECT}' \
+                            --branch '${env.REVIEW_BRANCH}' \
+                            --base-branch '${env.BASE_BRANCH}' \
+                            --jira-url '${params.JIRA_URL}' \
+                            --mr-url '${env.MR_URL}' \
+                            --mr-state '${mrStateForPost}' \
+                            --engine-file '${ENGINE_RESULT_FILE}' \
+                            --game-file '${GAME_RESULT_FILE}'
+                    """,
+                    returnStdout: true
+                ).trim()
 
                 def feishuAppId = env.FEISHU_APP_ID ?: ''
                 def feishuAppSecret = env.FEISHU_APP_SECRET ?: ''
@@ -714,7 +622,7 @@ pipeline {
         }
 
         cleanup {
-            sh "rm -rf ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id || true"
+            sh "rm -rf ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id ${env.WORKSPACE}/.rendered_*.md ${env.WORKSPACE}/.eng_update_* ${env.WORKSPACE}/result_*.json ${env.WORKSPACE}/parsed_*.json ${env.WORKSPACE}/.reply_msg_id_* || true"
         }
     }
 }

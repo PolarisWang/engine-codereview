@@ -21,36 +21,16 @@ import os
 import re
 import sys
 import time
-import urllib.request
-import urllib.error
 
-# ── Jira URL pattern ──────────────────────────────────────────────────────────
-
-JIRA_URL_PATTERN = re.compile(r'https?://[\w.-]+/(?:browse|issues)/([A-Za-z][A-Za-z0-9]+-\d+)')
+# Shared helpers: Jira URL pattern, HTTP with retry
+from common import JIRA_URL_PATTERN, http_request
 
 
-# ── Feishu API helpers (same pattern as feishu_notifier.py) ───────────────────
-
-def _request(method, url, data=None, headers=None):
-    if headers is None:
-        headers = {}
-    headers.setdefault("Content-Type", "application/json")
-    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data else None
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print(f"[feishu] HTTP {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"[feishu] Request error: {e}", file=sys.stderr)
-        return None
-
+# ── Feishu API helpers ───────────────────────────────────────────────────────
 
 def get_tenant_token(app_id, app_secret):
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    resp = _request("POST", url, {"app_id": app_id, "app_secret": app_secret})
+    resp = http_request("POST", url, {"app_id": app_id, "app_secret": app_secret})
     if resp and resp.get("code") == 0:
         return resp["tenant_access_token"]
     print(f"[feishu] Failed to get tenant token: {resp}", file=sys.stderr)
@@ -76,7 +56,7 @@ def list_messages(token, chat_id, page_size=50, page_token=None, start_time=None
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    resp = _request("GET", url, headers=headers)
+    resp = http_request("GET", url, headers=headers)
     if resp and resp.get("code") != 0:
         print(f"[feishu] list_messages error: code={resp.get('code')} msg={resp.get('msg')}",
               file=sys.stderr)
@@ -95,22 +75,6 @@ def extract_jira_urls(text):
     return results
 
 
-def is_thread_reply(message):
-    """Check if a message is a thread reply (not a topic starter)."""
-    # Feishu thread replies have thread_id or parent_id in message body
-    msg_body = message.get("body", {})
-    content = msg_body.get("content", "")
-    if not content:
-        return False
-    try:
-        content_dict = json.loads(content) if isinstance(content, str) else content
-        # thread replies in Feishu have different content structure
-        # Check by message type and the absence of thread info in root
-        return False  # will refine based on actual data
-    except (json.JSONDecodeError, TypeError):
-        return False
-
-
 def main():
     parser = argparse.ArgumentParser(description="Scan Feishu group for Jira URLs")
     parser.add_argument("--app-id", default=os.environ.get("FEISHU_APP_ID", ""))
@@ -126,8 +90,18 @@ def main():
         print(json.dumps({"error": "FEISHU_APP_ID and FEISHU_APP_SECRET required", "items": []}))
         sys.exit(0)
 
-    # ── Load state for time window tracking only ──
+    # ── Load state (time-window cursor) ──
+    # The scan window is anchored on the last successful scan time (cursor),
+    # with a small overlap so a message posted between runs is not missed even
+    # if this cron tick or the API is briefly flaky. The cursor only advances on
+    # a successful scan; on failure it is left unchanged so the next run re-scans
+    # the same window (no gaps).
     state = {}
+    try:
+        with open(args.state_file, encoding="utf-8") as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
 
     # ── Get Feishu token ──
     token = get_tenant_token(args.app_id, args.app_secret)
@@ -135,18 +109,29 @@ def main():
         print(json.dumps({"error": "Failed to get Feishu token", "items": []}))
         sys.exit(0)
 
-    # ── Calculate time window ──
-    # Only scan recent messages to avoid re-processing old topics on every build
-    # Scan window: last 5 minutes (300 seconds) to catch newly posted topics
+    # ── Calculate time window (cursor-based, with overlap) ──
+    #   - First run (no cursor): scan the last INITIAL_WINDOW seconds.
+    #   - Subsequent runs: start at `last_scan_time - OVERLAP` to close gaps,
+    #     end at now. Repeated messages within the overlap are de-duplicated
+    #     downstream by message_id.
+    INITIAL_WINDOW = 300    # sec — how far back from first run with no cursor
+    OVERLAP = 60            # sec — overlap pulled back from the previous cursor
+    MAX_GAP = 86400         # sec — ignore a stale cursor older than 1 day
     now_sec = int(time.time())
-    window_start = now_sec - 300
 
-    print(f"[feishu] Scanning messages from {window_start} to {now_sec} (last 5 min)", flush=True)
+    last_scan = state.get("last_scan_time")
+    if last_scan and (now_sec - last_scan) < MAX_GAP:
+        window_start = last_scan - OVERLAP
+        source = "cursor-based"
+    else:
+        window_start = now_sec - INITIAL_WINDOW
+        source = "initial window"
 
-    print(f"[feishu] Scanning messages from {window_start} to {now_sec}", flush=True)
+    print(f"[feishu] Scanning messages from {window_start} to {now_sec} ({source})", flush=True)
 
     all_messages = []
     page_token = None
+    scan_succeeded = False
     while True:
         resp = list_messages(token, args.chat_id, page_size=50, page_token=page_token,
                              start_time=window_start, end_time=now_sec)
@@ -168,6 +153,7 @@ def main():
         all_messages.extend(items)
 
         if not data.get("has_more"):
+            scan_succeeded = True
             break
         page_token = data.get("page_token")
 
@@ -243,10 +229,15 @@ def main():
                 "create_time": msg.get("create_time", ""),
             })
 
-    # ── Save state (just last scan time) ──
-    state = {"last_scan_time": now_sec}
-    with open(args.state_file, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    # ── Save state (advance cursor only on successful scan) ──
+    # On failure we keep the previous cursor so the next run re-scans the same
+    # window and does not miss messages.
+    if scan_succeeded:
+        state["last_scan_time"] = now_sec
+        with open(args.state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    else:
+        print("[feishu] Scan incomplete (API error) — cursor NOT advanced, will retry", file=sys.stderr)
 
     # ── Write output ──
     result = {
