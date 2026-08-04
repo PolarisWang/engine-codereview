@@ -139,17 +139,31 @@ def run(args):
         pipeline_state.add_topic(state_file, message_id=key, jira_url=key, mode="manual")
         _log('MANUAL', 'RUNNING', key, '', '', '', 'manual review started')
     else:
-        # Scan mode: key is a Feishu message_id; jira_url came from the scan item.
-        jira_url = getattr(args, "jira_url", "")
+        # Scan mode: key is a Feishu message_id. For a fresh scan item the
+        # jira_url comes from the CLI args; for a RETRY driven from state, the
+        # jira_url is read from the existing topic record.
         topic = pipeline_state.get_topic(state_file, key)
+        got_jira_url = getattr(args, "jira_url", "")
+        if not got_jira_url and topic:
+            got_jira_url = topic.get("jira_url", "")
         if topic is None:
             pipeline_state.add_topic(state_file, message_id=key,
                                      jira_key=getattr(args, "jira_key", key),
-                                     jira_url=jira_url, mode="scan",
+                                     jira_url=got_jira_url, mode="scan",
                                      text_preview=getattr(args, "text", ""),
                                      sender_id=getattr(args, "sender_id", ""),
                                      sender_name=getattr(args, "sender_name", ""))
-        _log('SCANNED', 'RUNNING', key, getattr(args, "jira_key", ""), '', '', 'topic discovered')
+        # For a retry, re-advance the in-progress phase to allow re-running after
+        # FAILED/SCANNED (record_failure set FAILED; orchestrate transitions forward).
+        _log('SCANNED', 'RUNNING', key, getattr(args, "jira_key", "") or (topic or {}).get("jira_key", ""), '', '', 'topic discovered')
+        jira_url = got_jira_url or key
+
+        # Retry path: if this topic previously FAILED, reset it to a runnable
+        # state so the forward phase transitions below are legal.
+        if topic is not None and topic.get("phase") == "FAILED":
+            pipeline_state.reset_for_retry(state_file, key)
+            _log('SCANNED', 'RETRY', key, topic.get("jira_key", ""), '', '',
+                 f"retry #{int(topic.get('retry_count') or 0) + 1}")
 
     # 1. Reply processing card in Feishu thread (scan) or send new (manual).
     reply_msg_id = ""

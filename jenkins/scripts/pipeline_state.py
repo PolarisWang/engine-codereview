@@ -313,6 +313,63 @@ def can_retry(path, key):
     return time.time() >= nxt_ts
 
 
+def get_retryable(path, limit=5):
+    """
+    Return FAILED topics that are currently eligible for automatic retry
+    (backoff elapsed AND not exhausted). This decouples retries from the Feishu
+    scan window — a message that has aged out of the scanner's cursor can still
+    be retried because we drive from pipeline state, not from message time.
+    Returns a list of topic dicts (most recently updated first), capped at
+    `limit` to bound retry volume per build.
+    """
+    state = load_state(path)
+    now = time.time()
+    out = []
+    for t in state["topics"].values():
+        if t.get("phase") != "FAILED":
+            continue
+        if t.get("failed_exhausted"):
+            continue
+        # Need a resolvable jira_url to re-run review.
+        if not t.get("jira_url"):
+            continue
+        nxt = t.get("next_retry_at") or ""
+        if nxt:
+            try:
+                nxt_ts = time.mktime(time.strptime(nxt, "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, TypeError):
+                pass  # treat as immediately retryable
+            else:
+                if now < nxt_ts:
+                    continue
+        out.append(t)
+    out.sort(key=lambda t: (t.get("updated_at") or ""), reverse=True)
+    return out[:limit]
+
+
+def reset_for_retry(path, key):
+    """
+    Reset a FAILED topic to a fresh SCANNED/RUNNING state so a retry can run
+    (clears the terminal FAILED phase and the backoff schedule). Keeps the
+    original jira_url/branch fields. Returns the topic dict.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    topic["phase"] = "SCANNED"
+    topic["status"] = "RUNNING"
+    topic["next_retry_at"] = ""
+    # Keep retry_count as a historical counter; failed_exhausted stays until a
+    # manual/intervention clears it — but resetting implies the operator opted in,
+    # so clear the exhausted flag so it can actually retry.
+    topic["failed_exhausted"] = False
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
+
+
 # ── Per-repo status ──────────────────────────────────────────────────────────
 
 def set_repo(path, key, repo, *, status, error="", skip_reason="",
@@ -505,6 +562,9 @@ def main(argv=None):
     p = sub.add_parser("status", parents=[common],
                        help="Ops overview: counts by phase/status + alerts")
 
+    p = sub.add_parser("retryable", parents=[common],
+                       help="List FAILED topics eligible for automatic retry (JSON list)")
+
     p = sub.add_parser("fail", parents=[common],
                        help="Record a topic failure with exponential-backoff retry set")
     p.add_argument("--key", required=True)
@@ -547,6 +607,15 @@ def main(argv=None):
         query(path, key=args.key or None, as_json=args.json)
     elif args.command == "status":
         status(path)
+    elif args.command == "retryable":
+        topics = get_retryable(path)
+        # Emit a JSON array of {message_id, jira_url, jira_key, retry_count}
+        print(json.dumps([{
+            "message_id": t.get("message_id", ""),
+            "jira_key": t.get("jira_key", ""),
+            "jira_url": t.get("jira_url", ""),
+            "retry_count": int(t.get("retry_count") or 0),
+        } for t in topics], ensure_ascii=False))
 
 
 if __name__ == "__main__":

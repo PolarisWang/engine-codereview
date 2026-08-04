@@ -218,22 +218,40 @@ pipeline {
                     }
                     items = items.findAll(retryableFilter)
 
-                    if (items.isEmpty()) {
-                        currentBuild.result = 'SUCCESS'
-                    } else {
-                        echo "Processing first detected Jira URL (one per build)"
+                    // Build the list of topics to process this tick:
+                    //   (a) fresh scan items (most recent message), plus
+                    //   (b) FAILED topics eligible for automatic retry (driven from
+                    //       pipeline state, NOT the scan window — so a message that
+                    //       aged out of the scanner cursor can still be retried).
+                    def retryables = []
+                    if (fileExists(PIPELINE_STATE_FILE)) {
+                        def retryJson = sh(script: "${PYTHON} ${SCRIPTS_DIR}/pipeline_state.py retryable --state-file '${PIPELINE_STATE_FILE}'", returnStdout: true).trim()
+                        if (retryJson) {
+                            def parsed = readJSON(text: retryJson)
+                            if (parsed instanceof List) {
+                                retryables = parsed
+                            }
+                        }
+                    }
+                    echo "Scan: ${items.size()} new message(s), ${retryables.size()} retryable FAILED topic(s)"
 
-                        def issueBuilds = [:]
-                        // Only process the first (most recent) item per build to avoid duplicates
-                        def firstItem = items[0]
-                        def issueKey = firstItem.issue_key
-                        def jiraUrl = firstItem.jira_url
-                        def msgId = firstItem.message_id
-                        // Topic birth: record pipeline state (SCANNED); then drive the whole
-                        // review from Python (orchestrate.py) — single source of flow logic.
-                        psCmd("add --key ${shq(msgId)} --jira-key ${shq(issueKey)} --jira-url ${shq(jiraUrl)} --mode scan --text ${shq(firstItem.text ?: '')} --sender-id ${shq(firstItem.sender_id ?: '')} --sender-name ${shq(firstItem.sender_name ?: '')}")
+                    // Prefer processing fresh messages; then drain retryables. Bound total
+                    // so we never process more than a handful per build (retry backoff
+                    // already limits how many are 'retryable' right now).
+                    def nFresh = Math.min(items.size(), 1)          // one fresh message per build
+                    def nRetry = Math.min(retryables.size(), 3)     // up to 3 retries per build
+                    if (nFresh + nRetry == 0) {
+                        currentBuild.result = 'SUCCESS'
+                    }
+                    int processedCount = 0
+                    for (int k = 0; k < nFresh && processedCount < 4; k++) {
+                        def item = items[k]
+                        def issueKey = item.issue_key
+                        def jiraUrl = item.jira_url
+                        def msgId = item.message_id
+                        psCmd("add --key ${shq(msgId)} --jira-key ${shq(issueKey)} --jira-url ${shq(jiraUrl)} --mode scan --text ${shq(item.text ?: '')} --sender-id ${shq(item.sender_id ?: '')} --sender-name ${shq(item.sender_name ?: '')}")
                         codereviewLog('SCANNED', 'RUNNING', msgId, issueKey, '', '', 'topic discovered')
-                        def orchRc = sh script: """
+                        def rc = sh script: """
                             ${PYTHON} ${SCRIPTS_DIR}/orchestrate.py run \
                                 --key ${shq(msgId)} \
                                 --mode scan \
@@ -241,15 +259,34 @@ pipeline {
                                 --pipeline-state-file '${PIPELINE_STATE_FILE}' \
                                 --jira-key ${shq(issueKey)} \
                                 --jira-url ${shq(jiraUrl)} \
-                                --text ${shq(firstItem.text ?: '')} \
-                                --sender-id ${shq(firstItem.sender_id ?: '')} \
-                                --sender-name ${shq(firstItem.sender_name ?: '')}
+                                --text ${shq(item.text ?: '')} \
+                                --sender-id ${shq(item.sender_id ?: '')} \
+                                --sender-name ${shq(item.sender_name ?: '')}
                         """, returnStatus: true
-                        if (orchRc != 0) {
-                            echo "orchestrate.py run failed for ${msgId} (rc ${orchRc})"
-                            // Keep message un-processed so it can be retried by a later scan
-                            // (unless it already reached a terminal FAILED via the state file).
+                        if (rc != 0) {
+                            echo "orchestrate.py run failed for ${msgId} (rc ${rc})"
                         }
+                        processedCount++
+                    }
+                    for (int k = 0; k < nRetry && processedCount < 4; k++) {
+                        def r = retryables[k]
+                        def msgId = r.message_id
+                        def jiraUrl = r.jira_url
+                        def jiraKey = r.jira_key ?: jiraUrl
+                        codereviewLog('SCANNED', 'RETRY', msgId, jiraKey, '', '', "retry automated (count ${r.retry_count ?: 0})")
+                        def rc = sh script: """
+                            ${PYTHON} ${SCRIPTS_DIR}/orchestrate.py run \
+                                --key ${shq(msgId)} \
+                                --mode scan \
+                                --workspace '${REVIEW_WORKSPACE}' \
+                                --pipeline-state-file '${PIPELINE_STATE_FILE}' \
+                                --jira-key ${shq(jiraKey)} \
+                                --jira-url ${shq(jiraUrl)}
+                        """, returnStatus: true
+                        if (rc != 0) {
+                            echo "orchestrate.py retry failed for ${msgId} (rc ${rc})"
+                        }
+                        processedCount++
                     }
                 }
             }
