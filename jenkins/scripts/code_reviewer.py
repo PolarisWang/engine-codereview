@@ -79,6 +79,45 @@ def load_config():
     }
 
 
+# Structured-findings tool: forces the LLM to return findings as machine-readable
+# JSON (via Anthropic tool_use), so severity counts are exact and never depend on
+# parsing the free-form markdown report.
+REVIEW_TOOLS = [{
+    "name": "review_findings",
+    "description": (
+        "Return the code review findings as structured JSON. Use this tool "
+        "EVERY time you complete a review. The findings array is the source of "
+        "truth for severity counts."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string",
+                                 "description": "Repo-relative path of the changed file."},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["critical", "warning", "suggestion"],
+                            "description": "Severity of this finding."
+                        },
+                        "issue": {"type": "string",
+                                  "description": "One-line description of the problem."},
+                        "suggestion": {"type": "string",
+                                       "description": "How to fix it."}
+                    },
+                    "required": ["file", "severity", "issue", "suggestion"]
+                }
+            }
+        },
+        "required": ["findings"]
+    },
+}]
+
+
 def run_git(cmd, cwd, timeout=600):
     """Run a git command, return (returncode, stdout, stderr)."""
     result = subprocess.run(
@@ -439,15 +478,24 @@ def _extract_table_count(review_text, cell_pattern):
 def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
                     max_output_tokens):
     """
-    Single LLM API call. Returns (review_text, error_message).
-    error_message is None on success.
+    Single LLM API call. Uses an Anthropic-tool_use 'review_findings' tool so the
+    model returns structured findings JSON (exact severity counts), while still
+    producing a free-form markdown report in the text block.
+
+    Returns (review_text, findings_list, error). findings_list is a list of
+    {file, severity, issue, suggestion} dicts from the tool input, or None if the
+    tool_use block wasn't returned (the call still succeeded and review_text has
+    the markdown report).
     """
-    payload = json.dumps({
+    body = {
         "model": model,
         "max_tokens": max_output_tokens,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_prompt}],
-    }).encode("utf-8")
+        "tools": REVIEW_TOOLS,
+        "tool_choice": {"type": "any"},
+    }
+    payload = json.dumps(body).encode("utf-8")
 
     # Use the shared retry-enabled HTTP helper: the LLM call is the most
     # latency/transience-prone step, so give it extra attempts and a long timeout.
@@ -465,20 +513,51 @@ def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
         backoff=2.0,
     )
     if result is None:
-        return None, "LLM API request failed after retries"
+        return None, None, "LLM API request failed after retries"
 
-    # Extract response text
+    # Extract markdown text + structured findings from the response blocks.
+    review_text = ""
+    findings = None
     try:
-        if "content" in result:
-            review_text = "".join(
-                block.get("text", "") for block in result["content"]
-                if block.get("type") == "text"
-            )
-        else:
+        blocks = result.get("content") or []
+        text_parts = []
+        for b in blocks:
+            if b.get("type") == "text":
+                text_parts.append(b.get("text", ""))
+            elif b.get("type") == "tool_use" and b.get("name") == "review_findings":
+                inp = b.get("input") or {}
+                if isinstance(inp.get("findings"), list):
+                    findings = inp["findings"]
+        review_text = "".join(text_parts)
+        if not review_text and findings:
+            # No free-form text block (e.g. tool-only response) — build a readable
+            # markdown report from the structured findings so the detailed card
+            # still has content. This also makes review_text consistent with
+            # severity_counts (exact, from the same JSON).
+            sev_labels = {"critical": "🔴 Critical", "warning": "🟡 Warning",
+                          "suggestion": "ℹ️ Suggestion"}
+            reviews = []
+            for f in findings:
+                label = sev_labels.get((f.get("severity") or "").lower(), "ℹ️")
+                reviews.append(
+                    f"### {label}\n\n"
+                    f"**文件**: {f.get('file','')}\n"
+                    f"**问题**: {f.get('issue','')}\n"
+                    f"**建议**: {f.get('suggestion','')}\n")
+            if reviews:
+                review_text = "## 代码审查结果\n\n" + "\n".join(reviews)
+                # Append a summary table.
+                c = sum(1 for f in findings if (f.get('severity') or '').lower()=='critical')
+                w = sum(1 for f in findings if (f.get('severity') or '').lower()=='warning')
+                s = sum(1 for f in findings if (f.get('severity') or '').lower()=='suggestion')
+                review_text += (f"\n## 总结\n| 严重级别 | 数量 |\n|---------|------|\n"
+                                f"| 🔴 Critical | {c} |\n| 🟡 Warning | {w} |\n"
+                                f"| ℹ️ Suggestion | {s} |")
+        if not review_text:
             review_text = result.get("completion", json.dumps(result))
     except Exception:
         review_text = json.dumps(result)
-    return review_text, None
+    return review_text, findings, None
 
 
 def review_with_claude(diff_info, config, project, issue_key, repo_type):
@@ -533,6 +612,7 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
     print(f"[review] Splitting into {num_batches} batch(es)", flush=True)
 
     all_text = []
+    all_findings = []
     total = {"critical": 0, "warning": 0, "suggestion": 0}
     first_error = None
 
@@ -593,7 +673,7 @@ At the end, provide a summary with count of each severity level.
 
 IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
 
-        review_text, err = _call_llm_batch(
+        review_text, findings, err = _call_llm_batch(
             system_prompt, user_prompt, api_key, base_url, model, max_output_tokens
         )
         if err:
@@ -607,9 +687,22 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
         else:
             all_text.append(review_text)
 
-        counts = _count_severities(review_text)
-        for k in total:
-            total[k] += counts[k]
+        if findings is not None:
+            # Exact counts from the structured tool_use JSON (source of truth).
+            all_findings.extend(findings)
+            for f in findings:
+                sev = (f.get("severity") or "").lower()
+                if sev == "critical":
+                    total["critical"] += 1
+                elif sev == "warning":
+                    total["warning"] += 1
+                elif sev == "suggestion":
+                    total["suggestion"] += 1
+        else:
+            # Fallback: count from the markdown report if no structured findings.
+            counts = _count_severities(review_text)
+            for k in total:
+                total[k] += counts[k]
 
     if not all_text and first_error:
         # Every batch failed — surface the error as the result.
@@ -619,6 +712,7 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
             "summary": f"API error: {first_error}",
             "review_text": "",
             "severity_counts": {},
+            "findings": [],
             "error": first_error,
             "batches": num_batches,
         }
@@ -627,6 +721,7 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
         "summary": "",
         "review_text": "\n\n".join(all_text),
         "severity_counts": total,
+        "findings": all_findings,
         "error": first_error,   # non-None if at least one batch failed (partial results)
         "batches": num_batches,
     }
