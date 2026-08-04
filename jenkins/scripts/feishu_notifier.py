@@ -294,6 +294,20 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
             text += f"\n🟡 Warning: {sev['warning']}"
         if sev.get("suggestion"):
             text += f"\nℹ️ Suggestion: {sev['suggestion']}"
+        # Evidence chain: expose the diff hash + a few changed files so the result
+        # is verifiably tied to a real diff, not a guess.
+        diff_hash = (result or {}).get("diff_hash") or ""
+        if diff_hash:
+            text += f"\n📄 diff: `{diff_hash[:10]}…`"
+        changed_files = ((result or {}).get("changed_files") or [])[:5]
+        if changed_files:
+            names = []
+            for cf in changed_files:
+                parts = cf.split("\t")
+                names.append(parts[-1] if len(parts) > 1 else cf)
+            text += f"\n变更文件预览: {', '.join(names)}"
+            if changed > len(changed_files):
+                text += " …"
         if not sev.get("critical") and not sev.get("warning") and not sev.get("suggestion"):
             text += "\n✅ 未发现严重问题"
         if error and review_text:

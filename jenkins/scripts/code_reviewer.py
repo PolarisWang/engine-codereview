@@ -382,7 +382,25 @@ def _group_into_batches(blocks, max_batch_chars):
 
 
 def _count_severities(review_text):
-    """Count findings by severity heading patterns, with emoji fallback."""
+    """
+    Count findings by severity.
+
+    Preferred: parse the LLM's own summary table at the end of the review text
+    (e.g. `| 🔴 Critical | 3 |`), so the counts match what the LLM explicitly
+    concluded in its report — this keeps the card summary consistent with the
+    body (previously we counted 🔴/🟡/ℹ️ header lines, which can differ from the
+    number of listed issues under a single header, making the data look fake).
+
+    Fallback: count 🔴/🟡/ℹ️ header lines (then raw emoji) if no table is found.
+    """
+    # Try the LLM's own summary table first.
+    critical = _extract_table_count(review_text, r'🔴|Critical|关键')
+    warning = _extract_table_count(review_text, r'🟡|Warning|警告')
+    suggestion = _extract_table_count(review_text, r'ℹ️|Suggestion|建议')
+    if critical is not None and warning is not None and suggestion is not None:
+        return {"critical": critical, "warning": warning, "suggestion": suggestion}
+
+    # Fallback: count header lines.
     critical = len(re.findall(r'🔴\s*(?:Critical|关键)', review_text))
     warning = len(re.findall(r'🟡\s*(?:Warning|警告)', review_text))
     suggestion = len(re.findall(r'ℹ️?\s*(?:Suggestion|建议)', review_text))
@@ -391,6 +409,31 @@ def _count_severities(review_text):
         warning = review_text.count("🟡")
         suggestion = review_text.count("ℹ️")
     return {"critical": critical, "warning": warning, "suggestion": suggestion}
+
+
+def _extract_table_count(review_text, cell_pattern):
+    """
+    Parse a markdown table row of the LLM summary:
+        | 🔴 Critical | 3 |
+        | 严重级别 | 数量 |
+        |---------|------|
+    Returns the integer cell next to a row whose label cell matches
+    `cell_pattern`, or None if not found.
+    """
+    lines = review_text.splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        label, value = cells[0], cells[1]
+        if re.search(cell_pattern, label) and label not in ("严重级别", "🆚"):
+            m = re.search(r'(\d+)', value)
+            if m:
+                return int(m.group(1))
+    return None
 
 
 def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
