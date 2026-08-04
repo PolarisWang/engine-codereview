@@ -32,15 +32,90 @@ JIRA_URL_PATTERN = re.compile(
 _CONFIG_CACHE = None
 
 
+def _parse_yaml_minimal(text):
+    """
+    Minimal YAML-subset parser for config.yaml WITHOUT PyYAML.
+
+    Handles the structure actually used by this repo's config.yaml: a flat
+    mapping, block-nested mappings (2-space indent), and scalar string/int
+    values (with optional quotes and trailing # comments). Comments and blank
+    lines are ignored. This is deliberately limited — full YAML is handled by
+    PyYAML when available.
+
+    Returns a dict, or raises ValueError on unsupported syntax.
+    """
+    result = {}
+    current = result          # the dict we're currently filling
+    stack = []                # stack of (indent, dict) for nesting
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip() if "#" in raw else raw.rstrip()
+        if not line.strip():
+            continue
+        # strip indentation
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if stripped.startswith("- "):
+            # list item (only used for flat symbol lists if ever) — not in our config
+            raise ValueError("list items unsupported by minimal YAML parser")
+        # split key: value
+        if ":" not in stripped:
+            continue
+        key, _, val = stripped.partition(":")
+        key = key.strip()
+        val = val.strip()
+        # Rebuild stack for the new indent level.
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+            current = stack[-1][1] if stack else result
+        if not val:
+            # block -> a nested mapping
+            child = {}
+            current[key] = child
+            stack.append((indent, child))
+            current = child
+        else:
+            # scalar
+            if val in ("true", "True"):
+                val = True
+            elif val in ("false", "False"):
+                val = False
+            elif val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'") and len(val) >= 2:
+                val = val[1:-1]
+            else:
+                # keep as string (numbers stay strings; fine for our config)
+                pass
+            current[key] = val
+    return result
+
+
 def load_config():
-    """Load config.yaml once. Returns dict; falls back to {} on any error."""
+    """Load config.yaml once. Uses PyYAML if available, else a minimal built-in
+    parser so the scripts never hard-depend on a yaml module being installed on
+    the Jenkins agent. Returns {} on any error."""
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
+    raw = None
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        _CONFIG_CACHE = {}
+        print(f"[config] Failed to read {CONFIG_PATH}: {e}", file=sys.stderr)
+        return _CONFIG_CACHE
     try:
         import yaml
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            _CONFIG_CACHE = yaml.safe_load(f) or {}
+        _CONFIG_CACHE = yaml.safe_load(raw) or {}
+    except ImportError:
+        # PyYAML not installed on this agent — use the minimal parser.
+        try:
+            _CONFIG_CACHE = _parse_yaml_minimal(raw)
+            print("[config] PyYAML not found; used minimal built-in YAML parser", file=sys.stderr)
+        except ValueError as e:
+            _CONFIG_CACHE = {}
+            print(f"[config] Minimal YAML parse failed for {CONFIG_PATH}: {e}", file=sys.stderr)
     except Exception as e:
         _CONFIG_CACHE = {}
         print(f"[config] Failed to load {CONFIG_PATH}: {e}", file=sys.stderr)
