@@ -677,7 +677,6 @@ pipeline {
                     }
                 }
             }
-        }
 
         cleanup {
             sh "rm -rf ${SCAN_RESULT_FILE} ${PARSED_INFO_FILE} ${ENGINE_RESULT_FILE} ${GAME_RESULT_FILE} ${env.WORKSPACE}/engine_review.json ${env.WORKSPACE}/game_review.json ${env.WORKSPACE}/feishu_msg.json ${env.WORKSPACE}/feishu_err_msg.json ${env.WORKSPACE}/feishu_topic_msg.json ${env.WORKSPACE}/feishu_engine_reply.json ${env.WORKSPACE}/feishu_game_reply.json ${env.WORKSPACE}/feishu_err_reply.json ${env.WORKSPACE}/feishu_progress.json ${env.WORKSPACE}/feishu_summary_reply.json ${env.WORKSPACE}/.fs_*.txt ${env.WORKSPACE}/.feishu_reply_msg_id ${env.WORKSPACE}/.rendered_*.md ${env.WORKSPACE}/.eng_update_* ${env.WORKSPACE}/result_*.json ${env.WORKSPACE}/parsed_*.json ${env.WORKSPACE}/.reply_msg_id_* ${env.WORKSPACE}/.state_*.json || true"
