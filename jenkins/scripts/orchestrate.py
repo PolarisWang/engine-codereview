@@ -106,10 +106,13 @@ def _alert_if_exhausted(state_file, topic, app_id="", app_secret=""):
                 _run_py("feishu_notifier.py", ["webhook", "--webhook-url", webhook,
                                                "--message-base64", _b64_str(text)])
             elif app_id and app_secret:
-                _run_py("feishu_notifier.py", ["send-message", "--app-id", app_id,
-                                               "--app-secret", app_secret,
-                                               "--chat-id", _env("FEISHU_CHAT_ID"),
-                                               "--message-base64", _b64_str(text)])
+                # Convention: in the topic group the bot only REPLIES, never starts a
+                # new topic. There is no reply target for the exhausted alert (the
+                # topic has no card yet), so we do NOT send-message (would create a
+                # new topic). Just log it.
+                print(f"[orchestrate] WARN: exhausted alert would start a new topic; "
+                      f"skipping (reply-only convention). topic={topic.get('jira_key')}",
+                      file=sys.stderr)
         except Exception as e:
             print(f"[orchestrate] WARN: exhausted alert failed: {e}", file=sys.stderr)
 
@@ -180,10 +183,12 @@ def run(args):
             pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
                                       render_msg_id=reply_msg_id)
         else:
-            rc, out, _ = _run_py("feishu_notifier.py", [
-                "send-message", "--app-id", app_id, "--app-secret", app_secret,
-                "--chat-id", chat_id, "--message-base64", _b64_str("reviewing...")])
-            reply_msg_id = _extract_msg_id(out, rc)
+            # No reply target for manual mode. Convention: the bot only REPLIES in the
+            # topic group, never starts a new topic — so error out instead of
+            # send-message (which would create a new topic).
+            print(f"[orchestrate] ERROR: manual mode needs FEISHU_REPLY_MSG_ID to reply in "
+                  f"an existing topic (reply-only convention). topic={key}", file=sys.stderr)
+            reply_msg_id = ""
     else:
         # Scan mode: we want ONE card per topic that evolves through the review
         # ("Reviewing..." -> FAILED/SKIPPED -> DONE), so a retry reuses the topic's

@@ -572,21 +572,12 @@ pipeline {
                                 """
                             }
                         } else {
-                            // ── New topic message (no FEISHU_REPLY_MSG_ID) ──
-                            def topicB64 = b64(topicText)
-                            def topicResult = sh(
-                                script: """
-                                    ${PYTHON} ${SCRIPTS_DIR}/feishu_notifier.py send-message \
-                                        --app-id '${feishuAppId}' \
-                                        --app-secret '${feishuAppSecret}' \
-                                        --chat-id '${feishuChatId}' \
-                                        --message-base64 '${topicB64}'
-                                """,
-                                returnStdout: true
-                            ).trim()
-                            def topicJson = readJSON(text: topicResult)
-                            topicMsgId = topicJson.message_id ?: ''
-                            echo "Topic message sent: ${topicMsgId}"
+                            // ── No reply target in manual mode ──
+                            // Convention: the bot only REPLIES in the topic group, never
+                            // starts a new topic. Refuse instead of send-message (which
+                            // would create a new topic).
+                            echo "Convention: bot only replies in the group; cannot send a new topic for ${env.ISSUE_KEY} (no FEISHU_REPLY_MSG_ID)"
+                            topicMsgId = ''
 
                             if (engineResult.review?.review_text && topicMsgId) {
                                 def engineDetail = "**🔧 Engine 详细报告:**\n${engineResult.review.review_text}"
