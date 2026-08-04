@@ -32,61 +32,114 @@ JIRA_URL_PATTERN = re.compile(
 _CONFIG_CACHE = None
 
 
+def _parse_yaml_scalar(val):
+    """Coerce a scalar value: null/bool/int are handled; strings stay strings."""
+    v = val.strip()
+    if v in ("", "null", "Null", "NULL", "~"):
+        return None
+    if v in ("true", "True", "TRUE"):
+        return True
+    if v in ("false", "False", "FALSE"):
+        return False
+    if v.startswith('"') and v.endswith('"') and len(v) >= 2:
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'") and len(v) >= 2:
+        return v[1:-1]
+    # YAML plain int
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    return v
+
+
 def _parse_yaml_minimal(text):
     """
     Minimal YAML-subset parser for config.yaml WITHOUT PyYAML.
 
-    Handles the structure actually used by this repo's config.yaml: a flat
-    mapping, block-nested mappings (2-space indent), and scalar string/int
-    values (with optional quotes and trailing # comments). Comments and blank
-    lines are ignored. This is deliberately limited — full YAML is handled by
-    PyYAML when available.
+    Deliberately supports the syntax this repo actually uses:
+      - flat and block-nested mappings (2-space indentation)
+      - scalar values: quoted ('...' / "..."), bool, int, plain strings
+      - block scalars: `key: |` and `key: >` (multi-line literal / folded)
+      - comments (starts with #) and blank lines
 
-    Returns a dict, or raises ValueError on unsupported syntax.
+    Full YAML (anchors, lists, complex nesting) is left to PyYAML when present;
+    if this parser meets syntax it cannot handle it raises ValueError so the
+    caller surfaces a clear, actionable error instead of misparsing silently.
     """
     result = {}
-    current = result          # the dict we're currently filling
-    stack = []                # stack of (indent, dict) for nesting
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip() if "#" in raw else raw.rstrip()
+    current = result
+    stack = []                # (indent, dict)
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw = lines[i]
+        # strip comments (careful not to strip # inside quotes — config doesn't use them)
+        line = raw.split("#", 1)[0] if "#" in raw else raw
+        line = line.rstrip()
         if not line.strip():
+            i += 1
             continue
-        # strip indentation
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
         if stripped.startswith("- "):
-            # list item (only used for flat symbol lists if ever) — not in our config
-            raise ValueError("list items unsupported by minimal YAML parser")
-        # split key: value
+            raise ValueError("list items are unsupported by the minimal YAML parser; "
+                             "install PyYAML on the agent instead")
         if ":" not in stripped:
-            continue
+            raise ValueError(f"unsupported line in config without ':' at line {i+1}: {stripped[:40]}")
         key, _, val = stripped.partition(":")
         key = key.strip()
         val = val.strip()
-        # Rebuild stack for the new indent level.
+        # Rebuild stack for this indent level.
         while stack and stack[-1][0] >= indent:
             stack.pop()
             current = stack[-1][1] if stack else result
+
         if not val:
-            # block -> a nested mapping
+            # Nested mapping — but first check for a block scalar introducer on
+            # the SAME key is impossible (block scalars have a marker after ':').
             child = {}
             current[key] = child
             stack.append((indent, child))
             current = child
+            i += 1
+        elif val in ("|", ">"):
+            # Block scalar: absorb subsequent more-indented lines.
+            block_lines = []
+            i += 1
+            while i < n:
+                inner = lines[i].rstrip()
+                if not inner.strip():
+                    # blank line inside block — keep, unless it's the terminator
+                    # (we stop only when a line is less/equal indented with content)
+                    if not lines[i].strip():
+                        # peek ahead: if next non-blank is <= this key's indent, end block
+                        j = i
+                        while j < n and not lines[j].strip():
+                            j += 1
+                        if j >= n or (len(lines[j]) - len(lines[j].lstrip())) <= indent:
+                            break
+                        block_lines.append("")
+                        i += 1
+                        continue
+                    block_lines.append("")
+                    i += 1
+                    continue
+                inner_indent = len(inner) - len(inner.lstrip())
+                if inner_indent <= indent:
+                    break
+                block_lines.append(inner[inner_indent:])
+                i += 1
+            while block_lines and block_lines[-1] == "":
+                block_lines.pop()
+            folded = (val == ">")
+            body = "\n" if not folded else " "
+            block_val = body.join(block_lines)
+            current[key] = block_val
         else:
-            # scalar
-            if val in ("true", "True"):
-                val = True
-            elif val in ("false", "False"):
-                val = False
-            elif val.startswith('"') and val.endswith('"'):
-                val = val[1:-1]
-            elif val.startswith("'") and val.endswith("'") and len(val) >= 2:
-                val = val[1:-1]
-            else:
-                # keep as string (numbers stay strings; fine for our config)
-                pass
-            current[key] = val
+            current[key] = _parse_yaml_scalar(val)
+            i += 1
     return result
 
 

@@ -102,3 +102,21 @@ environment {
 若保持单 job：可接受「一次长审查阻塞扫描」的延迟，系统仍是正确的（重叠窗口 + message_id 去重
 保证不漏不重，只是晚处理）。如需更激进可去掉 `disableConcurrentBuilds()` 并依赖 cursor + 
 `processed_ids` 去重，但不建议——并发竞态更难排查。
+
+---
+
+## Agent 运行时依赖（PyYAML）
+
+`common.py` 的 `config.yaml` 加载逻辑：**优先用 PyYAML**，若 agent 未安装则回退到内置的
+最小 YAML 解析器（`_parse_yaml_minimal`，支持该项目 config.yaml 用到的扁平映射 + `|`/`>`
+块标量）。因此脚本不硬依赖 PyYAML。
+
+**建议仍在 agent 镜像/启动时安装 PyYAML**，作为双保险：
+
+- APT：`apt-get install -y python3-yaml`（Debian/Ubuntu agent 容器）
+- 或 pip（容器 python 若为 externally-managed 需加 `--break-system-packages`）：
+  `python3 -m pip install pyyaml`
+
+`_parse_yaml_minimal` 是**有意的受限子集**——只覆盖 config.yaml 实际语法。若以后 config.yaml
+引入 PyYAML 特有语法（锚点、列表、复杂嵌套），务必保证 agent 装有 PyYAML，否则会得到
+"unsupported... install PyYAML" 的明确报错（而非静默解析错误）。
