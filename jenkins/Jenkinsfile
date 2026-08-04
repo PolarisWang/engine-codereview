@@ -324,7 +324,7 @@ pipeline {
                     writeFile(file: "${env.WORKSPACE}/.feishu_reply_msg_id", text: "${params.FEISHU_REPLY_MSG_ID ?: ''}", encoding: "UTF-8")
 
                     // Manual topic: record PARSED + resolved branch/base/project.
-                    def manTopic = params.JIRA_URL ?: 'manual-topic'
+                    // (manTopic is already declared at the top of this script block.)
                     psCmd("transition --key ${shq(manTopic)} --to PARSING --status RUNNING --review-branch ${shq(env.REVIEW_BRANCH)} --base-branch ${shq(env.BASE_BRANCH)} --mr-url ${shq(env.MR_URL)}")
                     codereviewLog('PARSED', 'RUNNING', manTopic, env.ISSUE_KEY, env.PROJECT, '', "branch=${env.REVIEW_BRANCH}->${env.BASE_BRANCH}")
                 }
