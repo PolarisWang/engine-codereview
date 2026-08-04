@@ -47,6 +47,19 @@ workspace:
   cache_repos: true   # reuse local clones, fetch instead of clone
 
 # ============================================================
+# Real-time event subscription server (topic interaction)
+# ============================================================
+event:
+  # Port the event server listens on (0.0.0.0:port). Feishu callbacks hit this.
+  port: 8085
+  # Feishu open-platform event subscription settings (secrets may also come from
+  # env: FEISHU_VERIFICATION_TOKEN / FEISHU_ENCRYPT_KEY).
+  # verification_token: ""
+  # encrypt_key: ""
+  # Where the server reads/writes the shared topic pipeline state.
+  state_file: /root/.codereview-pipeline-state.json
+
+# ============================================================
 # Claude API settings
 # ============================================================
 claude:

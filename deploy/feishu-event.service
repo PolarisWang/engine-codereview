@@ -1,0 +1,26 @@
+[Unit]
+Description=Feishu Code Review Event Server (real-time interaction)
+After=network.target
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian/agent/engine-codereview/jenkins/scripts
+# ENV is injected by the same Jenkins-managed env vars (FEISHU_APP_ID etc.), or
+# via an EnvironmentFile if you keep secrets there.
+EnvironmentFile=/home/debian/agent/engine-codereview/.env
+ExecStart=/usr/bin/python3 /home/debian/agent/engine-codereview/jenkins/scripts/event_server.py --host 0.0.0.0 --port 8085
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -264,6 +264,9 @@ def run(args):
         issue_key, project, review_branch, base_branch, jira_url, mr_url,
         eng_res or {}, gam_res or {},
     )
+    # Append a text interaction hint so users know they can reply to this topic
+    # to select a fix / re-review / ask a follow-up (real-time event server routes it).
+    summary = _append_fix_options(summary, review_branch)
     if reply_msg_id:
         rc, _, err = _run_py("feishu_notifier.py", [
             "update-reply", "--app-id", app_id, "--app-secret", app_secret,
@@ -307,6 +310,200 @@ def _send_reply(app_id, app_secret, reply_msg_id, text):
 def _update_card_text(app_id, app_secret, card_msg_id, text):
     """Update an existing card message in place (single-card-per-topic behaviour)."""
     _send_reply(app_id, app_secret, card_msg_id, text)
+
+
+def _append_fix_options(summary, branch):
+    """Append a text-only interaction prompt to the summary card. (Buttons are a
+    later upgrade; for now the user replies in-thread to pick an action.)"""
+    hint = (
+        "\n\n---\n🤖 **交互**：回复本话题 `@机器人` 并附带指令：\n"
+        f"  - `1` 生成修复补丁预览\n"
+        f"  - `2` 重新审查 `{branch}`\n"
+        f"  - `3 <关键词>` 解释某个 finding\n"
+        f"  - `/状态` 当前审查状态\n"
+        f"  - 直接提问会自动按当前 diff 答疑"
+    )
+    return summary + hint
+
+
+def _build_fix_patch_preview(topic, findings):
+    """
+    Generate a text preview of candidate fixes for the most critical findings,
+    based on the structured findings list (file + issue + suggestion). This is a
+    plain-text "修复补丁预览" using each finding's suggestion — no code edits are
+    applied automatically.
+    """
+    if not findings:
+        return "无待修复的 finding。"
+    lines = ["## 修复建议预览（基于审查 findings）\n"]
+    shown = 0
+    for f in findings:
+        sev = _normalize_sev(f.get("severity"))
+        if sev != "critical" and shown >= 5:
+            continue
+        lines.append(f"**{f.get('file','')}** ({sev})\n- {f.get('issue','')}\n"
+                     f"- 建议：{f.get('suggestion','')}\n")
+        shown += 1
+        if shown >= 8:
+            break
+    lines.append("\n> 仅文本预览，不会自动改动代码。如需真实改动请自行应用。")
+    return "\n".join(lines)
+
+
+def _normalize_sev(sev):
+    s = (sev or "").strip().lower()
+    if s in ("critical", "high", "error", "blocker"):
+        return "critical"
+    if s in ("warning", "warn", "minor"):
+        return "warning"
+    return "suggestion"
+
+
+def _build_status_text(topic):
+    """Human-readable current status of a topic."""
+    if not topic:
+        return "该话题没有对应的审查状态。"
+    repos = topic.get("repos") or {}
+    lines = [f"**状态**: {topic.get('phase')} / {topic.get('status')}"]
+    if topic.get("last_error"):
+        lines.append(f"`错误`: {topic['last_error'][:120]}")
+    for r in ("engine", "game"):
+        rd = repos.get(r) or {}
+        lines.append(f"  {r}: {rd.get('status')} "
+                     f"{rd.get('severity_counts') or ''} "
+                     f"{('— ' + rd.get('skip_reason','')) if rd.get('skip_reason') else ''}")
+    lines.append(f"`retry`: {topic.get('retry_count',0)} · `exhausted`: {topic.get('failed_exhausted')}")
+    return "\n".join(lines)
+
+
+# ── Interaction (reply/chat round-trip) ─────────────────────────────────────
+
+def interact(args):
+    """
+    Handle a user reply / @bot in a topic thread (driven by the event server).
+
+    Routes the reply text to an action and updates the SAME topic card in place:
+      1/生成修复补丁预览, 2/重新审查, 3 <kw>/解释某 finding, /状态, or free-form
+      question answered against the topic's diff + review context.
+    """
+    key = args.key                 # parent topic message_id
+    reply_text = (args.reply or "").strip()
+    workspace = args.workspace
+    state_file = args.pipeline_state_file or os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+    # env for LLM call if we answer free-form questions
+    api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
+    base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    model = _env("ANTHROPIC_MODEL") or "deepseek-v4-flash"
+
+    topic = pipeline_state.get_topic(state_file, key)
+    if topic is None:
+        return 0  # unknown topic — nothing to reply to
+    render_id = topic.get("render_msg_id") or ""
+
+    # Load existing review findings (from saved result files) for context.
+    eng_findings, gam_findings = _load_findings(workspace, key)
+
+    lower = reply_text.lower()
+    answer = None
+    action = "unknown"
+
+    if reply_text.startswith("1") or "修复" in reply_text and "补丁" in reply_text:
+        action = "fix_preview"
+        answer = _build_fix_patch_preview(topic, (eng_findings or []) + (gam_findings or []))
+    elif reply_text.startswith("2") or "重审" in reply_text or "重新" in reply_text:
+        action = "re-review"
+        # Re-run the full review; reuse diff-hash cache if unchanged.
+        jira_url = topic.get("jira_url") or key
+        # Re-run run() by re-invoking this script's own logic would recurse; instead
+        # do a targeted re-run reusing _review_repos via a fresh run.
+        answer = "🔄 正在重新审查…请稍候，结果会更新到本帖。"
+        # Fire a background re-run of the scan flow for this topic.
+        _spawn_rerun(key, workspace, state_file, jira_url, app_id, app_secret)
+    elif reply_text.startswith("3 ") or "解释" in reply_text or "为什么" in reply_text:
+        action = "explain"
+        keyword = reply_text[2:].strip() if reply_text.startswith("3 ") else \
+            (reply_text.split("解释", 1)[1].strip() if "解释" in reply_text else "")
+        answer = _answer_question(keyword, (eng_findings or []) + (gam_findings or []),
+                                  api_key, base_url, model)
+    elif reply_text in ("/状态", "/status", "状态"):
+        action = "status"
+        answer = _build_status_text(topic)
+    elif reply_text:
+        action = "question"
+        answer = _answer_question(reply_text, (eng_findings or []) + (gam_findings or []),
+                                  api_key, base_url, model)
+    else:
+        answer = "请回复指令：`1` 修复预览 / `2` 重审 / `3 <关键词>` 解释 / `/状态` / 直接提问。"
+
+    # Update the SAME card (or reply a new one if no card yet).
+    if answer:
+        if render_id and app_id and app_secret:
+            _update_card_text(app_id, app_secret, render_id, answer)
+        else:
+            _log(action.upper(), 'RUN', key, "", "", "", f"interaction: {action}")
+    return 0
+
+
+def _load_findings(workspace, key):
+    eng = gam = []
+    for repo in ("engine", "game"):
+        p = os.path.join(workspace, f"result_{key}_{repo}.json")
+        res = _read_json_file(p)
+        if res and isinstance(res, dict):
+            f = (res.get("review") or {}).get("findings") or []
+            if repo == "engine":
+                eng = f
+            else:
+                gam = f
+    return eng, gam
+
+
+def _answer_question(question, findings, api_key, base_url, model):
+    """Answer a free-form question about the reviewed findings using the LLM."""
+    if not api_key:
+        return "（未配置 LLM，无法答疑。可用 `/状态` 或 `1/2/3` 指令。）"
+    ctx = "\n".join(
+        f"- [{f.get('severity')}] {f.get('file')}: {f.get('issue', '')}"
+        for f in (findings or [])[:20])
+    prompt = (f"基于以下代码审查 findings，用中文简短回答用户问题（基于这些 findings 推断，不要编造）：\n"
+              f"审查 findings：\n{ctx or '（无）'}\n\n用户问题：{question}")
+    code = _call_llm_simple(prompt, api_key, base_url, model)
+    return code or "（无法生成答复）"
+
+
+def _call_llm_simple(prompt, api_key, base_url, model, max_tokens=600):
+    """Minimal direct LLM call for interaction answers (no retries needed for chat)."""
+    import urllib.request
+    try:
+        payload = json.dumps({
+            "model": model, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/v1/messages", data=payload,
+            headers={"Content-Type": "application/json", "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"}, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        text = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
+        return text.strip()
+    except Exception as e:
+        print(f"[interact] llm error: {e}", file=sys.stderr)
+        return None
+
+
+def _spawn_rerun(key, workspace, state_file, jira_url, app_id, app_secret):
+    """Re-run the scan review for a topic in the background (reuses diff-hash cache)."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.join(SCRIPTS_DIR, "orchestrate.py"), "run",
+             "--key", key, "--mode", "scan", "--jira-url", jira_url,
+             "--workspace", workspace, "--pipeline-state-file", state_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[interact] rerun spawn failed: {e}", file=sys.stderr)
 
 
 def _parse_jira(jira_url, host, token, gitlab_token):
@@ -437,9 +634,19 @@ def main(argv=None):
     p.add_argument("--text", default="")
     p.add_argument("--sender-id", default="")
     p.add_argument("--sender-name", default="")
+
+    p = sub.add_parser("interact", help="Handle a reply/@bot in a topic thread")
+    p.add_argument("--key", required=True, help="Parent topic message_id")
+    p.add_argument("--reply", required=True, help="Reply text (command or question)")
+    p.add_argument("--reply-msg-id", default="", help="The reply message id (unused; card updated by key)")
+    p.add_argument("--workspace", default="/data/codereview/workspace")
+    p.add_argument("--pipeline-state-file", default="")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         sys.exit(run(args))
+    elif args.command == "interact":
+        sys.exit(interact(args))
 
 
 if __name__ == "__main__":
