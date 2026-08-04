@@ -420,6 +420,47 @@ def _group_into_batches(blocks, max_batch_chars):
     return batches
 
 
+def _normalize_severity(sev):
+    """Map the LLM's severity strings to our enum {critical, warning, suggestion}.
+    The model sometimes writes 'info'/'Info' — treat as suggestion."""
+    s = (sev or "").strip().lower()
+    if s in ("critical", "high", "error", "blocker"):
+        return "critical"
+    if s in ("warning", "warn", "medium", "minor"):
+        return "warning"
+    return "suggestion"  # suggestion, info, note, low, etc.
+
+
+def _findings_counts(findings):
+    """Exact severity counts from a structured findings list."""
+    counts = {"critical": 0, "warning": 0, "suggestion": 0}
+    for f in findings or []:
+        counts[_normalize_severity(f.get("severity"))] += 1
+    return counts
+
+
+def _build_markdown_from_findings(findings):
+    """Build a complete, readable markdown report from structured findings, with
+    a summary table that matches severity_counts exactly."""
+    sev_labels = {"critical": "🔴 Critical", "warning": "🟡 Warning",
+                  "suggestion": "ℹ️ Suggestion"}
+    reviews = []
+    for f in findings or []:
+        label = sev_labels[_normalize_severity(f.get("severity"))]
+        reviews.append(
+            f"### {label}\n\n"
+            f"**文件**: {f.get('file','')}\n"
+            f"**问题**: {f.get('issue','')}\n"
+            f"**建议**: {f.get('suggestion','')}\n")
+    if not reviews:
+        return ""
+    c = _findings_counts(findings)
+    return ("## 代码审查结果\n\n" + "\n".join(reviews) +
+            f"\n## 总结\n| 严重级别 | 数量 |\n|---------|------|\n"
+            f"| 🔴 Critical | {c['critical']} |\n| 🟡 Warning | {c['warning']} |\n"
+            f"| ℹ️ Suggestion | {c['suggestion']} |")
+
+
 def _count_severities(review_text):
     """
     Count findings by severity.
@@ -529,30 +570,12 @@ def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
                 if isinstance(inp.get("findings"), list):
                     findings = inp["findings"]
         review_text = "".join(text_parts)
-        if not review_text and findings:
-            # No free-form text block (e.g. tool-only response) — build a readable
-            # markdown report from the structured findings so the detailed card
-            # still has content. This also makes review_text consistent with
-            # severity_counts (exact, from the same JSON).
-            sev_labels = {"critical": "🔴 Critical", "warning": "🟡 Warning",
-                          "suggestion": "ℹ️ Suggestion"}
-            reviews = []
-            for f in findings:
-                label = sev_labels.get((f.get("severity") or "").lower(), "ℹ️")
-                reviews.append(
-                    f"### {label}\n\n"
-                    f"**文件**: {f.get('file','')}\n"
-                    f"**问题**: {f.get('issue','')}\n"
-                    f"**建议**: {f.get('suggestion','')}\n")
-            if reviews:
-                review_text = "## 代码审查结果\n\n" + "\n".join(reviews)
-                # Append a summary table.
-                c = sum(1 for f in findings if (f.get('severity') or '').lower()=='critical')
-                w = sum(1 for f in findings if (f.get('severity') or '').lower()=='warning')
-                s = sum(1 for f in findings if (f.get('severity') or '').lower()=='suggestion')
-                review_text += (f"\n## 总结\n| 严重级别 | 数量 |\n|---------|------|\n"
-                                f"| 🔴 Critical | {c} |\n| 🟡 Warning | {w} |\n"
-                                f"| ℹ️ Suggestion | {s} |")
+        if findings:
+            # Always produce a complete, count-consistent markdown report rebuilt
+            # from the structured findings. This avoids truncated/fragmentary text
+            # blocks from a tool-only or partial response, and guarantees the
+            # detailed card matches severity_counts exactly.
+            review_text = _build_markdown_from_findings(findings)
         if not review_text:
             review_text = result.get("completion", json.dumps(result))
     except Exception:
@@ -690,14 +713,9 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
         if findings is not None:
             # Exact counts from the structured tool_use JSON (source of truth).
             all_findings.extend(findings)
-            for f in findings:
-                sev = (f.get("severity") or "").lower()
-                if sev == "critical":
-                    total["critical"] += 1
-                elif sev == "warning":
-                    total["warning"] += 1
-                elif sev == "suggestion":
-                    total["suggestion"] += 1
+            batch_counts = _findings_counts(findings)
+            for k in total:
+                total[k] += batch_counts[k]
         else:
             # Fallback: count from the markdown report if no structured findings.
             counts = _count_severities(review_text)
