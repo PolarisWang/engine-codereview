@@ -389,6 +389,70 @@ def _route(msg_id, parent_id, text, sender_id=""):
                 lock.release()
 
 
+class CardAwareClient:
+    """lark-oapi WS client subclass that does NOT drop CARD-frame messages.
+
+    The stock lark-oapi ws client ignores MessageType.CARD (button clicks on
+    interactive cards). We override _handle_data_frame so CARD payloads are
+    surfaced (callback to _on_card) instead of dropped. EVENT handling is fully
+    preserved (delegated to the real implementation). phase-A1: we first only log
+    the raw payload so we can learn the exact schema from a real click before
+    parsing actions.
+    """
+    def __init__(self, ws_client):
+        self._wsc = ws_client
+        self._on_card = None   # optional callback: async def _on_card(payload_bytes)
+
+    async def _handle_data_frame(self, frame):
+        import base64 as _b64, time as _time, http as _http
+        from lark_oapi.ws.const import HEADER_TYPE
+        from lark_oapi.ws.enum import MessageType
+        from lark_oapi.core.json import JSON
+        from lark_oapi.core.const import UTF_8
+        from lark_oapi.ws.model import Response
+
+        hs = frame.headers
+        type_ = ""
+        for h in hs:
+            if h.key == HEADER_TYPE:
+                type_ = h.value
+                break
+        try:
+            mt = MessageType(type_)
+        except Exception:
+            mt = None
+
+        if mt and mt.name == "CARD":
+            # Ack so Feishu does not retry; surface raw payload for the phase-A1 probe.
+            pl = frame.payload
+            print(f"[card] RAW CARD payload ({len(pl) if pl else 0} bytes): {pl!r}", flush=True)
+            cb = getattr(self, "_on_card", None)
+            if cb is not None and pl:
+                try:
+                    await cb(pl)
+                except Exception as e:
+                    print(f"[card] on_card handler error: {e}", file=sys.stderr)
+            resp = Response(code=_http.HTTPStatus.OK)
+            frame.payload = JSON.marshal(resp).encode(UTF_8)
+            await self._wsc._write_message(frame.SerializeToString())
+            return
+        # Non-CARD: preserve the original EVENT/other handling.
+        await self._wsc._handle_data_frame(frame)
+
+
+def _hijack_card(ws_client):
+    """Replace the ws client's _handle_data_frame with the CARD-aware wrapper.
+    Returns the wrapper (so we can attach an _on_card callback)."""
+    wrapper = CardAwareClient(ws_client)
+    # bind instance method to the real client
+    import asyncio
+    real = ws_client
+    async def _df(frame):
+        return await wrapper._handle_data_frame(frame)
+    real._handle_data_frame = _df
+    return wrapper
+
+
 def run_ws():
     """Start the long-connection event listener (no public callback URL needed)."""
     import lark_oapi
@@ -410,6 +474,9 @@ def run_ws():
     client = WSClient(app_id=app_id, app_secret=app_secret,
                       log_level=lark_oapi.LogLevel.INFO,
                       event_handler=handler)
+    # phase-A1: surface CARD (button-clicks) that the stock SDK drops, by
+    # wrapping _handle_data_frame. Logs raw payload until we parse it from real.
+    _hijack_card(client)
     client.start()
     # block forever (lark SDK keeps the WS alive / reconnects)
     import time

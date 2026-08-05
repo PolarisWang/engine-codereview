@@ -178,6 +178,54 @@ def update_card_message(token, message_id, card):
     return resp
 
 
+# ── Interactive action buttons (arch-A) ───────────────────────────────────────
+# Feishu interactive cards support clickable buttons. Clicking posts a
+# `card.action.trigger` callback carrying `value` + the operator's open_id. We
+# route that back into the same interaction/pending logic (see event_server).
+#
+# Actions are keyed by a short id; each maps to a topic interaction:
+#   re_review / apply_patch / close_topic / get_status
+ACTION_BUTTONS = [
+    # (label, value.action, enabled-when-DONE, tooltip)
+    ("🔍 重新审查", "re_review", True, "让 Jenkins 用最新代码重新审查"),
+    ("✏️ 修复补丁", "apply_patch", True, "生成/提议修复补丁预览"),
+    ("🔒 关闭话题", "close_topic", True, "终止该话题（发起人/管理员）"),
+]
+
+
+def build_action_row(topic_key, actions=ACTION_BUTTONS, enabled=None):
+    """Build a Feishu card `action` element (row of buttons) for a topic.
+
+    `enabled` is an optional set of action ids to render; default = all.
+    Each button carries value={action, topic} so the callback knows what to do.
+    """
+    act = enabled if enabled is not None else {a[1] for a in actions}
+    buttons = []
+    for label, act_id, always, tip in actions:
+        if act_id not in act:
+            continue
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": "default",
+            "value": {"action": act_id, "topic": topic_key},
+        })
+    if not buttons:
+        return None
+    return {"tag": "action", "actions": buttons}
+
+
+def with_action_row(card, topic_key, enabled=None):
+    """Return a copy of `card` (dict elements list) with an action-button row
+    appended, so the result/state card gains clickable buttons."""
+    row = build_action_row(topic_key, enabled=enabled)
+    if row is None:
+        return card
+    card = dict(card)
+    card["elements"] = list(card.get("elements") or []) + [row]
+    return card
+
+
 # ── Card builders ────────────────────────────────────────────────────────────
 
 def build_processing_card(issue_key, project):
@@ -543,6 +591,31 @@ def cmd_update_reply(args):
     print(json.dumps(resp, indent=2))
 
 
+def cmd_update_reply_card(args):
+    """Update a thread reply card with text + interactive action buttons."""
+    token = get_tenant_token(args.app_id, args.app_secret)
+    if not token:
+        sys.exit(1)
+    text = read_message_text(args)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "Code Review"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": text},
+        ],
+    }
+    # Enabled action ids come as comma-separated, e.g. "re_review,apply_patch,close_topic"
+    enabled = None
+    if args.actions:
+        enabled = set(a.strip() for a in args.actions.split(",") if a.strip())
+    card = with_action_row(card, args.topic, enabled=enabled)
+    resp = update_card_message(token, args.message_id, card)
+    print(json.dumps(resp, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Feishu Code Review Notifier")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -599,6 +672,15 @@ def main():
     p.add_argument("--message-id", required=True)
     p.add_argument("--message-base64", help="Base64-encoded new card text")
 
+    # ── update-reply-card (update a thread reply card with text + action buttons) ──
+    p = sub.add_parser("update-reply-card", help="Update a thread reply card with text + interactive action buttons")
+    p.add_argument("--app-id", required=True)
+    p.add_argument("--app-secret", required=True)
+    p.add_argument("--message-id", required=True)
+    p.add_argument("--message-base64", help="Base64-encoded card text")
+    p.add_argument("--topic", required=False, default="", help="Topic key to bind action buttons")
+    p.add_argument("--actions", required=False, default="", help="Comma-separated enabled action ids")
+
     # ── render-summary (build final review markdown; Jenkins sends it) ──
     p = sub.add_parser("render-summary", help="Render the final review summary markdown")
     p.add_argument("--issue-key", required=True)
@@ -634,6 +716,8 @@ def main():
         cmd_update_card(args)
     elif args.command == "update-reply":
         cmd_update_reply(args)
+    elif args.command == "update-reply-card":
+        cmd_update_reply_card(args)
     elif args.command == "render-summary":
         cmd_render_summary(args)
     elif args.command == "render-state":

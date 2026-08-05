@@ -288,8 +288,9 @@ def run(args):
     summary = _append_fix_options(summary, review_branch)
     if reply_msg_id:
         rc, _, err = _run_py("feishu_notifier.py", [
-            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", reply_msg_id, "--message-base64", _b64_str(summary)])
+            "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", reply_msg_id, "--message-base64", _b64_str(summary),
+            "--topic", str(key), "--actions", "re_review,apply_patch,close_topic"])
         if rc != 0:
             topic_after = pipeline_state.record_failure(state_file, key, f"update-reply failed: {err}")
             _alert_if_exhausted(state_file, topic_after, app_id, app_secret)
@@ -326,9 +327,17 @@ def _send_reply(app_id, app_secret, reply_msg_id, text):
         "--message-id", reply_msg_id, "--message-base64", _b64_str(text)])
 
 
-def _update_card_text(app_id, app_secret, card_msg_id, text):
-    """Update an existing card message in place (single-card-per-topic behaviour)."""
-    _send_reply(app_id, app_secret, card_msg_id, text)
+def _update_card_text(app_id, app_secret, card_msg_id, text, topic_key="", actions=""):
+    """Update an existing card message in place (single-card-per-topic behaviour).
+    When `topic_key` is given, appends interactive action buttons whose callbacks
+    are routed back into the same interaction/pending logic (arch-A)."""
+    if topic_key:
+        _run_py("feishu_notifier.py", [
+            "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", card_msg_id, "--message-base64", _b64_str(text),
+            "--topic", str(topic_key), "--actions", actions])
+    else:
+        _send_reply(app_id, app_secret, card_msg_id, text)
 
 
 def _append_fix_options(summary, branch):
