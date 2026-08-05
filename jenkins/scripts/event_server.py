@@ -240,7 +240,6 @@ def _sender_id_of(sender):
         raw = getattr(sender, "id", None) or ""
         idt = getattr(sender, "id_type", "") or ""
         if raw:
-            # If id_type names open_id (or is unset), raw is almost always the id we want.
             s = _sd(raw)
             print(f"[event] sender: id={s!r} id_type={_sd(idt)!r} (attr)", flush=True)
             return s
@@ -251,6 +250,8 @@ def _sender_id_of(sender):
             if s:
                 print(f"[event] sender: nested.id={s!r}", flush=True)
                 return s
+        print(f"[event] sender object has no extractable id; type={type(sender).__name__} "
+              f"attrs={sorted(a for a in dir(sender) if not a.startswith('_'))}", flush=True)
         return ""
     # Dict shape (webhook-style / raw JSON event)
     s = ""
@@ -260,7 +261,10 @@ def _sender_id_of(sender):
     if not sid:
         sid = sender.get("user_id") or sender.get("owner_id") or ""
     s = _sd(sid)
-    print(f"[event] sender: id={s!r} (dict)", flush=True)
+    if not s:
+        print(f"[event] sender dict has no id; keys={list(sender.keys())}", flush=True)
+    else:
+        print(f"[event] sender: id={s!r} (dict)", flush=True)
     return s
 
 
@@ -311,14 +315,19 @@ def _post_text(raw_content):
 def on_p2_im_message_receive(data):
     """WS event handler for im.message.receive_v1 (receives a P2ImMessageReceiveV1)."""
     try:
+        event = getattr(data, "event", None)
         message = _p2_message_payload(data)
         if not message:
             print("[event] ws event missing message", file=sys.stderr)
             return
+        # The replier's identity may sit on the EVENT (.sender) rather than on the
+        # message — check the event first, then fall back to message.sender.
+        sender = getattr(event, "sender", None) or getattr(message, "sender", None)
+        sender_id = _sender_id_of(sender)
         routed = _lark_message_to_route(message)
         if not routed:
             return
-        msg_id, parent_id, chat_type, text, sender_id = routed
+        msg_id, parent_id, chat_type, text, _ = routed
         if chat_type != "group":
             return
         _route(msg_id, parent_id, text, sender_id)
