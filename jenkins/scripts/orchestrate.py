@@ -170,12 +170,16 @@ def run(args):
         _log('SCANNED', 'RUNNING', key, getattr(args, "jira_key", "") or (topic or {}).get("jira_key", ""), '', '', 'topic discovered')
         jira_url = got_jira_url or key
 
-        # Retry path: if this topic previously FAILED, reset it to a runnable
-        # state so the forward phase transitions below are legal.
-        if topic is not None and topic.get("phase") == "FAILED":
+        # Retry/re-review path: if this topic was FAILED (auto-retry) or DONE
+        # (explicit re_review), reset it to a runnable state so the forward phase
+        # transitions below are legal. CLOSED topics were skipped earlier.
+        if topic is not None and topic.get("phase") in ("FAILED", "DONE"):
+            was_failed = topic.get("phase") == "FAILED"
+            reset_kind = "RETRY" if was_failed else "REREVIEW"
             pipeline_state.reset_for_retry(state_file, key)
-            _log('SCANNED', 'RETRY', key, topic.get("jira_key", ""), '', '',
-                 f"retry #{int(topic.get('retry_count') or 0) + 1}")
+            _log('SCANNED', reset_kind, key, topic.get("jira_key", ""), '', '',
+                 f"{'retry' if was_failed else 're-review'} "
+                 f"#{int(topic.get('retry_count') or 0) + 1}")
 
     # 1. Reply processing card in Feishu thread (scan) or send new (manual).
     reply_msg_id = ""
