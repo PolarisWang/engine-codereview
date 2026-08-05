@@ -198,7 +198,10 @@ def _handle_message_event(event):
     msg_id = message.get("message_id", "")
     parent_id = message.get("parent_id") or ""   # None/'' -> topic starter
     text = _text_of(message)
-    _route(msg_id, parent_id, text)
+    sender = event.get("sender", {}) or {}
+    sender_id = (sender.get("sender_id") or {}).get("user_id", "") \
+        if isinstance(sender.get("sender_id"), dict) else sender.get("sender_id", "")
+    _route(msg_id, parent_id, text, sender_id)
 
 
 # ── Long-connection (WebSocket) mode — no public callback URL needed ─────────
@@ -210,13 +213,16 @@ def _handle_message_event(event):
 
 def _lark_message_to_route(lark_message):
     """Map a lark-oapi ws P2ImMessageReceiveV1.message onto the routing fields.
-    Returns (msg_id, parent_id, chat_type, text) or None if not group/text."""
+    Returns (msg_id, parent_id, chat_type, text, sender_id) or None if not group/text."""
     try:
         msg_type = getattr(lark_message, "message_type", "") or ""
         chat_type = getattr(lark_message, "chat_type", "") or ""
         msg_id = getattr(lark_message, "message_id", "") or ""
         parent_id = getattr(lark_message, "parent_id", "") or ""
         raw_content = getattr(lark_message, "content", "") or ""
+        # sender: lark message .sender is a dict-like with .id
+        sender = getattr(lark_message, "sender", None)
+        sender_id = getattr(sender, "id", "") if sender else ""
         if msg_type == "text":
             cd = json.loads(raw_content) if isinstance(raw_content, str) else (raw_content or {})
             text = (cd or {}).get("text", "")
@@ -227,7 +233,7 @@ def _lark_message_to_route(lark_message):
     except Exception as e:
         print(f"[event] parse lark message failed: {e}", file=sys.stderr)
         return None
-    return msg_id, parent_id, chat_type, text
+    return msg_id, parent_id, chat_type, text, sender_id
 
 
 def _post_text(raw_content):
@@ -250,7 +256,6 @@ def _post_text(raw_content):
 def on_p2_im_message_receive(data):
     """WS event handler for im.message.receive_v1 (receives a P2ImMessageReceiveV1)."""
     try:
-        # data is the P2ImMessageReceiveV1; route via its message payload.
         message = _p2_message_payload(data)
         if not message:
             print("[event] ws event missing message", file=sys.stderr)
@@ -258,10 +263,10 @@ def on_p2_im_message_receive(data):
         routed = _lark_message_to_route(message)
         if not routed:
             return
-        msg_id, parent_id, chat_type, text = routed
+        msg_id, parent_id, chat_type, text, sender_id = routed
         if chat_type != "group":
             return
-        _route(msg_id, parent_id, text)
+        _route(msg_id, parent_id, text, sender_id)
     except Exception as e:
         print(f"[event] ws handler error: {e}", file=sys.stderr)
 
@@ -279,8 +284,24 @@ def _p2_message_payload(data):
         return None
 
 
-def _route(msg_id, parent_id, text):
-    """Shared single-link routing: new topic with Jira -> run; reply -> interact."""
+import threading
+
+# per-topic serial lock (defense-in-depth layer 5): same topic's interact handled one at a time.
+_T_LOCKS = {}
+_T_LOCKS_GUARD = threading.Lock()
+LOCK_TIMEOUT = 120  # seconds
+
+
+def _topic_lock(topic_key):
+    with _T_LOCKS_GUARD:
+        if topic_key not in _T_LOCKS:
+            _T_LOCKS[topic_key] = threading.Lock()
+        return _T_LOCKS[topic_key]
+
+
+def _route(msg_id, parent_id, text, sender_id=""):
+    """Shared single-link routing: new topic with Jira -> run; reply -> interact.
+    Same-topic replies are serialized via a per-topic lock."""
     base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
     if not parent_id:
         if _is_jira_topic(text):
@@ -289,9 +310,18 @@ def _route(msg_id, parent_id, text):
         else:
             print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
-        print(f"[event] REPLY {msg_id} to parent {parent_id}: {text[:80]}", flush=True)
-        _run_orchestrate(["interact", "--key", parent_id, "--reply", text[:500],
-                          "--reply-msg-id", msg_id] + base)
+        print(f"[event] REPLY {msg_id} to parent {parent_id}: {text[:80]} sender={sender_id}", flush=True)
+        lock = _topic_lock(parent_id)
+        acquired = lock.acquire(timeout=LOCK_TIMEOUT)
+        try:
+            if not acquired:
+                print(f"[event] topic {parent_id} busy, skip this reply", file=sys.stderr)
+                return
+            _run_orchestrate(["interact", "--key", parent_id, "--reply", text[:500],
+                              "--reply-msg-id", msg_id, "--sender-id", sender_id] + base)
+        finally:
+            if acquired:
+                lock.release()
 
 
 def run_ws():

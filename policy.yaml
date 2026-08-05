@@ -1,0 +1,47 @@
+# CodeReview Agent policy — 声明式边界（纵深防御的执行器依据）
+#
+# 执行器（orchestrate.interact / _approve）只按本表放行或拒绝动作。
+# 修改边界 = 改这个文件，不改代码。
+
+agent:
+  # 只读工具：任何群成员 @ 都可触发（不改东西）
+  invoke_anyone:
+    - get_status
+    - get_findings
+    - generate_patch_preview
+    - answer
+
+  # 受控动作：需确认门控，且只有 topic 发起人可批准
+  guarded:
+    # 触发重新审查（会重跑 code_reviewer，读资源）
+    re_review:
+      approver: "topic_owner"
+
+    # 提议修复补丁（进入 pending_patch，等待 @ok）
+    apply_patch:
+      approver: "topic_owner"
+      confirm: ["@ok", "ok", "好的", "执行", "确认"]
+
+    # 本地应用补丁（@ok 后）
+    apply_local:
+      approver: "topic_owner"
+      confirm: ["@ok", "ok", "好的", "执行", "确认"]
+
+    # 推送到远程 review 分支（@confirm push 后；仅该话题 review_branch）
+    push_remote:
+      approver: "topic_owner"
+      confirm: ["@confirm push", "确认push", "@push", "推"]
+      branch: "{topic.review_branch}"      # 只推该话题的 review 分支
+
+    # 回退（@撤销）
+    rollback:
+      approver: "topic_owner"
+      confirm: ["@撤销", "@revert", "撤销", "回退"]
+
+# 并发
+lock:
+  mode: serial        # 同一 topic 串行
+
+# 副作用范围
+scope:
+  repo_checkout_only: true   # apply/push 仅在 <workspace>/<repo> 内

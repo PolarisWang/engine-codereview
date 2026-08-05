@@ -147,6 +147,7 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         "chat_history": [],         # list of {"role":"user|assistant","content":"..."}
         "pending_patch": None,      # {"file","diff","repo","created_at", "push_pending": bool} awaiting @ok/@confirm push
         "applied_patches": [],      # list of {"file","diff","repo","commit","applied_at"}
+        "approval_log": [],         # audit: {"actor","action","target","time","result"}
     }
 
 
@@ -488,6 +489,38 @@ def pop_last_applied_patch(path, key):
     state["updated_at"] = _now_iso()
     save_state(state, path)
     return patch
+
+
+# Keep at most this many audit entries per topic.
+MAX_APPROVAL_LOG = 100
+
+
+def append_approval(path, key, actor, action, target="", result="ok", note=""):
+    """
+    Append one audit entry to the topic's approval_log.
+    Fields: actor, action, target, time, result, note.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    log = topic.setdefault("approval_log", [])
+    entry = {
+        "actor": actor or "",
+        "action": action or "",
+        "target": target or "",
+        "time": _now_iso(),
+        "result": result or "ok",
+        "note": note or "",
+    }
+    if isinstance(log, list):
+        log.append(entry)
+        if len(log) > MAX_APPROVAL_LOG:
+            topic["approval_log"] = log[-MAX_APPROVAL_LOG:]
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
 
 
 # ── Structured log line ──────────────────────────────────────────────────────

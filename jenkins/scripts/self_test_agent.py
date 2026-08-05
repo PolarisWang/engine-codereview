@@ -44,8 +44,9 @@ subprocess.run(["git", "commit", "-qm", "base"], cwd=checkout, check=True)
 head_before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout,
                              capture_output=True, text=True).stdout.strip()
 
-# topic with engine repo pointing to 'chaos', review_branch feature
-ps.add_topic(sp, message_id="om_test", jira_key="EV-1", mode="scan")
+# topic with engine repo pointing to 'chaos', review_branch feature, OWNER sender
+OWNER = "ou_owner"
+ps.add_topic(sp, message_id="om_test", jira_key="EV-1", mode="scan", sender_id=OWNER)
 st = ps.load_state(sp)
 st["topics"]["om_test"].update({
     "project": "EV",
@@ -75,9 +76,9 @@ cards = []
 o._update_card_text = lambda a, b, cid, text: cards.append(text)
 
 
-def mk(reply):
+def mk(reply, sender_id=OWNER):
     class A: pass
-    x = A(); x.key = "om_test"; x.reply = reply
+    x = A(); x.key = "om_test"; x.reply = reply; x.sender_id = sender_id
     x.workspace = ws; x.pipeline_state_file = sp; x.reply_msg_id = ""
     return x
 
@@ -121,22 +122,33 @@ ps.set_pending_patch(sp, "om_test", {
 })
 # Reset the file to pre-edit so git apply actually has something to apply.
 subprocess.run(["git", "checkout", "--", "a.go"], cwd=checkout, check=True)
-o._confirm_apply("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret")
+# 4a) NON-owner attempts @ok -> must be refused (identity/approval layer)
+cards.clear(); o._confirm_apply("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", "ou_intruder")
+assert cards and "发起人" in cards[-1], cards
+log = ps.get_topic(sp, "om_test").get("approval_log") or []
+assert any(e.get("result") == "denied" for e in log), "denial should be audited"
+assert not ps.get_topic(sp, "om_test").get("applied_patches"), "non-owner must not apply"
+print("4a) non-owner @ok REFUSED + audited OK |", cards[-1][:30])
+# 4b) owner @ok -> real git apply (produce a REAL diff via git diff so apply succeeds)
+cards.clear(); o._confirm_apply("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
 applied = ps.get_topic(sp, "om_test")
-assert applied.get("applied_patches"), "applied_patches should record after @ok"
-# the file should actually have changed (git apply really applied)
+assert applied.get("applied_patches"), "applied_patches should record after owner @ok"
 content = open(os.path.join(checkout, "a.go")).read()
 assert "if p != nil" in content, "git apply did not change the file!"
-print("4) @ok applied patch locally (real git apply) OK | applied:", len(applied["applied_patches"]))
+print("4b) owner @ok applied patch locally (real git apply) OK | applied:", len(applied["applied_patches"]))
 
-# ── 5) @confirm push: protected branch refused; feature allowed ──
-# 5a) on protected branch 'main' -> refused
+# ── 5) @confirm push: protected branch refused; feature allowed; also non-owner refused ──
+# 5a) on protected branch 'main' -> refused (even by owner)
 st = ps.load_state(sp); st["topics"]["om_test"]["review_branch"] = "main"; ps.save_state(st, sp)
-cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret")
-assert cards and "拒绝" in cards[-1], cards
-print("5a) push to protected 'main' REFUSED OK |", cards[-1][:30])
-# 5b) on feature branch -> push (real git push to a bare repo we create)
+cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
+assert cards and ("受保护" in cards[-1] or "仅话题" in cards[-1]), cards
+print("5a) push to protected 'main' REFUSED OK |", cards[-1][:34])
+# 5a2) non-owner @confirm push -> refused
 st = ps.load_state(sp); st["topics"]["om_test"]["review_branch"] = "feature/fix-x"; ps.save_state(st, sp)
+cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", "ou_intruder")
+assert cards and "发起人" in cards[-1], cards
+print("5a2) non-owner @confirm push REFUSED OK |", cards[-1][:30])
+# 5b) on feature branch + owner -> push (real git push to a bare repo we create)
 bare = os.path.join(work, "remote.git")
 subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
 subprocess.run(["git", "remote", "add", "origin", bare], cwd=checkout, check=True)
@@ -145,12 +157,12 @@ with open(os.path.join(checkout, "a.go"), "a") as f:
     f.write("\n// fixed\n")
 subprocess.run(["git", "add", "."], cwd=checkout, check=True)
 subprocess.run(["git", "commit", "-qm", "agent fix"], cwd=checkout, check=True)
-cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret")
+cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
 print("5b) push to feature branch ->", cards[-1][:40] if cards else "NO CARD")
 assert cards and "推送" in cards[-1], cards
 
 # ── 6) @撤销 rollback ──
-cards.clear(); o._rollback("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret")
+cards.clear(); o._rollback("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
 assert cards and ("回退" in cards[-1] or "已回退" in cards[-1]), cards
 print("6) @撤销 rollback OK |", cards[-1][:30])
 

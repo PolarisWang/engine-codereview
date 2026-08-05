@@ -43,6 +43,7 @@ from pipeline_state import log_line
 
 # Scripts dir (this file's directory)
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", ".."))
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -495,6 +496,7 @@ def interact(args):
     topic = pipeline_state.get_topic(state_file, key)
     if topic is None:
         return 0
+    actor = getattr(args, "sender_id", "") or ""   # the person @-ing / approving
     render_id = topic.get("render_msg_id") or ""
     eng_findings, gam_findings = _load_findings(workspace, key)
     all_findings = (eng_findings or []) + (gam_findings or [])
@@ -508,16 +510,24 @@ def interact(args):
 
     if pending:
         if is_ok:
-            # stage #1: apply locally.
-            return _confirm_apply(key, topic, workspace, state_file, app_id, app_secret)
+            return _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor)
         if low in ("@confirm push", "确认push", "@push"):
-            return _confirm_push(key, topic, workspace, state_file, app_id, app_secret)
+            return _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor)
         if is_rollback:
-            return _rollback(key, topic, workspace, state_file, app_id, app_secret)
+            return _rollback(key, topic, workspace, state_file, app_id, app_secret, actor)
 
     # Also handle @撤销 globally (rollback last applied patch even without pending).
     if is_rollback:
-        return _rollback(key, topic, workspace, state_file, app_id, app_secret)
+        return _rollback(key, topic, workspace, state_file, app_id, app_secret, actor)
+    # Audit / log query
+    if low in ("@审计", "@log", "审计"):
+        import json as _json
+        log = topic.get("approval_log") or []
+        lines = ["## 审计记录（最近）\n"] + [
+            f"- [{e.get('time','')}] {e.get('actor','')} -> {e.get('action','')}"
+            f" {e.get('target','')} [{e.get('result','')}]" for e in log[-20:]]
+        _finalize(key, "\n".join(lines), render_id, [], state_file, app_id, app_secret)
+        return 0
 
     # ── Agent loop ──────────────────────────────────────────────────────────
     history = topic.get("chat_history") or []
@@ -540,7 +550,7 @@ def interact(args):
                 name = c.get("name")
                 inp = c.get("input") or {}
                 result, side_effect = _exec_tool(name, inp, topic, workspace, all_findings,
-                                                 state_file, api_key, base_url, model)
+                                                 state_file, api_key, base_url, model, actor)
                 all_msgs.append({"role": "user", "content": f"[tool {name} result]\n{result}"})
                 if side_effect:
                     any_side_effect = True
@@ -560,7 +570,7 @@ def interact(args):
 
 
 def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
-               api_key, base_url, model):
+               api_key, base_url, model, actor=""):
     """Execute one agent tool. Returns (result_text, side_effect_bool)."""
     if name == "get_status":
         return _build_status_text(topic), False
@@ -573,6 +583,10 @@ def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
         target = (inp.get("target") or "").strip()
         return _build_patch_preview_target(all_findings, target), False
     if name == "re_review":
+        # guarded: only topic_owner may trigger a re-review.
+        ok, why = _approve(key_source(topic), topic, actor, "re_review")
+        if not ok:
+            return f"⛔ {why}", True
         jira_url = topic.get("jira_url") or key_source(topic)
         _spawn_rerun(key_source(topic), workspace, state_file, jira_url,
                      _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"))
@@ -581,6 +595,10 @@ def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
         q = (inp.get("question") or "").strip()
         return _answer_question(q or "请补充说明", all_findings, api_key, base_url, model), False
     if name == "apply_patch":
+        # guarded: only topic_owner may PROPOSE applying a patch.
+        ok, why = _approve(key_source(topic), topic, actor, "apply_patch")
+        if not ok:
+            return f"⛔ {why}", True
         # STAGE a patch (side-effect). The actual write waits for @ok (then @confirm push).
         target = (inp.get("target") or "all").strip()
         patch = _build_patch_target(all_findings, target)
@@ -644,6 +662,101 @@ def _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret):
 PROTECTED_BRANCHES = {"main", "master", "dev", "develop", "release", "stage", "prod"}
 
 
+# ── Policy layer (explicit "can/cannot", defense-in-depth layer 2) ──────────
+#
+# Reads policy.yaml at repo root (or falls back to this default). The executor
+# only follows this table: only topic_owner may approve guarded actions; push is
+# further restricted to the topic's own review_branch (layer 3 + 4).
+
+DEFAULT_POLICY = {
+    "agent": {
+        "invoke_anyone": [
+            "get_status", "get_findings", "generate_patch_preview", "answer"],
+        "guarded": {
+            "re_review": {"approver": "topic_owner"},
+            "apply_patch": {"approver": "topic_owner"},
+            "apply_local": {"approver": "topic_owner"},
+            "push_remote": {"approver": "topic_owner", "branch": "{topic.review_branch}"},
+            "rollback": {"approver": "topic_owner"},
+        },
+    },
+    "lock": {"mode": "serial"},
+    "scope": {"repo_checkout_only": True},
+}
+
+_POLICY_CACHE = None
+
+
+def _load_policy():
+    """Load policy.yaml from repo root, fallback to DEFAULT_POLICY."""
+    global _POLICY_CACHE
+    if _POLICY_CACHE is not None:
+        return _POLICY_CACHE
+    try:
+        import yaml
+        path = os.path.join(REPO_ROOT, "policy.yaml")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                p = yaml.safe_load(f) or {}
+            if isinstance(p, dict) and p.get("agent"):
+                _POLICY_CACHE = p
+                return _POLICY_CACHE
+    except Exception as e:
+        print(f"[policy] load failed, using default: {e}", file=sys.stderr)
+    _POLICY_CACHE = DEFAULT_POLICY
+    return _POLICY_CACHE
+
+
+def _is_invoke_anyone(policy, tool):
+    anyone = (policy.get("agent") or {}).get("invoke_anyone") or []
+    return tool in anyone
+
+
+def _approve(key, topic, actor, action, branch=""):
+    """
+    Defense-in-depth approval check (layers 2/3/4):
+      - guarded actions require actor == topic.sender_id (topic owner)
+      - push_remote additionally requires branch == topic.review_branch, not protected
+    Writes an approval_log entry (audit). Returns (allowed, why).
+    """
+    policy = _load_policy()
+    guarded = (policy.get("agent") or {}).get("guarded") or {}
+    rule = guarded.get(action)
+    if rule is None:
+        # not a guarded action -> allowed (subject to other layers)
+        return True, "not-guarded"
+
+    approver = rule.get("approver", "topic_owner")
+    owner = (topic or {}).get("sender_id") or ""
+    actor = actor or ""
+
+    if approver == "topic_owner":
+        if not owner:
+            pipeline_state.append_approval(
+                os.environ.get("PIPELINE_STATE_FILE", state_file_default(key, topic)), key,
+                actor, action, branch, "denied", "no topic owner recorded (fail-closed)")
+            return False, "话题未记录发起人，操作已拒绝（fail-closed）"
+        if actor != owner:
+            pipeline_state.append_approval(
+                os.environ.get("PIPELINE_STATE_FILE", state_file_default(key, topic)), key,
+                actor, action, branch, "denied", f"actor!=owner ({actor}!={owner})")
+            return False, "仅话题发起人可执行此操作"
+
+    if action == "push_remote":
+        want_branch = (rule.get("branch") or "").replace("{topic.review_branch}", topic.get("review_branch") or "")
+        if branch not in (want_branch, topic.get("review_branch")) or branch in PROTECTED_BRANCHES or not branch:
+            pipeline_state.append_approval(
+                os.environ.get("PIPELINE_STATE_FILE", state_file_default(key, topic)), key,
+                actor, action, branch, "denied", "branch not allowed/protected")
+            return False, "仅话题的 review 分支可 push，且不可推受保护分支"
+
+    return True, "approved"
+
+
+def state_file_default(key, topic):
+    return os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
+
+
 def _resolve_repo_checkout(workspace, topic, repo):
     """
     Locate a topic repo's git checkout under workspace. Returns (checkout_dir, real_repo_name)
@@ -682,41 +795,42 @@ def _run_git(args, cwd):
         return 1, "", str(e)
 
 
-def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret):
-    """User said @ok: apply the staged pending_patch to the LOCAL checkout (git apply)."""
+def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor=""):
+    """User said @ok: apply the staged pending_patch to the LOCAL checkout (git apply).
+    Only the topic owner may approve (defense-in-depth layer 3)."""
+    render = topic.get("render_msg_id") or ""
+    ok, why = _approve(key, topic, actor, "apply_local")
+    if not ok:
+        pipeline_state.append_approval(state_file, key, actor, "apply_local", "", "denied", why)
+        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        return 0
     pending = topic.get("pending_patch") or {}
     if not pending:
         return 0
-    render = topic.get("render_msg_id") or ""
-    # Determine which repo the patch targets (best-effort from file/repo).
-    repo = pending.get("repo") or "game" if "validate_commit" in pending.get("file", "") else "engine"
+    repo = pending.get("repo") or "engine"
     checkout, name = _resolve_repo_checkout(workspace, topic, repo)
-    diff = pending.get("diff") or ""  # the staged patch body (same key _exec_tool wrote)
+    diff = pending.get("diff") or ""
     if not os.path.isdir(os.path.join(checkout or "", ".git")):
         _update_card_text(app_id, app_secret, render,
                           f"⚠️ 无法定位该仓库 checkout（{name or '?'}），未应用补丁。")
         return 0
-    # Path whitelist is implicit: git apply runs inside the checkout dir only.
-    rc, out, err = _run_git(["apply", "--check"], checkout)
-    # Capture pre-apply HEAD for rollback.
     _, head_before, _ = _run_git(["rev-parse", "HEAD"], checkout)
-    # Apply via a temp patch file piped into git apply.
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
-        f.write(diff or "# empty")
+        f.write(diff or "# nothing to apply")
         patch_file = f.name
     rc2, out2, err2 = _run_git(["apply", patch_file], checkout)
-    import os as _os
-    _os.unlink(patch_file) if _os.path.exists(patch_file) else None
+    os.path.exists(patch_file) and os.unlink(patch_file)
     if rc2 != 0:
+        pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file",""), "failed", err2 or out2)
         _update_card_text(app_id, app_secret, render,
                           f"❌ 本地应用补丁失败: {err2 or out2}\n回复 `@撤销` 可回退。")
         return 0
-    # Record as applied (commit ref for rollback).
     pipeline_state.record_applied_patch(state_file, key, {
         "file": pending.get("file", ""), "repo": repo,
         "commit_before": head_before, "applied_at": "now",
     })
+    pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file",""), "ok", "@ok")
     _update_card_text(app_id, app_secret, render,
                       "✅ 补丁已应用到本地 checkout。\n"
                       "如需推送到远程 review 分支，回复 `@confirm push`。\n"
@@ -724,16 +838,17 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret):
     return 0
 
 
-def _confirm_push(key, topic, workspace, state_file, app_id, app_secret):
-    """User said @confirm push: push applied changes to the review branch (protected-safe)."""
+def _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor=""):
+    """User said @confirm push: push applied changes to the review branch.
+    Requires owner approval AND branch == topic.review_branch (not protected)."""
     render = topic.get("render_msg_id") or ""
     branch = topic.get("review_branch") or ""
-    if branch in PROTECTED_BRANCHES or not branch:
-        _update_card_text(app_id, app_secret, render,
-                          f"⚠️ 分支 `{branch or '?'}` 受保护或未知，拒绝推送。")
+    ok, why = _approve(key, topic, actor, "push_remote", branch=branch)
+    if not ok:
+        pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "denied", why)
+        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
         return 0
-    # Resolve checkout by engine (or first known repo).
-    checkout, name = _resolve_repo_checkout(workspace, topic, "engine")
+    checkout, _ = _resolve_repo_checkout(workspace, topic, "engine")
     if not os.path.isdir(os.path.join(checkout or "", ".git")):
         _update_card_text(app_id, app_secret, render, "⚠️ 无法定位仓库 checkout，未推送。")
         return 0
@@ -741,16 +856,23 @@ def _confirm_push(key, topic, workspace, state_file, app_id, app_secret):
     rc, out, err = _run_git(["commit", "-m", f"[codereview-agent] apply review fix for {key}"], checkout)
     rc, out, err = _run_git(["push", "origin", f"HEAD:{branch}"], checkout)
     if rc != 0:
+        pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "failed", err or out)
         _update_card_text(app_id, app_secret, render, f"❌ 推送失败: {err or out}")
         return 0
+    pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "ok", "@confirm push")
     _update_card_text(app_id, app_secret, render, f"✅ 已推送到远程分支 `{branch}`。可用 `@撤销` 回退。")
     return 0
 
 
-def _rollback(key, topic, workspace, state_file, app_id, app_secret):
-    """User said @撤销: revert the most recently applied local patch (git revert/checkout)."""
+def _rollback(key, topic, workspace, state_file, app_id, app_secret, actor=""):
+    """User said @撤销: revert the most recently applied local patch. Owner-only."""
     render = topic.get("render_msg_id") or ""
-    pipeline_state.set_pending_patch(state_file, key, None)  # drop any pending
+    ok, why = _approve(key, topic, actor, "rollback")
+    if not ok:
+        pipeline_state.append_approval(state_file, key, actor, "rollback", "", "denied", why)
+        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        return 0
+    pipeline_state.set_pending_patch(state_file, key, None)
     patch = pipeline_state.pop_last_applied_patch(state_file, key)
     if not patch:
         _update_card_text(app_id, app_secret, render, "ℹ️ 没有可回退的已应用补丁。")
@@ -760,6 +882,7 @@ def _rollback(key, topic, workspace, state_file, app_id, app_secret):
     before = patch.get("commit_before") or ""
     if before and os.path.isdir(os.path.join(checkout or "", ".git")):
         _run_git(["reset", "--hard", before], checkout)
+        pipeline_state.append_approval(state_file, key, actor, "rollback", patch.get("file",""), "ok", "@撤销")
         _update_card_text(app_id, app_secret, render, "✅ 已回退（本地 reset 到应用前）。")
     else:
         _update_card_text(app_id, app_secret, render, "⚠️ 补丁记录缺失 checkout，无法自动回退，请手动处理。")
@@ -962,6 +1085,7 @@ def main(argv=None):
     p.add_argument("--key", required=True, help="Parent topic message_id")
     p.add_argument("--reply", required=True, help="Reply text (command or question)")
     p.add_argument("--reply-msg-id", default="", help="The reply message id (unused; card updated by key)")
+    p.add_argument("--sender-id", default="", help="The user who sent the @/reply (approver for guarded actions)")
     p.add_argument("--workspace", default="/data/codereview/workspace")
     p.add_argument("--pipeline-state-file", default="")
 
