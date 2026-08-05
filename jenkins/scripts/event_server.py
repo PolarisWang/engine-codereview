@@ -221,6 +221,49 @@ def _handle_message_event(event):
 # callback URL. We register a handler for im.message.receive_v1 and normalize the
 # lark-oapi message dataclass into the same routing used by the webhook mode.
 
+def _sd(value):
+    """Return a truthy string (strip) or empty. Normalizes None/falsy."""
+    return "" if value is None else str(value).strip()
+
+
+def _sender_id_of(sender):
+    """Extract the replier's Feishu user id from a lark-oapi `Sender` object OR a
+    dict. Handles the several shapes Feishu can send (open_id is what we store on
+    topics as sender_id, so prefer it / the `id` field):
+      - Sender dataclass: sender.id (+ friendlier sender.id_type)
+      - dict: sender['id'] / sender['sender_id']['user_id'] / sender['owner_id']
+    Returns a plain str (possibly empty)."""
+    if sender is None:
+        return ""
+    # Object (lark-oapi Sender / any attr-based)
+    if not isinstance(sender, dict):
+        raw = getattr(sender, "id", None) or ""
+        idt = getattr(sender, "id_type", "") or ""
+        if raw:
+            # If id_type names open_id (or is unset), raw is almost always the id we want.
+            s = _sd(raw)
+            print(f"[event] sender: id={s!r} id_type={_sd(idt)!r} (attr)", flush=True)
+            return s
+        # Some events nest the real id under .sender_id(.id)
+        nested = getattr(sender, "sender_id", None)
+        if nested is not None:
+            s = _sd(getattr(nested, "id", None) or getattr(nested, "open_id", ""))
+            if s:
+                print(f"[event] sender: nested.id={s!r}", flush=True)
+                return s
+        return ""
+    # Dict shape (webhook-style / raw JSON event)
+    s = ""
+    sid = sender.get("id") or sender.get("open_id") or ""
+    if not sid and isinstance(sender.get("sender_id"), dict):
+        sid = sender["sender_id"].get("user_id") or sender["sender_id"].get("open_id") or ""
+    if not sid:
+        sid = sender.get("user_id") or sender.get("owner_id") or ""
+    s = _sd(sid)
+    print(f"[event] sender: id={s!r} (dict)", flush=True)
+    return s
+
+
 def _lark_message_to_route(lark_message):
     """Map a lark-oapi ws P2ImMessageReceiveV1.message onto the routing fields.
     Returns (msg_id, parent_id, chat_type, text, sender_id) or None if not group/text."""
@@ -230,9 +273,11 @@ def _lark_message_to_route(lark_message):
         msg_id = getattr(lark_message, "message_id", "") or ""
         parent_id = getattr(lark_message, "parent_id", "") or ""
         raw_content = getattr(lark_message, "content", "") or ""
-        # sender: lark message .sender is a dict-like with .id
         sender = getattr(lark_message, "sender", None)
-        sender_id = getattr(sender, "id", "") if sender else ""
+        sender_id = _sender_id_of(sender)
+        if not sender_id:
+            print("[event] WARN: no sender_id extracted from message (guarded actions "
+                  "like re_review/apply/close will be denied)", flush=True)
         if msg_type == "text":
             cd = json.loads(raw_content) if isinstance(raw_content, str) else (raw_content or {})
             text = (cd or {}).get("text", "")

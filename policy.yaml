@@ -19,9 +19,9 @@ agent:
 
   # 受控动作：需确认门控，且只有 topic 发起人可批准
   guarded:
-    # 触发重新审查（会重跑 code_reviewer，读资源）
+    # 触发重新审查（会重跑 code_reviewer，读资源）。发起人或管理员可触发。
     re_review:
-      approver: "topic_owner"
+      approver: "admin_or_owner"
 
     # 提议修复补丁（进入 pending_patch，等待 @ok）
     apply_patch:
