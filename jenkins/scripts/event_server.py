@@ -63,9 +63,19 @@ def _state_file():
 
 
 def _workspace():
+    # The reviewer (Jenkinsfile) writes review-result files to REVIEW_WORKSPACE
+    # (= $HOME/codereview-workspace). The interact phase must read findings from
+    # the SAME directory, or it finds none and wrongly reports "no findings".
+    # Prefer REVIEW_WORKSPACE (matches Jenkinsfile), then the de-facto workspace,
+    # and only treat the (possibly-stale) config base_dir as a last resort.
+    env_ws = os.environ.get("REVIEW_WORKSPACE", "")
+    if env_ws:
+        return env_ws
+    home_ws = os.path.join(os.path.expanduser("~") or "/root", "codereview-workspace")
+    if os.path.isdir(home_ws):
+        return home_ws
     cfg = _config()
-    return cfg.get("workspace", {}).get("base_dir") or \
-        os.environ.get("REVIEW_WORKSPACE", "/root/codereview-workspace")
+    return cfg.get("workspace", {}).get("base_dir") or "/root/codereview-workspace"
 
 
 app = None

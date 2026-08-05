@@ -71,9 +71,27 @@ with open(os.path.join(ws, "result_om_test_game.json"), "w") as f:
 
 print("1) isolated env ready: state=%s checkout=%s head=%s" % (sp, checkout, head_before[:8]))
 
-# capture card updates
+# capture card updates, and capture the plain-text answer that _finalize posts
+# as an independent reply-message (commit 51e067c: answers no longer overwrite
+# the card, they post a separate reply in the thread).
 cards = []
 o._update_card_text = lambda a, b, cid, text: cards.append(text)
+import base64 as _b64
+_orig_run_py = o._run_py
+
+
+def _fake_run_py(script, args):
+    # Intercept the reply-message subprocess so we can assert on the answer the
+    # bot would have posted, without actually calling feishu_notifier.py.
+    if script.endswith("feishu_notifier.py") and "reply-message" in args \
+            and "--message-base64" in args:
+        data = args[args.index("--message-base64") + 1]
+        cards.append(_b64.b64decode(data).decode("utf-8", "replace"))
+        return 0, "", ""
+    return _orig_run_py(script, args)
+
+
+o._run_py = _fake_run_py
 
 
 def mk(reply, sender_id=OWNER):

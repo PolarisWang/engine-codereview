@@ -498,7 +498,7 @@ def interact(args):
         return 0
     actor = getattr(args, "sender_id", "") or ""   # the person @-ing / approving
     render_id = topic.get("render_msg_id") or ""
-    eng_findings, gam_findings = _load_findings(workspace, key)
+    eng_findings, gam_findings, findings_status = _load_findings(workspace, key)
     all_findings = (eng_findings or []) + (gam_findings or [])
 
     # ── Confirmation gating (user replies to a staged action) ───────────────
@@ -550,6 +550,7 @@ def interact(args):
                 name = c.get("name")
                 inp = c.get("input") or {}
                 result, side_effect = _exec_tool(name, inp, topic, workspace, all_findings,
+                                                 findings_status,
                                                  state_file, api_key, base_url, model, actor)
                 all_msgs.append({"role": "user", "content": f"[tool {name} result]\n{result}"})
                 if side_effect:
@@ -569,14 +570,18 @@ def interact(args):
     return 0
 
 
-def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
-               api_key, base_url, model, actor=""):
+def _exec_tool(name, inp, topic, workspace, all_findings, findings_status,
+               state_file, api_key, base_url, model, actor=""):
     """Execute one agent tool. Returns (result_text, side_effect_bool)."""
     if name == "get_status":
         return _build_status_text(topic), False
     if name == "get_findings":
         if not all_findings:
-            # Distinguish "review failed/not done" from "reviewed clean" (issue B).
+            # Three distinct cases. Only a genuinely clean review (files present,
+            # zero findings) may be reported as "no issues".
+            if findings_status == "missing":
+                return (f"⚠️ 无法读取审查结果文件（workspace 里没有 result_{key_source(topic)}_<engine/game>.json）。"
+                        f"审查结果可能在其他 workspace，或文件已被清理。请先 `重新审查` 让 Jenkins 重新生成结果。"), False
             if (topic or {}).get("phase") in ("FAILED", "SCANNED") or (topic or {}).get("last_error"):
                 err = (topic or {}).get("last_error") or ""
                 return (f"⚠️ 该话题的审查未成功（phase={topic.get('phase')}）"
@@ -587,6 +592,8 @@ def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
                          for f in all_findings[:25]), False
     if name == "generate_patch_preview":
         if not all_findings:
+            if findings_status == "missing":
+                return "⚠️ 无法读取审查结果文件，无法生成补丁。请先 `重新审查`。", False
             if (topic or {}).get("phase") in ("FAILED", "SCANNED") or (topic or {}).get("last_error"):
                 return "⚠️ 该话题审查未成功，无 findings 可生成补丁。请先 `重新审查`。", False
         target = (inp.get("target") or "").strip()
@@ -911,17 +918,27 @@ def _rollback(key, topic, workspace, state_file, app_id, app_secret, actor=""):
 
 
 def _load_findings(workspace, key):
+    """Load findings for both repos from the workspace result files.
+
+    Returns (eng, gam, status) where status is one of:
+      - "ok":      at least one result file was read and parsed (findings may still
+                   legitimately be empty if the review was clean).
+      - "missing": no result file could be read — the caller must NOT report the
+                   review as "clean", because we simply could not see the results.
+    """
     eng = gam = []
+    found_any = False
     for repo in ("engine", "game"):
         p = os.path.join(workspace, f"result_{key}_{repo}.json")
         res = _read_json_file(p)
         if res and isinstance(res, dict):
+            found_any = True
             f = (res.get("review") or {}).get("findings") or []
             if repo == "engine":
                 eng = f
             else:
                 gam = f
-    return eng, gam
+    return eng, gam, ("ok" if found_any else "missing")
 
 
 def _answer_question(question, findings, api_key, base_url, model):
