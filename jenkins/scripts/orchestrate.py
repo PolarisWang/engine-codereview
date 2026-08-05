@@ -511,7 +511,7 @@ def interact(args):
             # stage #1: apply locally.
             return _confirm_apply(key, topic, workspace, state_file, app_id, app_secret)
         if low in ("@confirm push", "确认push", "@push"):
-            return _confirm_push(key, topic, state_file, app_id, app_secret)
+            return _confirm_push(key, topic, workspace, state_file, app_id, app_secret)
         if is_rollback:
             return _rollback(key, topic, workspace, state_file, app_id, app_secret)
 
@@ -658,6 +658,13 @@ def _resolve_repo_checkout(workspace, topic, repo):
     url = repos.get(repo) or (list(repos.values())[0] if repos else "")
     if not url:
         return None, None
+    # Convert scp-style (git@host:path/repo.git) to https so the basename is the
+    # real repo name — same rule code_reviewer.prepare_repo uses after ssh_to_https.
+    import re as _re
+    if url.startswith("git@"):
+        m = _re.match(r'git@([^:]+):(.+)', url)
+        if m:
+            url = f"https://{m.group(1)}/{m.group(2)}"
     name = url.rstrip("/").split("/")[-1].replace(".git", "")
     candidate = os.path.join(workspace, name)
     if os.path.isdir(os.path.join(candidate, ".git")):
@@ -684,7 +691,7 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret):
     # Determine which repo the patch targets (best-effort from file/repo).
     repo = pending.get("repo") or "game" if "validate_commit" in pending.get("file", "") else "engine"
     checkout, name = _resolve_repo_checkout(workspace, topic, repo)
-    diff = pending.get("_diff") or ""  # staged actual diff body
+    diff = pending.get("diff") or ""  # the staged patch body (same key _exec_tool wrote)
     if not os.path.isdir(os.path.join(checkout or "", ".git")):
         _update_card_text(app_id, app_secret, render,
                           f"⚠️ 无法定位该仓库 checkout（{name or '?'}），未应用补丁。")
@@ -717,7 +724,7 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret):
     return 0
 
 
-def _confirm_push(key, topic, state_file, app_id, app_secret):
+def _confirm_push(key, topic, workspace, state_file, app_id, app_secret):
     """User said @confirm push: push applied changes to the review branch (protected-safe)."""
     render = topic.get("render_msg_id") or ""
     branch = topic.get("review_branch") or ""
@@ -726,8 +733,7 @@ def _confirm_push(key, topic, state_file, app_id, app_secret):
                           f"⚠️ 分支 `{branch or '?'}` 受保护或未知，拒绝推送。")
         return 0
     # Resolve checkout by engine (or first known repo).
-    checkout, name = _resolve_repo_checkout(os.environ.get("CODEREVIEW_WORKSPACE", "/root/codereview-workspace"),
-                                            topic, "engine")
+    checkout, name = _resolve_repo_checkout(workspace, topic, "engine")
     if not os.path.isdir(os.path.join(checkout or "", ".git")):
         _update_card_text(app_id, app_secret, render, "⚠️ 无法定位仓库 checkout，未推送。")
         return 0
