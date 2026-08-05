@@ -192,4 +192,37 @@ assert len(h) >= 2, "at least the agent Q&A turns should persist"
 assert any("critical" in (m.get('content') or '') for m in h), "earlier agent memory should persist"
 print("   session memory preserved earlier turns OK")
 
+# ── 8) close_topic lifecycle: owner closes, intruder denied, closed topics skip review ──
+# Ensure the policy cache includes an admins/guarded entry for close_topic (used by _approve).
+def _with_admins(policy):
+    policy.setdefault("agent", {})
+    policy["agent"].setdefault("admins", ["ou_admin"])
+    policy["agent"].setdefault("guarded", {}).setdefault("close_topic", {"approver": "admin_or_owner"})
+    return policy
+o._POLICY_CACHE = _with_admins(o._load_policy())
+ti = ps.get_topic(sp, "om_test")
+# 8a) intruder tries to close -> denied, phase unchanged
+cards.clear()
+r, se = o._exec_tool("close_topic", {}, ti, ws, [], "ok", sp, "k", "u", "m", "ou_intruder")
+assert "⛔" in r and se is True, r
+assert ps.get_topic(sp, "om_test").get("phase") != "CLOSED", "intruder must not close"
+print("8a) close_topic intruder REFUSED OK |", r[:30].strip())
+# 8b) owner closes -> phase becomes CLOSED + audit
+cards.clear()
+r, se = o._exec_tool("close_topic", {"reason": "selftest"}, ps.get_topic(sp, "om_test"), ws, [], "ok", sp, "k", "u", "m", OWNER)
+t_closed = ps.get_topic(sp, "om_test")
+assert t_closed.get("phase") == "CLOSED" and t_closed.get("closed_by") == OWNER, t_closed
+assert any(e.get("action") == "close_topic" for e in t_closed.get("approval_log") or [])
+print("8b) close_topic owner CLOSED OK |", t_closed.get("closed_reason"))
+# 8c) replying to the now-CLOSED topic is swallowed with a reminder, not processed
+_agent_llm_orig = o._agent_llm
+o._agent_llm = lambda *a, **k: ("应该不会被处理", [])   # if this leaks through we fail
+captured_reply = []
+o._finalize = lambda key, ans, rid, msgs, sf, aid, sec: captured_reply.append(ans)
+o.interact(mk("1"))
+assert captured_reply and "已关闭" in captured_reply[-1], captured_reply
+o._finalize = None
+o._agent_llm = _agent_llm_orig
+print("8c) reply to closed topic -> reminder OK |", captured_reply[-1][:30].strip())
+
 print("\n=== ALL DESIGN-3 SELF-TESTS PASSED ===")

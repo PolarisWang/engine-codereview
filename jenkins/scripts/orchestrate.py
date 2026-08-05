@@ -137,6 +137,14 @@ def run(args):
 
     # 0. Ensure topic record exists.
     issue_key = ""   # resolved after jira parse below
+
+    # A CLOSED topic must never be re-reviewed (manual reset or scan re-run).
+    existing = pipeline_state.get_topic(state_file, key)
+    if existing is not None and pipeline_state.is_closed(existing):
+        _log('CLOSED', 'SKIP', key, existing.get("jira_key", ""), '', '',
+             f'closed (by {existing.get("closed_by","?")}): skip re-review')
+        return 0
+
     if mode == "manual":
         # Manual mode: key is the Jira URL.
         jira_url = key
@@ -321,6 +329,7 @@ def _append_fix_options(summary, branch):
         f"  - `1` 生成修复补丁预览\n"
         f"  - `2` 重新审查 `{branch}`\n"
         f"  - `3 <关键词>` 解释某个 finding\n"
+        f"  - `4` 关闭话题（发起人或管理员）\n"
         f"  - `/状态` 当前审查状态\n"
         f"  - 直接提问会自动按当前 diff 答疑"
     )
@@ -425,6 +434,15 @@ AGENT_TOOLS = [
                                                    "description": "file (or 'all') to fix"}},
                          "required": ["target"]},
     },
+    {
+        # Side-effect (terminal): closes the topic; only owner/admin may trigger.
+        "name": "close_topic",
+        "description": "Close this topic (terminate its lifecycle). After closing, the bot ignores further replies and the topic is skipped by scans. Only the topic owner OR an admin may take this action.",
+        "input_schema": {"type": "object",
+                         "properties": {"reason": {"type": "string",
+                                                   "description": "optional reason for closing"}},
+                         "required": []},
+    },
 ]
 
 AGENT_MAX_ROUNDS = 6           # max tool-call rounds per user message
@@ -468,6 +486,8 @@ def _agent_system(topic, api_key):
         "re_review/answer) freely; use their results to continue.\n"
         "- To change code, use apply_patch, which only PROPOSES — it is NOT executed "
         "automatically; the user must confirm with @ok, then @confirm push for remote.\n"
+        "- close_topic closes this topic; ONLY the topic owner or an admin may trigger it, "
+        "and the system will reject it otherwise.\n"
         "- Reply in Chinese, concise. When done, give a plain-text final answer.\n"
         f"- Topic context: {topic.get('jira_key','')} ({topic.get('project','')}), "
         f"branch {topic.get('review_branch','')} -> {topic.get('base_branch','')}."
@@ -498,6 +518,39 @@ def interact(args):
         return 0
     actor = getattr(args, "sender_id", "") or ""   # the person @-ing / approving
     render_id = topic.get("render_msg_id") or ""
+    low0 = (reply_text or "").lower().strip()
+
+    # ── Closed-topic handling (admin/owner close OR auto-silence) ─────────────
+    # A closed topic ignores further replies except @审计 (audit stays visible).
+    if pipeline_state.is_closed(topic):
+        if low0 in ("@审计", "@log", "审计"):
+            pass  # fall through to audit branch below
+        else:
+            reason = topic.get("closed_reason") or "已关闭"
+            _finalize(key, f"🔒 本话题已关闭（{reason}），不再处理。如需重新审查请新开话题。",
+                      render_id, [], state_file, app_id, app_secret)
+            return 0
+    else:
+        # Lazy auto-silence: DONE/FAILED with no new reply for N days -> auto close.
+        N_DAYS = 3
+        if topic.get("phase") in ("DONE", "FAILED"):
+            try:
+                import time as _time
+                upd = topic.get("updated_at") or ""
+                if upd:
+                    ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
+                    idle_days = (_time.time() - ts) / 86400.0
+                else:
+                    idle_days = N_DAYS + 1
+            except Exception:
+                idle_days = 0
+            if idle_days > N_DAYS:
+                pipeline_state.close_topic(state_file, key, closed_by="auto",
+                                           reason="3天无新回复自动静默")
+                _finalize(key, "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
+                          render_id, [], state_file, app_id, app_secret)
+                return 0
+
     eng_findings, gam_findings, findings_status = _load_findings(workspace, key)
     all_findings = (eng_findings or []) + (gam_findings or [])
 
@@ -610,6 +663,16 @@ def _exec_tool(name, inp, topic, workspace, all_findings, findings_status,
     if name == "answer":
         q = (inp.get("question") or "").strip()
         return _answer_question(q or "请补充说明", all_findings, api_key, base_url, model), False
+    if name == "close_topic":
+        # guarded: only topic owner OR admin may close (policy.yaml: close_topic ->
+        # approver admin_or_owner). Terminal side-effect — stops further processing.
+        ok, why = _approve(key_source(topic), topic, actor, "close_topic")
+        if not ok:
+            return f"⛔ {why}", True
+        reason = (inp.get("reason") or "").strip()[:200] or "用户请求关闭"
+        pipeline_state.close_topic(state_file, key_source(topic),
+                                   closed_by=actor or "unknown", reason=reason)
+        return "🔒 本话题已关闭，不再处理。如需重新审查请新开话题。", True
     if name == "apply_patch":
         # guarded: only topic_owner may PROPOSE applying a patch.
         ok, why = _approve(key_source(topic), topic, actor, "apply_patch")
@@ -766,6 +829,20 @@ def _approve(key, topic, actor, action, branch=""):
                 os.environ.get("PIPELINE_STATE_FILE", state_file_default(key, topic)), key,
                 actor, action, branch, "denied", f"actor!=owner ({actor}!={owner})")
             return False, "仅话题发起人可执行此操作"
+
+    if approver == "admin_or_owner":
+        # Allowed if actor is the topic owner OR is in the policy admins list.
+        admins = (policy.get("agent") or {}).get("admins") or []
+        if owner and actor == owner:
+            pass  # owner allowed
+        elif actor in admins:
+            pass  # admin allowed
+        else:
+            pipeline_state.append_approval(
+                os.environ.get("PIPELINE_STATE_FILE", state_file_default(key, topic)), key,
+                actor, action, branch, "denied",
+                f"not owner nor admin (owner={'yes' if owner else 'no'}, admin={'yes' if actor in admins else 'no'})")
+            return False, "仅有话题发起人或管理员可执行此操作"
 
     if action == "push_remote":
         want_branch = (rule.get("branch") or "").replace("{topic.review_branch}", topic.get("review_branch") or "")

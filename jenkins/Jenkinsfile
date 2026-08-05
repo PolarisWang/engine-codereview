@@ -154,6 +154,7 @@ pipeline {
                             --chat-id '${env.FEISHU_CHAT_ID}' \
                             --jira-host '${env.JIRA_HOST}' \
                             --state-file '${REVIEWED_STATE_FILE}' \
+                            --pipeline-state-file '${PIPELINE_STATE_FILE}' \
                             --output '${SCAN_RESULT_FILE}'
                     """
                     scanResult = readJSON(file: SCAN_RESULT_FILE)
@@ -174,10 +175,10 @@ pipeline {
                         if (termJson) {
                             def topics = readJSON(text: termJson)
                             if (topics instanceof List) {
-                                // DONE and SKIPPED are terminal (no auto-retry). FAILED is
-                                // retryable and handled by the backoff filter below.
+                                // DONE, SKIPPED and CLOSED are terminal (no auto-retry).
+                                // FAILED is retryable and handled by the backoff filter below.
                                 terminalKeys = topics.findAll { t ->
-                                    t.phase == 'DONE' || t.status == 'SKIPPED'
+                                    t.phase == 'DONE' || t.status == 'SKIPPED' || t.phase == 'CLOSED'
                                 }.collect { t -> t.message_id }
                             }
                         }
@@ -204,6 +205,7 @@ pipeline {
                         def st = topicStates[item.message_id]
                         if (st == null) return true
                         if (st.failed_exhausted == true) return false
+                        if (st.phase == 'CLOSED') return false   // closed = never re-review
                         if (st.phase != 'FAILED') return true
                         def nxt = (st.next_retry_at ?: '') as String
                         if (nxt == '') return true   // no schedule → allow immediate retry

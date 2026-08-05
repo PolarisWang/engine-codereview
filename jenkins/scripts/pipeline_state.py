@@ -56,7 +56,7 @@ SCHEMA_VERSION = 1
 # Ordered topic phases. FAILED is a terminal sink reachable from any non-DONE
 # phase; phase order is enforced so we cannot accidentally jump backwards.
 PHASE_ORDER = ["SCANNED", "PARSING", "REVIEWING", "NOTIFYING", "DONE"]
-TERMINAL_PHASES = {"DONE", "FAILED"}
+TERMINAL_PHASES = {"DONE", "FAILED", "CLOSED"}
 REPO_STATUSES = {"PENDING", "RUNNING", "SKIPPED", "SUCCESS", "FAILED"}
 VALID_REPOS = ("engine", "game")
 
@@ -148,6 +148,10 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         "pending_patch": None,      # {"file","diff","repo","created_at", "push_pending": bool} awaiting @ok/@confirm push
         "applied_patches": [],      # list of {"file","diff","repo","commit","applied_at"}
         "approval_log": [],         # audit: {"actor","action","target","time","result"}
+        # Closed lifecycle (admin/owner or auto-silence): terminal, ignores further replies.
+        "closed_by": "",            # actor or "auto"
+        "closed_at": "",            # ISO
+        "closed_reason": "",        # human/auto note
     }
 
 
@@ -224,6 +228,10 @@ def transition(path, key, *, to, status, last_error="", render_msg_id=None,
         state["topics"][key] = topic
 
     prev = topic.get("phase", "SCANNED")
+    # CLOSED is a hard terminal state: nothing may transition out of it (no retry,
+    # no re-open). FAILED stays retryable via reset_for_retry().
+    if prev == "CLOSED":
+        raise ValueError("cannot leave terminal phase CLOSED")
     # Enforce ordering: reject backward jumps (except FAILED as a sink).
     if to not in TERMINAL_PHASES:
         old_idx = PHASE_ORDER.index(prev) if prev in PHASE_ORDER else -1
@@ -294,6 +302,36 @@ def record_failure(path, key, error=""):
     state["updated_at"] = _now_iso()
     save_state(state, path)
     return topic
+
+
+def close_topic(path, key, *, closed_by="", reason=""):
+    """
+    Mark a topic CLOSED (hard terminal state). CLOSED topics ignore further
+    replies and are skipped by scan/review. Bypasses transition() on purpose:
+    mirrors record_failure by writing phase/status directly. Writes an audit
+    entry to approval_log. Returns the topic dict.
+    """
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    topic["phase"] = "CLOSED"
+    topic["status"] = "CLOSED"
+    topic["closed_by"] = closed_by or ""
+    topic["closed_reason"] = reason or ""
+    topic["closed_at"] = _now_iso()
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    # Audit trail (append after save so a failed save doesn't double-log).
+    append_approval(path, key, closed_by or "auto", "close_topic",
+                    target="", result="ok", note=reason or "topic closed")
+    return topic
+
+
+def is_closed(topic):
+    """True if a topic record is in the hard-terminated CLOSED state."""
+    return bool(topic) and (topic.get("phase") == "CLOSED")
 
 
 def can_retry(path, key):

@@ -4,6 +4,11 @@
 # 修改边界 = 改这个文件，不改代码。
 
 agent:
+  # 管理员：可对 guarded 动作（如 关闭话题）代替 topic 发起人放行。
+  # 填入 Feishu 用户 id（事件消息的 sender_id，形如 ou_xxxxxxxx...）。
+  admins:
+    - "ou_ADMIN_PLACEHOLDER_REPLACE"
+
   # 只读工具：任何群成员 @ 都可触发（不改东西）
   invoke_anyone:
     - get_status
@@ -37,6 +42,10 @@ agent:
     rollback:
       approver: "topic_owner"
       confirm: ["@撤销", "@revert", "撤销", "回退"]
+
+    # 关闭话题（终止生命周期）。发起人或 admins 列表中的管理员可触发。
+    close_topic:
+      approver: "admin_or_owner"
 
 # 并发
 lock:

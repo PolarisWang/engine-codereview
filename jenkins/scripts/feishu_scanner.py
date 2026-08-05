@@ -83,6 +83,10 @@ def main():
                         "oc_254e95f0687245b9df82ab8bf823ca54"))
     parser.add_argument("--jira-host", default=os.environ.get("JIRA_HOST", ""))
     parser.add_argument("--state-file", default="/tmp/codereview-feishu-state.json")
+    parser.add_argument("--pipeline-state-file", default="",
+                        help="Optional path to the topic pipeline state; when set, "
+                             "already-CLOSED topic message_ids are filtered out of the "
+                             "candidate list (defense-in-depth closure guard).")
     parser.add_argument("--output", default="/tmp/codereview-scan-result.json")
     args = parser.parse_args()
 
@@ -233,6 +237,21 @@ def main():
             json.dump(state, f, indent=2)
     else:
         print("[feishu] Scan incomplete (API error) — cursor NOT advanced, will retry", file=sys.stderr)
+
+    # ── Defense-in-depth: drop topics already CLOSED in the pipeline state ──
+    if args.pipeline_state_file:
+        try:
+            with open(args.pipeline_state_file, encoding="utf-8") as f:
+                pstate = json.load(f)
+            topics = pstate.get("topics") or {}
+            closed_ids = {k for k, t in topics.items() if (t or {}).get("phase") == "CLOSED"}
+            if closed_ids:
+                before = len(items)
+                items = [it for it in items if it.get("message_id") not in closed_ids]
+                if len(items) != before:
+                    print(f"[feishu] skipped {before - len(items)} CLOSED topic(s)", flush=True)
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("[feishu] could not read pipeline state for CLOSED filter; continuing", file=sys.stderr)
 
     # ── Write output ──
     result = {
