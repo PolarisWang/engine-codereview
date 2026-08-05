@@ -401,6 +401,7 @@ class CardAwareClient:
     """
     def __init__(self, ws_client):
         self._wsc = ws_client
+        self._orig = ws_client._handle_data_frame   # keep the REAL handler (bound)
         self._on_card = None   # optional callback: async def _on_card(payload_bytes)
 
     async def _handle_data_frame(self, frame):
@@ -436,8 +437,9 @@ class CardAwareClient:
             frame.payload = JSON.marshal(resp).encode(UTF_8)
             await self._wsc._write_message(frame.SerializeToString())
             return
-        # Non-CARD: preserve the original EVENT/other handling.
-        await self._wsc._handle_data_frame(frame)
+        # Non-CARD: preserve the original EVENT/other handling (delegate to the
+        # REAL handler captured before we replaced the attribute).
+        return await self._orig(frame)
 
 
 def _hijack_card(ws_client):
