@@ -42,9 +42,16 @@ popd >/dev/null
 if [ -d "$DEST/.git" ]; then
     echo ">> syncing shared checkout to $REMOTE/$BRANCH"
     git -C "$DEST" fetch "$REMOTE" "$BRANCH" 2>/dev/null || \
-        { echo "[apply] WARN: fetch failed (no net?) — trying local reset only"; }
+        { echo "[apply] WARN: fetch failed (no net?) — will reset to existing origin/main"; }
     BEFORE=$(git -C "$DEST" rev-parse --short HEAD 2>/dev/null || echo "?")
-    git -C "$DEST" reset --hard "$REMOTE/$BRANCH"
+    # Use FETCH_HEAD (the just-fetched commit) so we never reset to a stale
+    # origin/main when the local remote-tracking ref lags behind the fetch.
+    if git -C "$DEST" rev-parse FETCH_HEAD >/dev/null 2>&1; then
+        TARGET="FETCH_HEAD"
+    else
+        TARGET="$REMOTE/$BRANCH"
+    fi
+    git -C "$DEST" reset --hard "$TARGET"
     AFTER=$(git -C "$DEST" rev-parse --short HEAD 2>/dev/null || echo "?")
 else
     echo "[apply] ERROR: $DEST is not a git checkout; nothing to do."
