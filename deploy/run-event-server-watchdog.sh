@@ -26,7 +26,7 @@ set -u
 
 SCRIPTS_DIR="/home/jenkins/workspace/code-review-pipeline/jenkins/scripts"
 ENV_FILE="${ENV_FILE:-/tmp/ev-env.sh}"
-BOT_CMD="python3 -B event_server.py --mode ws"
+BOT_PY="$SCRIPTS_DIR/event_server.py"
 PID_FILE="${PID_FILE:-/var/run/ev-server-watchdog.pid}"
 LOG_DIR="/tmp/ev-server-logs"
 
@@ -60,19 +60,25 @@ cd "$SCRIPTS_DIR" || { echo "[watchdog] cannot cd $SCRIPTS_DIR"; exit 1; }
 find_bot_pid() {
     # Match only the real bot process (exclude this watchdog's own subshells by
     # filtering for the literal python entry point).
-    pgrep -f "python3 -B event_server.py --mode ws" 2>/dev/null
+    pgrep -f "python3 -B ${SCRIPTS_DIR}/event_server.py --mode ws" 2>/dev/null
 }
 
 launch_bot() {
     local ts log
     ts=$(date +%Y%m%d-%H%M%S)
     log="$LOG_DIR/ev-server-$ts.log"
+    # Use an absolute path to the script and re-check the cwd, so a transient fs
+    # hiccup during the loop cannot make us launch a non-existent relative file.
+    if [ ! -f "$BOT_PY" ]; then
+        echo "[watchdog] BOT_PY missing: $BOT_PY; will retry" >&2
+        return 1
+    fi
     echo "[watchdog] $(date '+%F %T') starting bot -> $log"
-    setsid nohup $BOT_CMD > "$log" 2>&1 < /dev/null &
+    setsid nohup python3 -B "$BOT_PY" --mode ws > "$log" 2>&1 < /dev/null &
     echo $! > /var/run/ev-server.pid
 }
 
-echo "[watchdog] ($(date '+%F %T')) supervisor up; monitoring '$BOT_CMD' (bot pid: $(find_bot_pid | tr '\n' ' '))"
+echo "[watchdog] ($(date '+%F %T')) supervisor up; monitoring '$BOT_PY' (bot pid: $(find_bot_pid | tr '\n' ' '))"
 
 while true; do
     if [ -z "$(find_bot_pid)" ]; then
