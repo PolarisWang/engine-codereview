@@ -45,6 +45,12 @@ from pipeline_state import log_line
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", ".."))
 
+# Shared workspace (arch-D): both the interaction layer and the Jenkins executor
+# only see a CONSISTENT workspace so a topic's checkout + result files are shared.
+# The persistent volume /var/lib/report-server/daily is bind-mounted into the agent
+# container at the same path, so it survives restarts and is reachable from Jenkins.
+_DEFAULT_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
+
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -660,10 +666,16 @@ def _exec_tool(name, inp, topic, workspace, all_findings, findings_status,
         ok, why = _approve(key_source(topic), topic, actor, "re_review")
         if not ok:
             return f"⛔ {why}", True
-        jira_url = topic.get("jira_url") or key_source(topic)
-        _spawn_rerun(key_source(topic), workspace, state_file, jira_url,
-                     _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"))
-        return "已触发重新审查（后台运行），结果会更新到本帖。", False
+        # arch-D: enqueue a re_review for the Jenkins executor (the only role with
+        # GitLab/Jira creds to pull real code); do NOT run it here (no creds).
+        pipeline_state.set_pending(state_file, key_source(topic), "re_review")
+        msg = ("⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查，结果会自动更新到本帖。")
+        try:
+            _finalize(key_source(topic), msg, topic.get("render_msg_id") or "",
+                      [], state_file, _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"))
+            return "", True
+        except Exception:
+            return msg, True
     if name == "answer":
         q = (inp.get("question") or "").strip()
         return _answer_question(q or "请补充说明", all_findings, api_key, base_url, model), False
@@ -902,8 +914,11 @@ def _run_git(args, cwd):
 
 
 def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor=""):
-    """User said @ok: apply the staged pending_patch to the LOCAL checkout (git apply).
-    Only the topic owner may approve (defense-in-depth layer 3)."""
+    """@ok — approve applying the staged patch. In arch-D this does NOT run git
+    locally: it writes a pending 'apply' action for the Jenkins executor (the
+    only role with GitLab creds / the shared checkout), then reports 'recorded'.
+    Approval still happens here (defense-in-depth), so only the owner/admin can
+    enqueue an apply."""
     render = topic.get("render_msg_id") or ""
     ok, why = _approve(key, topic, actor, "apply_local")
     if not ok:
@@ -912,41 +927,24 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor=
         return 0
     pending = topic.get("pending_patch") or {}
     if not pending:
+        _update_card_text(app_id, app_secret, render, "ℹ️ 没有待应用的补丁，无需操作。")
         return 0
-    repo = pending.get("repo") or "engine"
-    checkout, name = _resolve_repo_checkout(workspace, topic, repo)
-    diff = pending.get("diff") or ""
-    if not os.path.isdir(os.path.join(checkout or "", ".git")):
-        _update_card_text(app_id, app_secret, render,
-                          f"⚠️ 无法定位该仓库 checkout（{name or '?'}），未应用补丁。")
-        return 0
-    _, head_before, _ = _run_git(["rev-parse", "HEAD"], checkout)
-    import tempfile
-    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
-        f.write(diff or "# nothing to apply")
-        patch_file = f.name
-    rc2, out2, err2 = _run_git(["apply", patch_file], checkout)
-    os.path.exists(patch_file) and os.unlink(patch_file)
-    if rc2 != 0:
-        pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file",""), "failed", err2 or out2)
-        _update_card_text(app_id, app_secret, render,
-                          f"❌ 本地应用补丁失败: {err2 or out2}\n回复 `@撤销` 可回退。")
-        return 0
-    pipeline_state.record_applied_patch(state_file, key, {
-        "file": pending.get("file", ""), "repo": repo,
-        "commit_before": head_before, "applied_at": "now",
+    # Record intent; the Jenkins executor applies it to the shared checkout.
+    pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file", ""), "ok", "@ok enqueued")
+    pipeline_state.set_pending(state_file, key, "apply", patch={
+        "file": pending.get("file", ""), "repo": pending.get("repo", "engine"), "diff": pending.get("diff", ""),
     })
-    pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file",""), "ok", "@ok")
+    pipeline_state.set_pending_patch(state_file, key, None)  # now owned by the executor
     _update_card_text(app_id, app_secret, render,
-                      "✅ 补丁已应用到本地 checkout。\n"
-                      "如需推送到远程 review 分支，回复 `@confirm push`。\n"
-                      "如需回退，回复 `@撤销`。")
+                      "⏳ 已记录应用请求，Jenkins 将把补丁应用到共享 checkout。\n"
+                      "完成后会更新本帖。如需推送远程，届时再回复 `@confirm push`。")
     return 0
 
 
 def _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor=""):
-    """User said @confirm push: push applied changes to the review branch.
-    Requires owner approval AND branch == topic.review_branch (not protected)."""
+    """@confirm push — approve pushing applied changes to the review branch.
+    arch-D: records a pending 'push' for the Jenkins executor (only role with
+    GitLab creds), rather than pushing locally. Approval still enforced here."""
     render = topic.get("render_msg_id") or ""
     branch = topic.get("review_branch") or ""
     ok, why = _approve(key, topic, actor, "push_remote", branch=branch)
@@ -954,45 +952,188 @@ def _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor="
         pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "denied", why)
         _update_card_text(app_id, app_secret, render, f"⛔ {why}")
         return 0
-    checkout, _ = _resolve_repo_checkout(workspace, topic, "engine")
-    if not os.path.isdir(os.path.join(checkout or "", ".git")):
-        _update_card_text(app_id, app_secret, render, "⚠️ 无法定位仓库 checkout，未推送。")
-        return 0
-    rc, out, err = _run_git(["add", "-A"], checkout)
-    rc, out, err = _run_git(["commit", "-m", f"[codereview-agent] apply review fix for {key}"], checkout)
-    rc, out, err = _run_git(["push", "origin", f"HEAD:{branch}"], checkout)
-    if rc != 0:
-        pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "failed", err or out)
-        _update_card_text(app_id, app_secret, render, f"❌ 推送失败: {err or out}")
-        return 0
-    pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "ok", "@confirm push")
-    _update_card_text(app_id, app_secret, render, f"✅ 已推送到远程分支 `{branch}`。可用 `@撤销` 回退。")
+    pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "ok", "@confirm push enqueued")
+    pipeline_state.set_pending(state_file, key, "push")
+    _update_card_text(app_id, app_secret, render,
+                      "⏳ 已记录推送请求，Jenkins 将把已应用的改动推到远程分支 `{branch}`。".format(branch=branch))
     return 0
 
 
 def _rollback(key, topic, workspace, state_file, app_id, app_secret, actor=""):
-    """User said @撤销: revert the most recently applied local patch. Owner-only."""
+    """@撤销 — revert the most recently applied local patch. Owner-only.
+    arch-D: enqueues a pending 'rollback' for the Jenkins executor."""
     render = topic.get("render_msg_id") or ""
     ok, why = _approve(key, topic, actor, "rollback")
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "rollback", "", "denied", why)
         _update_card_text(app_id, app_secret, render, f"⛔ {why}")
         return 0
-    pipeline_state.set_pending_patch(state_file, key, None)
-    patch = pipeline_state.pop_last_applied_patch(state_file, key)
-    if not patch:
-        _update_card_text(app_id, app_secret, render, "ℹ️ 没有可回退的已应用补丁。")
-        return 0
-    repo = patch.get("repo", "engine")
-    checkout, _ = _resolve_repo_checkout(workspace, topic, repo)
-    before = patch.get("commit_before") or ""
-    if before and os.path.isdir(os.path.join(checkout or "", ".git")):
-        _run_git(["reset", "--hard", before], checkout)
-        pipeline_state.append_approval(state_file, key, actor, "rollback", patch.get("file",""), "ok", "@撤销")
-        _update_card_text(app_id, app_secret, render, "✅ 已回退（本地 reset 到应用前）。")
-    else:
-        _update_card_text(app_id, app_secret, render, "⚠️ 补丁记录缺失 checkout，无法自动回退，请手动处理。")
+    pipeline_state.set_pending(state_file, key, "rollback")
+    pipeline_state.append_approval(state_file, key, actor, "rollback", "", "ok", "@撤销 enqueued")
+    _update_card_text(app_id, app_secret, render,
+                      "⏳ 已记录回退请求，Jenkins 将回退最近一次应用的补丁。")
     return 0
+
+
+# ── Async executor (arch-D): Jenkins consumes topic.pending and executes it ────
+#
+# The interaction layer only enqueues intents (re_review/apply/push/rollback); the
+# Jenkins scan/scheduled job calls consume_pending() for each topic with a pending
+# action. It is the ONLY place that touches the git checkout / runs the review,
+# because it has the full GitLab/Jira creds and a shared, consistent checkout.
+# Returns a human-readable result per action.
+
+def _ensure_shared_checkout(topic, repo, workspace):
+    """Locate (or lazily create) the shared repo checkout for a topic using the
+    engine/game repo URLs recorded on the topic. Returns (dirname, None) or
+    (None, error). Uses `workspace` as the base; both interaction & executor must
+    point at the SAME workspace (shared bind) so state/checkout stay consistent."""
+    url = ""
+    for r in ("engine", "game"):
+        if repo == r:
+            url = topic.get(f"{r}_repo") or topic.get("repos", {}).get(r, {}).get("repo_url") or ""
+            break
+    if not url:
+        return None, f"no repo_url recorded for '{repo}'"
+    checkout, name = _resolve_repo_checkout(workspace, topic, repo)
+    # If not present, clone it (executor may need credentials via git env).
+    if not os.path.isdir(os.path.join(checkout or "", ".git")):
+        try:
+            rc, out, err = _run_py("code_reviewer.py", [
+                "--repo", url, "--branch", topic.get("review_branch") or "",
+                "--base-branch", topic.get("base_branch") or "", "--dry",
+                "--workspace", workspace, "--output", os.path.join(workspace, f"dry_{repo}.json")])
+            if rc != 0:
+                return None, f"checkout prep failed: {err[:150]}"
+        except Exception as e:
+            return None, f"checkout prep error: {e}"
+    return checkout, None
+
+
+def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenkins"):
+    """Execute a topic's pending action. Returns (ok, message). Caller (Jenkins)
+    is expected to hold the per-topic cross-process lock already."""
+    topic = pipeline_state.get_topic(state_file, key)
+    if topic is None:
+        return False, "topic not found"
+    pending = topic.get("pending")
+    if not pending:
+        return False, "no pending action"
+    action = pending.get("action")
+    render = topic.get("render_msg_id") or ""
+
+    if action == "re_review":
+        # Re-run the full review (Jenkins has creds). Reuse the run() pipeline.
+        jira_url = topic.get("jira_url") or key
+        _log('EXEC', 'REREVIEW', key, topic.get("jira_key", ""), '', '', 'consuming pending re_review')
+        # Reset terminal phase so run() can re-run, then run the review.
+        if topic.get("phase") in ("DONE", "FAILED"):
+            pipeline_state.reset_for_retry(state_file, key)
+        rc = _run_review_subprocess(key, jira_url, workspace, state_file)
+        ok = rc == 0
+        pipeline_state.clear_pending(state_file, key)
+        return ok, "re_review executed, review complete" if ok else f"re_review failed rc={rc}"
+
+    if action == "apply":
+        patch = pending.get("patch") or topic.get("pending_patch") or {}
+        diff = patch.get("diff") or ""
+        repo = patch.get("repo") or "engine"
+        file = patch.get("file") or ""
+        if not diff:
+            pipeline_state.clear_pending(state_file, key)
+            return False, "apply: no diff recorded"
+        checkout, err = _ensure_shared_checkout(topic, repo, workspace)
+        if err:
+            pipeline_state.clear_pending(state_file, key)
+            return False, f"apply: {err}"
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+            f.write(diff)
+            patch_file = f.name
+        _, head_before, _ = _run_git(["rev-parse", "HEAD"], checkout)
+        rc2, out2, err2 = _run_git(["apply", patch_file], checkout)
+        os.path.exists(patch_file) and os.unlink(patch_file)
+        if rc2 != 0:
+            pipeline_state.clear_pending(state_file, key)
+            return False, f"apply: git apply failed: {err2 or out2}"
+        pipeline_state.record_applied_patch(state_file, key, {
+            "file": file, "repo": repo, "commit_before": head_before, "applied_at": "now",
+        })
+        pipeline_state.append_approval(state_file, key, actor, "apply_local", file, "ok", "executor applied")
+        pipeline_state.clear_pending(state_file, key)
+        return True, f"applied patch to {file} (commit {head_before[:8]})"
+
+    if action == "push":
+        branch = topic.get("review_branch") or ""
+        if not branch:
+            pipeline_state.clear_pending(state_file, key)
+            return False, "push: no review_branch"
+        checkout, err = _ensure_shared_checkout(topic, "engine", workspace)
+        if err:
+            pipeline_state.clear_pending(state_file, key)
+            return False, f"push: {err}"
+        _run_git(["add", "-A"], checkout)
+        _run_git(["commit", "-m", f"[codereview-agent] apply review fix for {key}"], checkout)
+        rc, out, err = _run_git(["push", "origin", f"HEAD:{branch}"], checkout)
+        if rc != 0:
+            pipeline_state.clear_pending(state_file, key)
+            return False, f"push: failed: {err or out}"
+        pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "ok", "executor pushed")
+        pipeline_state.clear_pending(state_file, key)
+        return True, f"pushed to {branch}"
+
+    if action == "rollback":
+        patch = pipeline_state.pop_last_applied_patch(state_file, key)
+        if not patch:
+            pipeline_state.clear_pending(state_file, key)
+            return False, "rollback: nothing to revert"
+        repo = patch.get("repo", "engine")
+        checkout, err = _ensure_shared_checkout(topic, repo, workspace)
+        if err:
+            pipeline_state.clear_pending(state_file, key)
+            return False, f"rollback: {err}"
+        before = patch.get("commit_before") or ""
+        if before and os.path.isdir(os.path.join(checkout or "", ".git")):
+            _run_git(["reset", "--hard", before], checkout)
+            pipeline_state.append_approval(state_file, key, actor, "rollback", patch.get("file",""), "ok", "executor rolled back")
+        pipeline_state.clear_pending(state_file, key)
+        return True, ("rolled back to " + before[:8]) if before else "rolled back"
+
+    pipeline_state.clear_pending(state_file, key)
+    return False, f"unknown pending action: {action}"
+
+
+def _run_review_subprocess(key, jira_url, workspace, state_file):
+    """Run the full review pipeline for a topic in a subprocess (reviewer has the
+    creds needed). Returns rc."""
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            [sys.executable, os.path.join(SCRIPTS_DIR, "orchestrate.py"), "run",
+             "--key", key, "--mode", "scan", "--jira-url", jira_url,
+             "--workspace", workspace, "--pipeline-state-file", state_file],
+            capture_output=True, text=True, timeout=1800)
+        return r.returncode
+    except Exception as e:
+        print(f"[executor] re_review subprocess error: {e}", file=sys.stderr)
+        return 1
+
+
+def consume_all_pending(state_file, workspace, app_id, app_secret, lock_dir=None):
+    """Jenkins entry: consume every topic's pending action, serialized per topic
+    with a cross-process lock. Returns a dict {key: (ok, message)}."""
+    lock_dir = lock_dir or pipeline_state.DEFAULT_LOCK_DIR()
+    results = {}
+    for key, _pending in pipeline_state.list_pending_topics(state_file):
+        try:
+            with pipeline_state.topic_lock_context(lock_dir, key):
+                ok, msg = consume_pending(key, state_file, workspace, app_id, app_secret)
+                results[key] = (ok, msg)
+        except Exception as e:
+            results[key] = (False, f"executor error: {e}")
+    return results
+
+
 
 
 
@@ -1188,7 +1329,7 @@ def main(argv=None):
     p = sub.add_parser("run", help="Run the full pipeline for one topic")
     p.add_argument("--key", required=True)
     p.add_argument("--mode", default="scan", choices=["scan", "manual"])
-    p.add_argument("--workspace", default="/data/codereview/workspace")
+    p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
     p.add_argument("--pipeline-state-file", default="")
     # scan-mode source fields (used only when creating the topic record)
     p.add_argument("--jira-key", default="")
@@ -1202,14 +1343,27 @@ def main(argv=None):
     p.add_argument("--reply", required=True, help="Reply text (command or question)")
     p.add_argument("--reply-msg-id", default="", help="The reply message id (unused; card updated by key)")
     p.add_argument("--sender-id", default="", help="The user who sent the @/reply (approver for guarded actions)")
-    p.add_argument("--workspace", default="/data/codereview/workspace")
+    p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
     p.add_argument("--pipeline-state-file", default="")
+
+    p = sub.add_parser("consume", help="[arch-D executor] consume pending actions for all topics")
+    p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
+    p.add_argument("--pipeline-state-file", default="")
+    p.add_argument("--lock-dir", default="")
 
     args = parser.parse_args(argv)
     if args.command == "run":
         sys.exit(run(args))
     elif args.command == "interact":
         sys.exit(interact(args))
+    elif args.command == "consume":
+        lock_dir = getattr(args, "lock_dir", "") or pipeline_state.DEFAULT_LOCK_DIR()
+        results = consume_all_pending(args.pipeline_state_file, args.workspace,
+                                      _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"),
+                                      lock_dir=lock_dir)
+        for k, (ok, msg) in results.items():
+            print(f"[executor] {k}: {'OK' if ok else 'FAIL'} — {msg}", flush=True)
+        sys.exit(0 if results else 1)
 
 
 if __name__ == "__main__":

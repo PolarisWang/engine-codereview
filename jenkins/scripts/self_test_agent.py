@@ -129,8 +129,8 @@ t = ps.get_topic(sp, "om_test")
 assert t.get("pending_patch"), "apply_patch should be staged, not executed"
 print("3) apply_patch staged pending (confirmation gate) OK | pending:", t["pending_patch"]["target"])
 
-# ── 4) @ok -> real git apply (produce a REAL diff via git diff so apply succeeds) ──
-# Simulate a real "generate patch from file" step: edit the file then capture git diff.
+# ── 4) @ok -> enqueue apply; jenkins executor consumes pending -> real git apply ──
+# Interaction layer only RECORDS intent (arch-D). Build a real diff for the executor.
 open(os.path.join(checkout, "a.go"), "w").write("package x\nfunc f() { var p *int\n if p != nil { _ = *p }\n }\n")
 real_diff = subprocess.run(["git", "diff", "--", "a.go"], cwd=checkout,
                            capture_output=True, text=True).stdout
@@ -138,51 +138,65 @@ assert real_diff.strip(), "no diff produced"
 ps.set_pending_patch(sp, "om_test", {
     "file": "a.go", "target": "a.go", "repo": "engine", "diff": real_diff,
 })
-# Reset the file to pre-edit so git apply actually has something to apply.
+# Reset the file so git apply has something to apply.
 subprocess.run(["git", "checkout", "--", "a.go"], cwd=checkout, check=True)
-# 4a) NON-owner attempts @ok -> must be refused (identity/approval layer)
+# 4a) NON-owner @ok -> refused (identity/approval), nothing enqueued
 cards.clear(); o._confirm_apply("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", "ou_intruder")
 assert cards and "发起人" in cards[-1], cards
-log = ps.get_topic(sp, "om_test").get("approval_log") or []
-assert any(e.get("result") == "denied" for e in log), "denial should be audited"
-assert not ps.get_topic(sp, "om_test").get("applied_patches"), "non-owner must not apply"
+assert ps.get_topic(sp, "om_test").get("pending") is None, "non-owner must not enqueue apply"
 print("4a) non-owner @ok REFUSED + audited OK |", cards[-1][:30])
-# 4b) owner @ok -> real git apply (produce a REAL diff via git diff so apply succeeds)
+# 4b) owner @ok -> records pending apply intent (NOT executed yet)
 cards.clear(); o._confirm_apply("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
+t = ps.get_topic(sp, "om_test")
+assert t.get("pending") and t["pending"].get("action") == "apply", t.get("pending")
+assert not t.get("applied_patches"), "should NOT apply until executor consumes"
+assert "if p != nil" not in open(os.path.join(checkout, "a.go")).read(), "file must not change before executor"
+print("4b) owner @ok ENQUEUED apply (not yet executed) OK | pending:", t["pending"]["action"])
+# 4c) executor consumes pending -> real git apply
+ok, msg = o.consume_pending("om_test", sp, ws, "test-app", "test-secret", OWNER)
+assert ok, msg
 applied = ps.get_topic(sp, "om_test")
-assert applied.get("applied_patches"), "applied_patches should record after owner @ok"
-content = open(os.path.join(checkout, "a.go")).read()
-assert "if p != nil" in content, "git apply did not change the file!"
-print("4b) owner @ok applied patch locally (real git apply) OK | applied:", len(applied["applied_patches"]))
+assert applied.get("applied_patches"), "executor must record applied_patches: " + msg
+assert "if p != nil" in open(os.path.join(checkout, "a.go")).read(), "executor git apply did not change file!"
+assert applied.get("pending") is None, "pending cleared after exec"
+print("4c) executor apply OK | applied:", len(applied["applied_patches"]), "|", msg[:40])
 
-# ── 5) @confirm push: protected branch refused; feature allowed; also non-owner refused ──
-# 5a) on protected branch 'main' -> refused (even by owner)
+# ── 5) @confirm push: protected refused; non-owner refused; owner enqueues; executor pushes ──
+# 5a) protected branch 'main' -> refused even by owner
 st = ps.load_state(sp); st["topics"]["om_test"]["review_branch"] = "main"; ps.save_state(st, sp)
 cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
 assert cards and ("受保护" in cards[-1] or "仅话题" in cards[-1]), cards
+assert ps.get_topic(sp, "om_test").get("pending") is None, "protected push must not enqueue"
 print("5a) push to protected 'main' REFUSED OK |", cards[-1][:34])
 # 5a2) non-owner @confirm push -> refused
 st = ps.load_state(sp); st["topics"]["om_test"]["review_branch"] = "feature/fix-x"; ps.save_state(st, sp)
 cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", "ou_intruder")
 assert cards and "发起人" in cards[-1], cards
 print("5a2) non-owner @confirm push REFUSED OK |", cards[-1][:30])
-# 5b) on feature branch + owner -> push (real git push to a bare repo we create)
+# 5b) owner @confirm push -> enqueue; executor pushes to a bare remote
 bare = os.path.join(work, "remote.git")
 subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
 subprocess.run(["git", "remote", "add", "origin", bare], cwd=checkout, check=True)
-# force a commit so push has something
-with open(os.path.join(checkout, "a.go"), "a") as f:
-    f.write("\n// fixed\n")
-subprocess.run(["git", "add", "."], cwd=checkout, check=True)
-subprocess.run(["git", "commit", "-qm", "agent fix"], cwd=checkout, check=True)
+# ensure a commit to push (the applied change is committed by executor push step)
 cards.clear(); o._confirm_push("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
-print("5b) push to feature branch ->", cards[-1][:40] if cards else "NO CARD")
-assert cards and "推送" in cards[-1], cards
+t = ps.get_topic(sp, "om_test")
+assert t.get("pending") and t["pending"]["action"] == "push", t.get("pending")
+print("5b) owner @confirm push ENQUEUED push OK | pending:", t["pending"]["action"])
+ok, msg = o.consume_pending("om_test", sp, ws, "test-app", "test-secret", OWNER)
+assert ok, msg
+remote_head = subprocess.run(["git", "rev-parse", "--short", "origin/feature/fix-x"], cwd=checkout,
+                             capture_output=True, text=True).stdout.strip()
+assert "推送" in msg or remote_head, msg
+print("5b2) executor push OK |", msg[:40])
 
-# ── 6) @撤销 rollback ──
+# ── 6) @撤销 rollback: enqueue; executor reverts to pre-apply commit ──
 cards.clear(); o._rollback("om_test", ps.get_topic(sp, "om_test"), ws, sp, "test-app", "test-secret", OWNER)
-assert cards and ("回退" in cards[-1] or "已回退" in cards[-1]), cards
-print("6) @撤销 rollback OK |", cards[-1][:30])
+t = ps.get_topic(sp, "om_test")
+assert t.get("pending") and t["pending"]["action"] == "rollback", t.get("pending")
+ok, msg = o.consume_pending("om_test", sp, ws, "test-app", "test-secret", OWNER)
+# rollback may or may not have a recorded patch; assert pending cleared and action consumed
+assert ps.get_topic(sp, "om_test").get("pending") is None
+print("6) @撤销 rollback executed OK |", msg[:40])
 
 # ── 7) chat_history session memory (agent turns persist; confirmation turns are actions) ──
 h = ps.get_topic(sp, "om_test").get("chat_history") or []

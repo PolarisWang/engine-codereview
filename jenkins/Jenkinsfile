@@ -108,7 +108,10 @@ pipeline {
         PYTHON = sh(script: "which python3 2>/dev/null || which python 2>/dev/null || echo '/usr/bin/python3'", returnStdout: true).trim()
         SCRIPTS_DIR = "${env.WORKSPACE}/jenkins/scripts"
         CONFIG_FILE = "${env.WORKSPACE}/config.yaml"
-        REVIEW_WORKSPACE = "${env.HOME}/codereview-workspace"
+        // arch-D shared workspace: Jenkins (executor) and the event server (interaction)
+        // must use the SAME path so a topic's checkout + result files are consistent.
+        REVIEW_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
+        LOCK_DIR = "/var/lib/report-server/daily/cr-locks"
         SCAN_RESULT_FILE = "${env.WORKSPACE}/scan_result.json"
         PARSED_INFO_FILE = "${env.WORKSPACE}/parsed_info.json"
         ENGINE_RESULT_FILE = "${env.WORKSPACE}/engine_result.json"
@@ -291,6 +294,17 @@ pipeline {
                         processedCount++
                     }
                 }
+
+                // arch-D executor: consume pending actions (re_review / apply / push
+                // / rollback) that the interaction layer enqueued. Runs here so the
+                // exec side always has full GitLab/Jira creds + the shared workspace.
+                echo "[executor] consuming pending topic actions..."
+                sh script: """
+                    ${PYTHON} ${SCRIPTS_DIR}/orchestrate.py consume \
+                        --workspace '${REVIEW_WORKSPACE}' \
+                        --pipeline-state-file '${PIPELINE_STATE_FILE}' \
+                        --lock-dir '${LOCK_DIR}'
+                """, returnStatus: true
             }
         }
 

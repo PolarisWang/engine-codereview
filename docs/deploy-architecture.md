@@ -2,7 +2,46 @@
 
 > 这是唯一权威的部署/运维文档。其他提到「systemd 常驻」的旧文档已过时，仅作历史参考。
 
+## 〇、架构-D：交互与执行解耦（当前架构）
+
+**交互（事件服务器）与执行（Jenkins）分离**，通过共享持久化的 pipeline-state + 共享 workspace 协作：
+
+```
+事件服务器（实时，只写"意图"，无 GitLab/Jira 凭证）:
+  收消息 → 识别指令 → 权限/审计 → 写 topic.pending 到 state → 回文案
+         （新话题/重审/apply/push/rollback 都只写意图，不真正执行）
+        │  共享 persistence：/var/lib/report-server/daily（bind 进容器）
+        ▼
+Jenkins code-review-scan（每分钟，有凭证，consume 队列）:
+  读 state 里所有 topic.pending → 逐个执行:
+        re_review → 拉真 diff 重新审查
+        apply     → 在共享 checkout git apply
+        push      → 共享 checkout commit + push（GitLab 凭证在此）
+        rollback  → 共享 checkout reset
+  完成后写回结果 + 清 pending
+```
+
+**这解决的核心问题**：
+- 重审/提交真正能拉到代码（凭证在 Jenkins），不再因事件服务器缺凭证而"缓存重放"。
+- 交互实时（文案秒回）、写操作异步（等下一个每分钟 scan 执行）。你已确认接受此取舍。
+- **分布式适配**：事件服务器（消息入口）与执行（Jenkins）天然解耦，可多 worker、排队、背压。
+
+**关键文件**：
+- `pipeline_state.py`：`pending` 字段 + `set/get/clear_pending` + `list_pending_topics` + `topic_lock_context`（per-topic 跨进程 `flock`，锁目录默认 `/var/lib/report-server/daily/cr-locks`）。
+- `orchestrate.py`：`consume_pending` / `consume_all_pending`（执行器）；`_confirm_apply/_confirm_push/_rollback/re_review` 均改为「写 pending 意图 + 回已记录」，不再本地执行。
+- 共享 workspace：`/var/lib/report-server/daily/cr-workspace`（事件服务器与 Jenkins 都用它，保证同一份 checkout/结果文件）。
+- `Jenkinsfile`：`code-review-scan` 里新增 `orchestrate.py consume` 一步，消费所有 pending。
+
+**workspace 释放策略**（"什么时候释放"）：
+- `ops/cleanup.sh`：把 `CLOSED` 且超过保留期（默认 30 天）的话题归档到 `topics_archive`，并删除其 `result_*.json`（若仍被活跃话题引用则保留）。默认 dry-run，`--apply` 才真正执行。
+- repo checkout 随 topic 归档/无引用后由清理脚本一并释放（同一共享 workspace）。
+- 保留期可调 `--retention N`。建议并入 host cron 每天跑一次 `--apply`。
+
+---
+
 ## 一、整体拓扑
+
+（原拓扑以"交互↔执行分离"为准，见上节；下述为运行/部署层面的物理关系）
 
 ```
 ┌─ 开发/配置层（host）──────────────────────────────────┐

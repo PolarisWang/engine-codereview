@@ -148,6 +148,11 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         "pending_patch": None,      # {"file","diff","repo","created_at", "push_pending": bool} awaiting @ok/@confirm push
         "applied_patches": [],      # list of {"file","diff","repo","commit","applied_at"}
         "approval_log": [],         # audit: {"actor","action","target","time","result"}
+        # Async work queue (arch-D): intent the interaction layer wrote for the
+        # Jenkins executor to consume. None when idle; one of an action marker:
+        #   {"action":"re_review"} / {"action":"apply","patch":{...}} /
+        #   {"action":"push"} / {"action":"rollback"}
+        "pending": None,
         # Closed lifecycle (admin/owner or auto-silence): terminal, ignores further replies.
         "closed_by": "",            # actor or "auto"
         "closed_at": "",            # ISO
@@ -494,6 +499,90 @@ def set_pending_patch(path, key, patch):
     state["updated_at"] = _now_iso()
     save_state(state, path)
     return topic
+
+
+# ── Async work queue (arch-D: interaction writes intent, Jenkins consumes) ────
+
+def set_pending(path, key, action, patch=None):
+    """Write an async action marker for the Jenkins executor to consume. `action`
+    is one of: re_review | apply | push | rollback. `patch` is carried only for
+    apply (the suggested diff the executor should git-apply). Returns the topic."""
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    entry = {"action": action}
+    if patch:
+        entry["patch"] = patch
+    topic["pending"] = entry
+    topic["updated_at"] = _now_iso()
+    state["updated_at"] = _now_iso()
+    save_state(state, path)
+    return topic
+
+
+def get_pending(path, key):
+    """Return the topic's pending action dict, or None."""
+    t = get_topic(path, key)
+    return (t or {}).get("pending")
+
+
+def clear_pending(path, key):
+    """Clear the topic's pending action (executor finished). Records nothing extra."""
+    state = load_state(path)
+    topic = state["topics"].get(key)
+    if topic is None:
+        return None
+    if topic.get("pending") is not None:
+        topic["pending"] = None
+        topic["updated_at"] = _now_iso()
+        state["updated_at"] = _now_iso()
+        save_state(state, path)
+    return topic
+
+
+def list_pending_topics(path):
+    """Return [(key, pending_dict), ...] for every topic with a non-empty pending
+    action — this is the queue the Jenkins executor consumes."""
+    state = load_state(path)
+    out = []
+    for k, t in (state.get("topics") or {}).items():
+        p = t.get("pending")
+        if p:
+            out.append((k, p))
+    return out
+
+
+def topic_lock_context(lock_dir, key):
+    """Cross-process, per-topic advisory lock via flock on a shared lock file.
+
+    Both the interaction layer (event server) and the executor (Jenkins) take this
+    lock around state + checkout mutations for the SAME topic, so the multi-round
+    'maybe apply, maybe not' state is serialized across processes. Yields a file
+    object that releases the lock on close/exit.
+
+    Usage:
+        with pipeline_state.topic_lock_context(lock_dir, key):
+            ... mutate topic state / checkout ...
+    """
+    import contextlib, fcntl, os as _os
+    _os.makedirs(lock_dir, exist_ok=True)
+    lock_path = _os.path.join(lock_dir, f"{key}.lock")
+    lock_file = open(lock_path, "a+")
+
+    @contextlib.contextmanager
+    def _locked():
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock_file.close()
+
+    return _locked()
+
+
+def DEFAULT_LOCK_DIR():
+    return "/var/lib/report-server/daily/cr-locks"
 
 
 def record_applied_patch(path, key, patch):
