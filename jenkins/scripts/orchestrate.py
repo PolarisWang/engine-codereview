@@ -658,11 +658,20 @@ def _confirm_patch_card(patch):
 
 
 def _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret):
-    """Persist chat history + update the same card with the final answer."""
+    """Persist chat history + post the answer as an INDEPENDENT reply in the topic
+    thread (reply-message), so it does NOT overwrite the review result card.
+    (Confirmation-gate actions still update the shared card via _update_card_text.)"""
     pipeline_state.append_chat(state_file, key, {"role": "user", "content": "（本轮交互）"})
     pipeline_state.append_chat(state_file, key, {"role": "assistant", "content": answer})
-    if answer and render_id and app_id and app_secret:
-        _update_card_text(app_id, app_secret, render_id, answer)
+    if not answer:
+        return
+    if not (app_id and app_secret):
+        _log("CHAT", "SKIP", key, "", "", "", "no feishu creds; reply skipped")
+        return
+    chat_id = _env("FEISHU_CHAT_ID")
+    _run_py("feishu_notifier.py", [
+        "reply-message", "--app-id", app_id, "--app-secret", app_secret,
+        "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(answer)])
 
 
 # ── Guarded side-effect executors (design-3): local apply + remote push + rollback ──
