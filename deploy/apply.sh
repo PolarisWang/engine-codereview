@@ -28,6 +28,13 @@ for a in "$@"; do
     esac
 done
 STARTUP="$DEST/deploy/startup.sh"
+# Container sees /home/jenkins (bind of host /home/jenkins/cr), so translate the
+# host DEST path into the container-visible path for docker exec.
+STARTUP_CONT="${STARTUP#/home/jenkins/cr}"     # -> /workspace/... or /home/... if not under cr
+case "$STARTUP" in
+    /home/jenkins/cr/*) STARTUP_CONT="/home/jenkins${STARTUP#/home/jenkins/cr}" ;;
+    *)                  STARTUP_CONT="$STARTUP" ;;
+esac
 
 echo "==== apply.sh ($(date '+%F %T')) ===="
 echo "authoritative repo : $REPO_DIR_DEV"
@@ -69,8 +76,8 @@ rsync -a "$REPO_DIR_DEV/deploy/" "$DEST/deploy/" 2>/dev/null || cp -a "$REPO_DIR
 
 # 4. Restart the service chain: only if code changed, or --force.
 if [ "$BEFORE" != "$AFTER" ] || [ "$FORCE" = "1" ]; then
-    echo ">> restarting event-server chain via startup.sh"
-    docker exec "$CONTAINER" bash "$STARTUP"
+    echo ">> restarting event-server chain via startup.sh (container path: $STARTUP_CONT)"
+    docker exec "$CONTAINER" bash "$STARTUP_CONT"
 else
     echo ">> no change (HEAD = $AFTER); skipping restart (use --force to force)."
 fi
