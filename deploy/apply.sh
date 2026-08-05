@@ -16,17 +16,18 @@
 set -euo pipefail
 
 REPO_DIR_DEV="$(cd "$(dirname "$0")/.." && pwd)"          # this repo (authoritative)
-DEST="${1:-/home/jenkins/cr/workspace/code-review-pipeline}"  # shared/container checkout
+DEST="/home/jenkins/cr/workspace/code-review-pipeline"      # shared/container checkout (default)
 CONTAINER="${CONTAINER:-chaos-agent-cr}"
-STARTUP="$DEST/deploy/startup.sh"
 REMOTE="${REMOTE:-origin}"
 BRANCH="${BRANCH:-main}"
 FORCE="0"
 for a in "$@"; do
     case "$a" in
-        --force|force) FORCE="1" ;;
+        --force|force)  FORCE="1" ;;
+        --dest=*)       DEST="${a#*=}" ;;
     esac
 done
+STARTUP="$DEST/deploy/startup.sh"
 
 echo "==== apply.sh ($(date '+%F %T')) ===="
 echo "authoritative repo : $REPO_DIR_DEV"
