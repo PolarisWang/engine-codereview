@@ -300,13 +300,21 @@ def _topic_lock(topic_key):
 
 
 def _route(msg_id, parent_id, text, sender_id=""):
-    """Shared single-link routing: new topic with Jira -> run; reply -> interact.
-    Same-topic replies are serialized via a per-topic lock."""
-    base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
+    """Shared single-link routing.
+
+    - New topic (no parent, has Jira URL): NOT reviewed here. The event server
+      runs without Jira/GitLab credentials, so an inline review would always fail;
+      the Jenkins scanner cron picks up new group topics and reviews with full
+      credentials. This keeps review ownership with Jenkins (single-link, no cred
+      duplication) and lets the event server act purely as the message/interact hub.
+    - Reply / @bot on an existing topic: route to interact (only needs FEISHU +
+      ANTHROPIC env, which the event server has). Same-topic replies are
+      serialized via a per-topic lock.
+    """
     if not parent_id:
         if _is_jira_topic(text):
-            print(f"[event] NEW TOPIC {msg_id}: {text[:80]}", flush=True)
-            _run_orchestrate(["run", "--key", msg_id, "--mode", "scan", "--text", text[:200]] + base)
+            # Review is owned by the Jenkins scanner; acknowledge here.
+            print(f"[event] NEW TOPIC {msg_id}: {text[:80]} (handing review to scanner)", flush=True)
         else:
             print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
@@ -317,6 +325,7 @@ def _route(msg_id, parent_id, text, sender_id=""):
             if not acquired:
                 print(f"[event] topic {parent_id} busy, skip this reply", file=sys.stderr)
                 return
+            base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
             _run_orchestrate(["interact", "--key", parent_id, "--reply", text[:500],
                               "--reply-msg-id", msg_id, "--sender-id", sender_id] + base)
         finally:

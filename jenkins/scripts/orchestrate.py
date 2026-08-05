@@ -576,10 +576,19 @@ def _exec_tool(name, inp, topic, workspace, all_findings, state_file,
         return _build_status_text(topic), False
     if name == "get_findings":
         if not all_findings:
-            return "（该话题暂无 findings）", False
+            # Distinguish "review failed/not done" from "reviewed clean" (issue B).
+            if (topic or {}).get("phase") in ("FAILED", "SCANNED") or (topic or {}).get("last_error"):
+                err = (topic or {}).get("last_error") or ""
+                return (f"⚠️ 该话题的审查未成功（phase={topic.get('phase')}）"
+                        f"{('：' + err[:80]) if err else ''}，因此暂无 findings。"
+                        f"发起人可回复 `重新审查` 让 Jenkins 重跑。"), False
+            return "（该话题审查通过，确实没有发现代码问题——无 findings。）", False
         return "\n".join(f"- [{f.get('severity')}] {f.get('file')}: {f.get('issue','')}"
                          for f in all_findings[:25]), False
     if name == "generate_patch_preview":
+        if not all_findings:
+            if (topic or {}).get("phase") in ("FAILED", "SCANNED") or (topic or {}).get("last_error"):
+                return "⚠️ 该话题审查未成功，无 findings 可生成补丁。请先 `重新审查`。", False
         target = (inp.get("target") or "").strip()
         return _build_patch_preview_target(all_findings, target), False
     if name == "re_review":
