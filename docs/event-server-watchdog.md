@@ -1,5 +1,7 @@
 # Event server (Feishu bot) 自愈 watchdog
 
+> ⚠️ **权威文档见 `deploy-architecture.md`**。本文是 watchdog 单项的补充细节。
+
 `deploy/run-event-server-watchdog.sh` 是对 code-review 事件服务（`event_server.py --mode ws`）
 的进程级自愈监督进程。它确保 **bot 进程崩溃 / 被 OOM-kill / 被误 kill 时被自动重新拉起**，
 并以正确的运行环境（Feishu / ANTHROPIC / cwd）重启，避免"静默失联"。

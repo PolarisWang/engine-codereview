@@ -1,3 +1,10 @@
+# ⚠️ DEPRECATED for the current agent-container deployment.
+#
+# This systemd unit targets a HOST path (/home/debian/agent/engine-codereview) and a
+# host-persistent service. The bot is actually deployed INSIDE the Jenkins-agent
+# container and supervised by deploy/run-event-server-watchdog.sh (see docs/
+# deploy-architecture.md). This file is kept only as an alternative/legacy option
+# (e.g. running on a dedicated host with systemd) — it is NOT installed here.
 [Unit]
 Description=Feishu Code Review Event Server (real-time interaction)
 After=network.target

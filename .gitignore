@@ -1,6 +1,12 @@
 # Secrets & Environment
 .env
 .env.*
+# Real persisted env (secrets) — the .example template IS committed.
+deploy/env/env.sh
+deploy/env/*.env
+!deploy/env/.env.example
+# Container/persistent runtime (if ever copied locally)
+cr-env/
 
 # Historical investigation notes (not part of the codebase)
 BUILD_5695_5696_ANSWER.md

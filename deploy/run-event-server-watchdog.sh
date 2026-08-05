@@ -25,7 +25,7 @@
 set -u
 
 SCRIPTS_DIR="/home/jenkins/workspace/code-review-pipeline/jenkins/scripts"
-ENV_FILE="${ENV_FILE:-/tmp/ev-env.sh}"
+ENV_FILE="${ENV_FILE:-/var/lib/report-server/daily/cr-env/env.sh}"
 BOT_PY="$SCRIPTS_DIR/event_server.py"
 PID_FILE="${PID_FILE:-/var/run/ev-server-watchdog.pid}"
 LOG_DIR="/tmp/ev-server-logs"
