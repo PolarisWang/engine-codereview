@@ -305,6 +305,16 @@ pipeline {
                         --pipeline-state-file '${PIPELINE_STATE_FILE}' \
                         --lock-dir '${LOCK_DIR}'
                 """, returnStatus: true
+
+                // arch-C: refresh MR GitLab CI status onto cards for recently-active
+                // topics (read-only; GitLab token comes from this job's env).
+                echo "[executor] refreshing MR CI status..."
+                sh script: """
+                    ${PYTHON} ${SCRIPTS_DIR}/orchestrate.py ci-poll \
+                        --workspace '${REVIEW_WORKSPACE}' \
+                        --pipeline-state-file '${PIPELINE_STATE_FILE}' \
+                        --refresh-minutes 15
+                """, returnStatus: true
             }
         }
 

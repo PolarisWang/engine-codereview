@@ -1164,6 +1164,43 @@ def consume_all_pending(state_file, workspace, app_id, app_secret, lock_dir=None
     return results
 
 
+def poll_ci_all(state_file, workspace, refresh_minutes=15):
+    """arch-C: refresh MR CI status onto topic cards for recently-active topics
+    that have an mr_url. Deduped by cmd_ci (only posts on change). Returns a dict
+    {key: (posted_bool, status)}. Called by the Jenkins scan tick."""
+    state = pipeline_state.load_state(state_file)
+    posted = {}
+    for key, t in (state.get("topics") or {}).items():
+        if not t.get("mr_url"):
+            continue
+        # Only poll topics someone did something with recently (bounded API load).
+        import time
+        try:
+            upd = t.get("updated_at") or ""
+            ts = time.mktime(time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            ts = 0
+        if time.time() - ts > refresh_minutes * 60:
+            continue
+        try:
+            rc = cmd_ci_silent(key, state_file, workspace)
+            posted[key] = (rc == 0, "ok" if rc == 0 else "err")
+        except Exception as e:
+            posted[key] = (False, f"err: {e}")
+    return posted
+
+
+def cmd_ci_silent(key, state_file, workspace):
+    """Thin wrapper to run cmd_ci via its args-object."""
+    class _A:
+        pass
+    a = _A(); a.key = key; a.workspace = workspace; a.pipeline_state_file = state_file
+    return cmd_ci(a)
+
+
+
+
+
 def cmd_action(args):
     """arch-A: apply a card-button action (re_review/apply_patch/close_topic) to a
     topic, with the button clicker's open_id as the actor. Reuses the guarded
@@ -1221,6 +1258,46 @@ def cmd_action(args):
     else:
         print(f"[action] unknown action: {action}", flush=True)
         return 1
+    return 0
+
+
+def cmd_ci(args):
+    """arch-C: refresh a topic's MR GitLab CI status onto its card (read-only)."""
+    key = args.key
+    state_file = args.pipeline_state_file or os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
+    topic = pipeline_state.get_topic(state_file, key)
+    if topic is None:
+        print(f"[ci] topic not found: {key}", flush=True)
+        return 1
+    mr_url = topic.get("mr_url") or ""
+    app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
+    if not mr_url:
+        print(f"[ci] topic {key} has no mr_url", flush=True)
+        return 1
+    import gitlab_ci
+    block = gitlab_ci.render_ci_card_block(mr_url)
+    # Dedup: only push a card update when the CI status changed since last poll,
+    # so an idle pipeline doesn't re-post an identical card every scan tick.
+    summary = gitlab_ci.pipeline_summary(mr_url)
+    new_status = f"{summary.get('status')}::{summary.get('pipeline_id')}"
+    if topic.get("ci_status") == new_status:
+        print(f"[ci] {key}: unchanged ({new_status})", flush=True)
+        return 0
+    print(f"[ci] {key}: {block.replace(chr(10), ' ')[:150]}", flush=True)
+    render = topic.get("render_msg_id")
+    if render and app_id and app_secret:
+        base = feishu_notifier.render_state_card(pipeline_state.get_topic(state_file, key))
+        _run_py("feishu_notifier.py", [
+            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", render, "--message-base64",
+            _b64_str(base + "\n\n---\n" + block)])
+    # record last reported status to prevent repeat posts
+    st = pipeline_state.load_state(state_file)
+    topic2 = st["topics"].get(key)
+    if topic2 is not None:
+        topic2["ci_status"] = new_status
+        st["updated_at"] = pipeline_state._now_iso()
+        pipeline_state.save_state(st, state_file)
     return 0
 
 
@@ -1447,6 +1524,16 @@ def main(argv=None):
     p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
     p.add_argument("--pipeline-state-file", default="")
 
+    p = sub.add_parser("ci", help="[arch-C] refresh a topic's MR GitLab CI status onto its card")
+    p.add_argument("--key", required=True, help="topic message_id")
+    p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
+    p.add_argument("--pipeline-state-file", default="")
+
+    p = sub.add_parser("ci-poll", help="[arch-C] refresh CI status for recently-active topics with mr_url")
+    p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
+    p.add_argument("--pipeline-state-file", default="")
+    p.add_argument("--refresh-minutes", type=int, default=15)
+
     args = parser.parse_args(argv)
     if args.command == "run":
         sys.exit(run(args))
@@ -1462,6 +1549,14 @@ def main(argv=None):
         sys.exit(0 if results else 1)
     elif args.command == "action":
         sys.exit(cmd_action(args))
+    elif args.command == "ci":
+        sys.exit(cmd_ci(args))
+    elif args.command == "ci-poll":
+        res = poll_ci_all(args.pipeline_state_file, args.workspace,
+                          refresh_minutes=getattr(args, "refresh_minutes", 15))
+        for k, (posted, st) in res.items():
+            print(f"[ci-poll] {k}: {'posted' if posted else 'skip'} {st}", flush=True)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
