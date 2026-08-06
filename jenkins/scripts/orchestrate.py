@@ -1143,6 +1143,66 @@ def consume_all_pending(state_file, workspace, app_id, app_secret, lock_dir=None
     return results
 
 
+def cmd_action(args):
+    """arch-A: apply a card-button action (re_review/apply_patch/close_topic) to a
+    topic, with the button clicker's open_id as the actor. Reuses the guarded
+    logic so approval + audit + arch-D pending enqueue all behave as if via @回复."""
+    key = args.key
+    action = args.action
+    actor = getattr(args, "sender_id", "") or ""
+    state_file = args.pipeline_state_file or os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
+    workspace = args.workspace
+    topic = pipeline_state.get_topic(state_file, key)
+    if topic is None:
+        print(f"[action] topic not found: {key}", flush=True)
+        return 1
+    render = topic.get("render_msg_id") or ""
+    app_id, app_secret = _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET")
+
+    if action == "re_review":
+        ok, why = _approve(key, topic, actor, "re_review")
+        if not ok:
+            _update_card_text(app_id, app_secret, render, f"⛔ {why}", topic_key=key)
+            return 1
+        pipeline_state.set_pending(state_file, key, "re_review")
+        _update_card_text(app_id, app_secret, render,
+                          "⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查。", topic_key=key)
+        print(f"[action] re_review enqueued by {actor}", flush=True)
+    elif action == "close_topic":
+        ok, why = _approve(key, topic, actor, "close_topic")
+        if not ok:
+            _update_card_text(app_id, app_secret, render, f"⛔ {why}", topic_key=key)
+            return 1
+        pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户点击关闭按钮")
+        _update_card_text(app_id, app_secret, render,
+                          "🔒 本话题已关闭，不再处理。", topic_key=key)
+        print(f"[action] closed by {actor}", flush=True)
+    elif action == "apply_patch":
+        ok, why = _approve(key, topic, actor, "apply_patch")
+        if not ok:
+            _update_card_text(app_id, app_secret, render, f"⛔ {why}", topic_key=key)
+            return 1
+        print(f"[action] apply_patch: propose patch (findings-based) staged by {actor}", flush=True)
+        # phase-C1: propose a patch preview from existing findings (not applied).
+        eng, gam, status = _load_findings(workspace, key)
+        all_f = (eng or []) + (gam or [])
+        patch = _build_patch_target(all_f, "all")
+        if patch.get("diff", "").strip() and all_f:
+            pipeline_state.set_pending_patch(state_file, key, {
+                "file": "all", "target": "all", "repo": "engine", "diff": patch.get("diff", ""),
+            })
+            _update_card_text(app_id, app_secret, render,
+                              "✏️ 已提议修复补丁预览（未应用）。如确认请回复 `@ok` 让 Jenkins 应用，再 `@confirm push` 推送。",
+                              topic_key=key)
+        else:
+            _update_card_text(app_id, app_secret, render,
+                              "ℹ️ 当前没有可生成补丁的 findings。", topic_key=key)
+    else:
+        print(f"[action] unknown action: {action}", flush=True)
+        return 1
+    return 0
+
+
 
 
 
@@ -1360,6 +1420,13 @@ def main(argv=None):
     p.add_argument("--pipeline-state-file", default="")
     p.add_argument("--lock-dir", default="")
 
+    p = sub.add_parser("action", help="[arch-A] apply a card-button action to a topic (with actor)")
+    p.add_argument("--key", required=True, help="topic message_id")
+    p.add_argument("--action", required=True, help="re_review | apply_patch | close_topic")
+    p.add_argument("--sender-id", default="", help="the button clicker's open_id (actor for approval)")
+    p.add_argument("--workspace", default=_DEFAULT_WORKSPACE)
+    p.add_argument("--pipeline-state-file", default="")
+
     args = parser.parse_args(argv)
     if args.command == "run":
         sys.exit(run(args))
@@ -1373,6 +1440,8 @@ def main(argv=None):
         for k, (ok, msg) in results.items():
             print(f"[executor] {k}: {'OK' if ok else 'FAIL'} — {msg}", flush=True)
         sys.exit(0 if results else 1)
+    elif args.command == "action":
+        sys.exit(cmd_action(args))
 
 
 if __name__ == "__main__":

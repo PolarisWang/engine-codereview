@@ -206,6 +206,35 @@ def _handle_message_event(event):
     _route(msg_id, parent_id, text, sender_id)
 
 
+def on_p2_card_action_trigger(data):
+    """WS handler for card.action.trigger (user clicked a button on an interactive
+    card). Maps to the same interaction path as an @reply: actor = operator.open_id,
+    value={action, topic}. Returns a P2CardActionTriggerResponse (ack)."""
+    try:
+        ev = getattr(data, "event", None)          # P2CardActionTriggerData
+        operator = getattr(ev, "operator", None)
+        action = getattr(ev, "action", None)
+        actor = (getattr(operator, "open_id", "") or "").strip()
+        value = (getattr(action, "value", None) or {}) or {}
+        act = str(value.get("action", ""))
+        topic = str(value.get("topic", ""))
+        print(f"[card] button click action={act} topic={topic} actor={actor}", flush=True)
+        if act and topic and actor:
+            base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
+            _run_orchestrate(["action", "--key", topic, "--action", act,
+                              "--sender-id", actor] + base)
+        else:
+            print(f"[card] incomplete button payload: action={act!r} topic={topic!r} actor={actor!r}",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"[card] handler error: {e}", file=sys.stderr)
+    try:
+        from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+        return P2CardActionTriggerResponse()
+    except Exception:
+        return None
+
+
 # ── Long-connection (WebSocket) mode — no public callback URL needed ─────────
 #
 # Feishu's open platform supports receiving events over a persistent WebSocket
@@ -472,6 +501,7 @@ def run_ws():
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     handler = EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_p2_im_message_receive) \
+        .register_p2_card_action_trigger(on_p2_card_action_trigger) \
         .build()
     client = WSClient(app_id=app_id, app_secret=app_secret,
                       log_level=lark_oapi.LogLevel.INFO,
