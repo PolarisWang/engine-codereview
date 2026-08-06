@@ -615,7 +615,12 @@ def interact(args):
 
     # ── Reliable command routing (arch: 1/2/3/4 + keywords go to FIXED actions, not
     #    LLM guesses). Matches whole-word / prefix so "2" always = re-review, etc. ──
-    word = low.strip().split()[0] if low.strip() else ""
+    # Drop a leading @-mention (e.g. "@_user_1 MR ...", "@机器人 1") so the first
+    # real command token is used for matching.
+    cmd = low.strip()
+    import re as _re
+    cmd = _re.sub(r'^@[\w.\-]+', '', cmd).strip()
+    word = cmd.split()[0] if cmd else ""
     if word in ("1", "补丁", "生成补丁", "修复"):
         # Propose a fix patch for the findings (suggestion-based, staged for later).
         return _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
@@ -674,9 +679,10 @@ def interact(args):
                   state_file, app_id, app_secret)
         return 0
 
-    # Loop exhausted.
-    _finalize(key, "已达本轮工具调用上限，请分步询问。", render_id, all_msgs,
-              state_file, app_id, app_secret)
+    # Loop exhausted without plain text — give a useful wrap-up, not a raw tool_use dump.
+    answer = ("已完成多步处理；如需进一步操作，请回复：`1 生成补丁` / `2 重新审查` / "
+              "`3 <关键词> 解释` / `4 关闭` / `MR单` 生成 MR 描述。")
+    _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret)
     return 0
 
 
