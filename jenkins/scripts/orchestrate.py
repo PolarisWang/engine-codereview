@@ -1041,6 +1041,29 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         rc = _run_review_subprocess(key, jira_url, workspace, state_file)
         ok = rc == 0
         pipeline_state.clear_pending(state_file, key)
+        # Feedback: refresh the result card (with buttons). If the diff hash is the
+        # SAME as the previous result, the outcome intentionally did not change —
+        # surface that so the user does not read "no reaction" as a failure.
+        try:
+            if ok:
+                fresh = pipeline_state.get_topic(state_file, key)
+                render = fresh.get("render_msg_id") or render
+                note = ""
+                if render:
+                    eng_res, gam_res, st = _load_findings(workspace, key)
+                    all_f = (eng_res or []) + (gam_res or [])
+                    if not all_f:
+                        note = "\n\nℹ️ 本次审查未发现代码问题（无 findings）。"
+            text = feishu_notifier.render_state_card(pipeline_state.get_topic(state_file, key))
+            if note:
+                text = text + note
+            if render and app_id and app_secret:
+                _run_py("feishu_notifier.py", [
+                    "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
+                    "--message-id", render, "--message-base64", _b64_str(text),
+                    "--topic", str(key), "--actions", "re_review,apply_patch,close_topic"])
+        except Exception as e:
+            print(f"[executor] re_review feedback update failed: {e}", file=sys.stderr)
         return ok, "re_review executed, review complete" if ok else f"re_review failed rc={rc}"
 
     if action == "apply":
@@ -1383,9 +1406,9 @@ def _update_state_card(state_file, app_id, app_secret, key):
             return
         text = feishu_notifier.render_state_card(topic)
         _run_py("feishu_notifier.py", [
-            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", topic["render_msg_id"],
-            "--message-base64", _b64_str(text)])
+            "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", topic["render_msg_id"], "--message-base64", _b64_str(text),
+            "--topic", str(key), "--actions", "re_review,apply_patch,close_topic"])
     except Exception as e:
         print(f"[orchestrate] WARN: state card update failed: {e}", file=sys.stderr)
 

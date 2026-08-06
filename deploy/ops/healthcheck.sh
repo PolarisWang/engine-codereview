@@ -43,18 +43,29 @@ if [ "$BOT" -lt 1 ]; then
     ok=0
 fi
 
-# 2. Feishu long-connection present in the newest event-server log (within window)
+# 2. Feishu long-connection: the bot is CONNECTED iff its own output log contains a
+#    "connected to wss" line (established by the watchdog-launched event_server).
+#    Liveness is "process alive (check 1) + a WS connection was established", NOT the
+#    log file's mtime. The bot is an idle event server: with no incoming traffic it
+#    writes nothing new, so a freshly-connected-but-otherwise-quiet bot's log file can
+#    legitimately age for hours. Treating raw mtime as a hard-fail produced false
+#    "未连 Feishu" alerts for healthy-but-idle bots. It is now an informational note.
 LATEST=$(sudo docker exec "$CONTAINER" bash -c "ls -t /tmp/ev-server-logs/ 2>/dev/null | head -1" 2>/dev/null)
-CONN=0; LOGAGE=999999
+CONN=0; LOGAGE=0
 if [ -n "$LATEST" ]; then
     CONN=$(sudo docker exec "$CONTAINER" bash -c "grep -c 'connected to wss' /tmp/ev-server-logs/$LATEST 2>/dev/null" 2>/dev/null || echo 0)
-    LOGAGE=$(sudo docker exec "$CONTAINER" bash -c "echo \$(( \$(date +%s) - \$(stat -c %Y /tmp/ev-server-logs/$LATEST 2>/dev/null || date +%s) ))" 2>/dev/null || echo 999999)
+    LOGAGE=$(sudo docker exec "$CONTAINER" bash -c "echo \$(( \$(date +%s) - \$(stat -c %Y /tmp/ev-server-logs/$LATEST 2>/dev/null || date +%s) ))" 2>/dev/null || echo 0)
 fi
 echo "[health] bot_log_conn=$CONN log_age_s=$LOGAGE"
-if [ "$CONN" -lt 1 ] || [ "$LOGAGE" -gt 7200 ]; then
-    echo "  FAIL: no Feishu WS connection / stale log"
-    alert "CodeReview bot 未连 Feishu" "最新日志($LATEST) 无连接($CONN)，日志年龄 ${LOGAGE}s。\n检查 watchdog 与 event_server 日志。"
+if [ "$CONN" -lt 1 ]; then
+    echo "  FAIL: no Feishu WS connection in latest log ($LATEST)"
+    alert "CodeReview bot 未连 Feishu" "最新日志($LATEST) 无连接($CONN)。\n检查 watchdog 与 event_server 日志：bot 进程在但从未建立 Feishu WS 连接。"
     ok=0
+elif [ "$LOGAGE" -gt 7200 ] && [ "${BOT:-0}" -ge 1 ]; then
+    # Bot is alive and connected but the log has been idle >2h — normal for a quiet
+    # event server. Survives check 1 (BOT>=1) AND has a WS connection, so no hard fail;
+    # log it so a genuinely stuck bot is still surfaced for triage.
+    echo "  INFO: bot connected but idle ${LOGAGE}s in $LATEST (no traffic) — expected if no reviews recently."
 fi
 
 # 3. pipeline-state freshness (reviews should keep touching it; a long-frozen state
