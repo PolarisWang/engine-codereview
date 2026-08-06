@@ -640,6 +640,15 @@ def interact(args):
         text = _generate_mr_card(topic, all_findings, workspace, key)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
+    if word in ("预览", "预览补丁", "patch预览"):
+        text = _render_patch_preview(topic, all_findings, api_key, base_url, model)
+        _finalize(key, text, render_id, [], state_file, app_id, app_secret)
+        return 0
+    if word in ("应用并提交", "确认提交", "push并建mr"):
+        text = _build_patch_preview_target(all_findings, "all")
+        _finalize(key, "⏳ 「应用并提交」将 push 新分支 + 建 MR（受控写操作，暂未执行）。\n"
+                       "当前先确认补丁预览：\n" + text[:400], render_id, [], state_file, app_id, app_secret)
+        return 0
     if word in ("状态", "/状态", "status"):
         _finalize(key, _build_status_text(topic), render_id, [], state_file, app_id, app_secret)
         return 0
@@ -773,6 +782,84 @@ def _build_patch_preview_target(findings, target):
     for f in subset[:8]:
         lines.append(f"- `{f.get('file')}` [{f.get('severity')}]: {f.get('issue','')}\n"
                      f"  建议: {f.get('suggestion','')}")
+    return "\n".join(lines)
+
+
+def _gitlab_raw_file(repo_project_path, file_path, ref, token=None):
+    """Fetch a file's raw content from GitLab (fast; no full clone). Returns text or None."""
+    import urllib.request, urllib.error, urllib.parse
+    token = token or _env("GITLAB_TOKEN") or ""
+    if not token:
+        return None
+    proj = urllib.parse.quote(repo_project_path, safe="")
+    u = (f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/files/"
+         f"{urllib.parse.quote(file_path, safe='')}/raw?ref={urllib.parse.quote(ref, safe='')}")
+    try:
+        r = urllib.request.Request(u, headers={"PRIVATE-TOKEN": token})
+        return urllib.request.urlopen(r, timeout=25).read().decode("utf-8", "ignore")
+    except Exception as e:
+        print(f"[patch] raw read {file_path} err: {e}", file=sys.stderr)
+        return None
+
+
+def _generate_real_patch(topic, all_findings, api_key, base_url, model):
+    """Generate REAL, apply-able unified diffs for the topic's critical findings.
+    Reads each file from GitLab (raw API), asks the LLM to produce a git apply-able
+    diff for that file. Returns a list of {file, diff} (diff may be empty if LLM
+    failed). No push. Suggestion-based `_build_patch_preview_target` remains the
+    fallback when we lack token / raw files.
+    """
+    repo_proj = ""
+    import common as _common
+    for pid, pc in _common.get_projects().items():
+        if str(pid).lower() == str(topic.get("project", "")).lower():
+            eng = pc.get("engine_repo", "")
+            if "git@" in eng:
+                repo_proj = eng.split(":")[-1].lstrip("/").rstrip(".git")
+            break
+    if not repo_proj:
+        return []
+    ref = topic.get("review_branch") or topic.get("base_branch") or ""
+    if not api_key:
+        return []
+    crit = [f for f in (all_findings or [])
+            if (f.get("severity") or "").lower() in ("critical", "high")]
+    show = crit or (all_findings or [])[:3]
+    out = []
+    for f in show[:3]:
+        file = f.get("file") or f.get("path") or ""
+        if not file:
+            continue
+        content = _gitlab_raw_file(repo_proj, file, ref)
+        if content is None:
+            continue
+        issue = (f.get("issue") or "")[:600]
+        sys_prompt = (f"You are fixing a code review finding. Given the file content, "
+                      "produce a minimal, CORRECT, git-apply-able unified diff (hunks with "
+                      "the right line numbers) that fixes the issue. Return ONLY the diff, "
+                      "starting with 'diff --git'. If you cannot safely fix, return 'NO_SAFE_FIX'.")
+        prompt = f"FILE: {file}\n\n```\n{content[:6000]}\n```\n\nISSUE: {issue}\n\nProduce the real unified diff."
+        diff = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=1500)
+        if diff and diff.strip() and diff.strip() != "NO_SAFE_FIX":
+            out.append({"file": file, "diff": diff.strip()})
+    return out
+
+
+def _render_patch_preview(topic, all_findings, api_key, base_url, model):
+    """Build a human preview: real diffs (if obtainable) + proposed new branch name."""
+    real = _generate_real_patch(topic, all_findings, api_key, base_url, model)
+    src = topic.get("review_branch") or ""
+    task = topic.get("jira_key") or "task"
+    new_branch = f"{src}-fix-{task}" if src else f"fix-{task}"
+    lines = [f"✏️ **补丁预览**（未应用/未推送）\n",
+             f"建议新分支：`{new_branch}`（基于源分支，不覆盖原始）\n"]
+    if real:
+        for r in real:
+            lines.append(f"\n**{r['file']}**\n```diff\n{r['diff'][:1200]}\n```")
+    else:
+        fallback = _build_patch_preview_target(all_findings, "all")
+        lines.append("\n（无法读到文件/生成真实 diff，给出建议：）\n" + fallback)
+    lines.append("\n> 确认无误后回复 `@机器人 应用并提交` 才会 push 新分支 + 建 MR。")
     return "\n".join(lines)
 
 
