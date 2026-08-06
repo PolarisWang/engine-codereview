@@ -1377,6 +1377,38 @@ def _spawn_rerun(key, workspace, state_file, jira_url, app_id, app_secret):
 
 
 def _parse_jira(jira_url, host, token, gitlab_token):
+    # If the "jira_url" is actually a GitLab MR link, resolve the MR's source/
+    # target branch directly (this powers "send an MR link -> review its branch").
+    import common as _common
+    if _common.MR_URL_PATTERN.search(jira_url or ""):
+        try:
+            import jira_parser
+            mi = jira_parser.gitlab_get_mr(jira_url, gitlab_token)
+            if mi:
+                # Normalize: run() reads mr_info.branch as the review source branch.
+                if not mi.get("branch"):
+                    mi["branch"] = mi.get("source_branch") or ""
+                info = {
+                    "project": "MR",
+                    "issue_key": jira_url,
+                    "mr_info": mi,
+                    "mr_url": jira_url,
+                    "default_branch": "master",
+                }
+                # Resolve engine/game repos for the MR's project by matching the
+                # MR URL path against config project repo URLs.
+                for pid, pc in (_common.get_projects() or {}).items():
+                    eng = pc.get("engine_repo", "")
+                    if eng and jira_parser.repo_matches_mr_url(eng, jira_url):
+                        info["engine_repo"] = eng
+                        info["game_repo"] = pc.get("game_repo", "")
+                        info["project"] = pid
+                        if not info.get("default_branch"):
+                            info["default_branch"] = pc.get("default_branch") or "master"
+                        break
+                return info
+        except Exception as e:
+            print(f"[orchestrate] MR resolve err: {e}", file=sys.stderr)
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
         out_path = f.name

@@ -23,7 +23,7 @@ import sys
 import time
 
 # Shared helpers: Jira URL pattern, HTTP with retry
-from common import JIRA_URL_PATTERN, http_request
+from common import JIRA_URL_PATTERN, MR_URL_PATTERN, http_request
 
 
 # ── Feishu API helpers ───────────────────────────────────────────────────────
@@ -64,14 +64,19 @@ def list_messages(token, chat_id, page_size=50, page_token=None, start_time=None
 
 
 def extract_jira_urls(text):
-    """Extract Jira issue keys from text, return list of (full_url, issue_key)."""
-    matches = JIRA_URL_PATTERN.findall(text)
+    """Extract Jira issue keys (and GitLab MR URLs) from text.
+    Returns list of (full_url, key). For Jira, key is the issue key; for MR, key
+    is the MR iid (prefixed to stay distinct) and the URL is the MR link."""
     results = []
-    for issue_key in matches:
-        # Find the actual URL in the text
+    for issue_key in JIRA_URL_PATTERN.findall(text):
         m = re.search(rf'(https?://[\w.-]+/(?:browse|issues)/{re.escape(issue_key)})', text)
         if m:
             results.append((m.group(1), issue_key))
+    # Also accept a GitLab MR link as a review trigger (source_branch resolved later).
+    if not results:
+        m = MR_URL_PATTERN.search(text or "")
+        if m and m.group(0):
+            results.append((m.group(0), f"MR{m.group(1)}"))
     return results
 
 

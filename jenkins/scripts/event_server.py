@@ -173,7 +173,7 @@ def _text_of(message):
 
 
 def _is_jira_topic(text):
-    return bool(common.JIRA_URL_PATTERN.search(text or ""))
+    return bool(common.JIRA_URL_PATTERN.search(text or "") or common.MR_URL_PATTERN.search(text or ""))
 
 
 def _run_orchestrate(args_list):

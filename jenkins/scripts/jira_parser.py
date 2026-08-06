@@ -63,6 +63,15 @@ def parse_gitlab_mr_url(url):
     return None, None
 
 
+def repo_matches_mr_url(repo_url, mr_url):
+    """True if a repo URL's project path appears inside an MR URL (same project)."""
+    if not repo_url or not mr_url:
+        return False
+    # repo e.g git@host:booming/dev/projects/x/chaos-cb-2.git
+    path = repo_url.rstrip(".git").split(":", 1)[-1].lstrip("/")
+    return path in mr_url
+
+
 def gitlab_get_mr(mr_url, token):
     """
     Fetch GitLab MR details via API.

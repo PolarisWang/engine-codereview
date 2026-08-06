@@ -27,6 +27,9 @@ JIRA_URL_PATTERN = re.compile(
     r'https?://[\w.-]+/(?:browse|issues)/([A-Za-z][A-Za-z0-9]+-\d+)'
 )
 
+# GitLab MR URL pattern: https://host/group/sub/project/-/merge_requests/123
+MR_URL_PATTERN = re.compile(r'https?://[\w.-]+/(?:.+?)/-/merge_requests/(\d+)')
+
 # ── Config loading ──────────────────────────────────────────────────────────
 
 _CONFIG_CACHE = None
