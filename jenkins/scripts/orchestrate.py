@@ -810,13 +810,22 @@ def _generate_real_patch(topic, all_findings, api_key, base_url, model):
     fallback when we lack token / raw files.
     """
     repo_proj = ""
-    import common as _common
-    for pid, pc in _common.get_projects().items():
-        if str(pid).lower() == str(topic.get("project", "")).lower():
-            eng = pc.get("engine_repo", "")
-            if "git@" in eng:
-                repo_proj = eng.split(":")[-1].lstrip("/").rstrip(".git")
-            break
+    # Prefer the MR URL's project path (authoritative, independent of empty project field).
+    mr_url = topic.get("mr_url") or topic.get("jira_url") or ""
+    if mr_url and "merge_requests" in mr_url:
+        import jira_parser as _jp
+        pp, _iid = _jp.parse_gitlab_mr_url(mr_url)
+        if pp:
+            repo_proj = pp
+    # Fallback: match config project by name if still empty.
+    if not repo_proj:
+        import common as _common
+        for pid, pc in _common.get_projects().items():
+            if str(pid).lower() == str(topic.get("project", "")).lower():
+                eng = pc.get("engine_repo", "")
+                if "git@" in eng:
+                    repo_proj = eng.split(":")[-1].lstrip("/").rstrip(".git")
+                break
     if not repo_proj:
         return []
     ref = topic.get("review_branch") or topic.get("base_branch") or ""
