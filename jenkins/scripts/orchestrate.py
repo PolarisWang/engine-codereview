@@ -179,13 +179,17 @@ def run(args):
         # Retry/re-review path: if this topic was FAILED (auto-retry) or DONE
         # (explicit re_review), reset it to a runnable state so the forward phase
         # transitions below are legal. CLOSED topics were skipped earlier.
-        if topic is not None and topic.get("phase") in ("FAILED", "DONE"):
+        # Reset any completed OR in-progress (possibly stuck) phase so a re-review
+        # can re-run forward from SCANNED. Covers FAILED (auto-retry), DONE (manual
+        # re-review) and REVIEWING/PARSING etc. left mid-flight by an earlier run.
+        if topic is not None and topic.get("phase") != "CLOSED":
             was_failed = topic.get("phase") == "FAILED"
             reset_kind = "RETRY" if was_failed else "REREVIEW"
-            pipeline_state.reset_for_retry(state_file, key)
-            _log('SCANNED', reset_kind, key, topic.get("jira_key", ""), '', '',
-                 f"{'retry' if was_failed else 're-review'} "
-                 f"#{int(topic.get('retry_count') or 0) + 1}")
+            if topic.get("phase") in ("FAILED", "DONE", "REVIEWING", "PARSING", "NOTIFYING"):
+                pipeline_state.reset_for_retry(state_file, key)
+                _log('SCANNED', reset_kind, key, topic.get("jira_key", ""), '', '',
+                     f"{'retry' if was_failed else 're-review'} "
+                     f"#{int(topic.get('retry_count') or 0) + 1}")
 
     # 1. Reply processing card in Feishu thread (scan) or send new (manual).
     reply_msg_id = ""
