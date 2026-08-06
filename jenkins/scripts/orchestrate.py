@@ -288,9 +288,8 @@ def run(args):
     summary = _append_fix_options(summary, review_branch)
     if reply_msg_id:
         rc, _, err = _run_py("feishu_notifier.py", [
-            "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", reply_msg_id, "--message-base64", _b64_str(summary),
-            "--topic", str(key), "--actions", "re_review,apply_patch,close_topic"])
+            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", reply_msg_id, "--message-base64", _b64_str(summary)])
         if rc != 0:
             topic_after = pipeline_state.record_failure(state_file, key, f"update-reply failed: {err}")
             _alert_if_exhausted(state_file, topic_after, app_id, app_secret)
@@ -328,21 +327,21 @@ def _send_reply(app_id, app_secret, reply_msg_id, text):
 
 
 def _update_card_text(app_id, app_secret, card_msg_id, text, topic_key="", actions=""):
-    """Update an existing card message in place (single-card-per-topic behaviour).
-    When `topic_key` is given, appends interactive action buttons whose callbacks
-    are routed back into the same interaction/pending logic (arch-A)."""
-    if topic_key:
-        _run_py("feishu_notifier.py", [
-            "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", card_msg_id, "--message-base64", _b64_str(text),
-            "--topic", str(topic_key), "--actions", actions])
-    else:
-        _send_reply(app_id, app_secret, card_msg_id, text)
+    """Update an existing card in place with plain text.
+
+    Interactive button callbacks (arch-A) are retired: verified that this Feishu
+    app's server strips the card `action` block (button clicks never produce
+    card.action.trigger), so buttons cannot be relied on. Interaction is done via
+    @-reply (im.message.receive_v1), guided by the text hint on the card. The
+    `topic_key`/`actions` args are kept for signature compatibility but unused.
+    """
+    _send_reply(app_id, app_secret, card_msg_id, text)
 
 
 def _append_fix_options(summary, branch):
-    """Append a text-only interaction prompt to the summary card. (Buttons are a
-    later upgrade; for now the user replies in-thread to pick an action.)"""
+    """Append a text-only interaction prompt to the summary card. Interaction is via
+    @-reply (buttons were retired: the Feishu app server strips card action blocks,
+    so button callbacks never fire — see arch-A note)."""
     hint = (
         "\n\n---\n🤖 **交互**：回复本话题 `@机器人` 并附带指令：\n"
         f"  - `1` 生成修复补丁预览\n"
@@ -1059,9 +1058,8 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                 text = text + note
             if render and app_id and app_secret:
                 _run_py("feishu_notifier.py", [
-                    "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
-                    "--message-id", render, "--message-base64", _b64_str(text),
-                    "--topic", str(key), "--actions", "re_review,apply_patch,close_topic"])
+                    "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+                    "--message-id", render, "--message-base64", _b64_str(text)])
         except Exception as e:
             print(f"[executor] re_review feedback update failed: {e}", file=sys.stderr)
         return ok, "re_review executed, review complete" if ok else f"re_review failed rc={rc}"
@@ -1406,9 +1404,8 @@ def _update_state_card(state_file, app_id, app_secret, key):
             return
         text = feishu_notifier.render_state_card(topic)
         _run_py("feishu_notifier.py", [
-            "update-reply-card", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", topic["render_msg_id"], "--message-base64", _b64_str(text),
-            "--topic", str(key), "--actions", "re_review,apply_patch,close_topic"])
+            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", topic["render_msg_id"], "--message-base64", _b64_str(text)])
     except Exception as e:
         print(f"[orchestrate] WARN: state card update failed: {e}", file=sys.stderr)
 
