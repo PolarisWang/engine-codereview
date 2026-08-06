@@ -843,15 +843,46 @@ def _generate_real_patch(topic, all_findings, api_key, base_url, model):
         if content is None:
             continue
         issue = (f.get("issue") or "")[:600]
-        sys_prompt = (f"You are fixing a code review finding. Given the file content, "
-                      "produce a minimal, CORRECT, git-apply-able unified diff (hunks with "
-                      "the right line numbers) that fixes the issue. Return ONLY the diff, "
-                      "starting with 'diff --git'. If you cannot safely fix, return 'NO_SAFE_FIX'.")
-        prompt = f"FILE: {file}\n\n```\n{content[:6000]}\n```\n\nISSUE: {issue}\n\nProduce the real unified diff."
-        diff = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=1500)
-        if diff and diff.strip() and diff.strip() != "NO_SAFE_FIX":
-            out.append({"file": file, "diff": diff.strip()})
+        sys_prompt = ("You are fixing a code review finding. Output a SINGLE minimal, CORRECT, "
+                      "git-apply-able unified diff that fixes the issue. Constraints: "
+                      "start immediately with 'diff --git', include 'index', '--- a/...', "
+                      "'+++ b/...', and each hunk with correct header '@@ -L,C +L,C @@' and "
+                      "context/minus/plus lines. Do NOT wrap in code fences. Do NOT add any "
+                      "explanatory prose before or after. If you cannot safely produce a "
+                      "correct diff, reply exactly: NO_SAFE_FIX.")
+        prompt = f"FILE: {file}\n\n```\n{content[:6000]}\n```\n\nISSUE: {issue}\n\nUnified diff:"
+        raw = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=1800)
+        clean = _extract_clean_diff(raw)
+        if clean:
+            out.append({"file": file, "diff": clean})
     return out
+
+
+def _extract_clean_diff(raw):
+    """Extract a clean git-apply-able unified diff from LLM output.
+
+    Strips any prose, keeps only from the first 'diff --git' onward, and validates
+    the essential unified-diff markers exist (--- a/, +++ b/, @@ hunks). Returns the
+    cleaned diff string, or "" if it is not a well-formed diff (strict validation so
+    we never push a broken patch)."""
+    if not raw or not raw.strip():
+        return ""
+    text = raw.strip()
+    if text.strip() == "NO_SAFE_FIX":
+        return ""
+    # Drop anything before the first 'diff --git'
+    idx = text.find("diff --git")
+    if idx < 0:
+        return ""
+    diff = text[idx:]
+    # Cut at the first code fence if LLM wrapped it anyway.
+    f1 = diff.find("```")
+    if f1 >= 0:
+        diff = diff[:f1]
+    # Validation: must look like a unified diff.
+    if "+++" not in diff or "---" not in diff or "@@" not in diff:
+        return ""
+    return diff.strip()
 
 
 def _render_patch_preview(topic, all_findings, api_key, base_url, model):
