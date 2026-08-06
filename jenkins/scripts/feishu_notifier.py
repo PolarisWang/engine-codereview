@@ -364,37 +364,76 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
     return text
 
 
+def _sev_mark(sev):
+    s = (sev or "").strip().lower()
+    if s in ("critical", "high", "error", "blocker"):
+        return "🔴"
+    if s in ("warning", "warn", "minor"):
+        return "🟡"
+    return "ℹ️"
+
+
+def _concise_findings(result, limit=4):
+    """Return up to `limit` most important findings as short one-liners (critical first)."""
+    rev = (result or {}).get("review") or {}
+    fs = rev.get("findings") or []
+
+    def _pri(f):
+        s = (f.get("severity") or "").lower()
+        return 0 if s in ("critical", "high", "error", "blocker") else (1 if s in ("warning", "warn") else 2)
+
+    fs = sorted(fs, key=_pri)
+    out = []
+    for f in fs[:limit]:
+        file = f.get("file") or f.get("path") or "?"
+        issue = (f.get("issue") or "").strip().replace("\n", " ")
+        out.append(f"{_sev_mark(f.get('severity'))} `{file}`: {issue[:80]}")
+    return out
+
+
 def build_summary_text(issue_key, project, review_branch, base_branch, jira_url, mr_url,
                        engine_result, game_result):
     """
-    Build the final Feishu markdown summary, mirroring the pipeline's online format.
-
-    engine_result/game_result are dicts (or file paths resolved by caller).
-    Returns the markdown string.
+    Build a CONCISE, FOCUSED Feishu summary: one-line verdict + top findings.
+    (The old full-length "详细报告" is dropped; it was noisy — the user wants
+    重点突出、言简意赅.)
     """
-    summary = f"**🔍 Code Review 报告: {issue_key}**\n\n"
-    summary += f"**项目:** {project}\n"
-    summary += f"**分支:** {review_branch} → {base_branch}\n"
-    if mr_url:
-        summary += f"**MR:** {mr_url}\n"
-    summary += f"\n{build_repo_section('Engine', '🔧', engine_result, review_branch, base_branch)}\n"
-    if game_result:
-        summary += f"\n{build_repo_section('Game', '🎮', game_result, review_branch, base_branch)}\n"
-    summary += f"\n---\n📎 Jira: {jira_url}"
+    def _sev_count(r):
+        return (r or {}).get("review") or {}
 
-    # Append truncated per-repo review details when they fit within the card limit.
-    MAX = 3500
-    for label, result in (("🔧 Engine", engine_result), ("🎮 Game", game_result)):
-        detail = ((result or {}).get("review") or {}).get("review_text")
-        if not detail:
+    ec = _sev_count(engine_result).get("severity_counts") or {}
+    gc = _sev_count(game_result).get("severity_counts") or {}
+    total_c = (ec.get("critical") or 0) + (gc.get("critical") or 0)
+    total_w = (ec.get("warning") or 0) + (gc.get("warning") or 0)
+    total_i = (ec.get("suggestion") or 0) + (gc.get("suggestion") or 0)
+
+    summary = f"**🔍 {issue_key}** · 审查结果："
+    if total_c:
+        summary += f"**{total_c} 个 Critical** / "
+    summary += f"{total_w} 个 Warning / {total_i} 个 Suggestion\n\n"
+
+    if mr_url:
+        summary += f"MR：{mr_url}\n"
+    summary += f"分支：`{review_branch}` → `{base_branch}`\n\n"
+
+    # FOCUSED: top findings across engine + game (critical first).
+    tops = _concise_findings(engine_result, 3) + _concise_findings(game_result, 3)
+    # de-dup by file line, then cap
+    seen = set()
+    uniq = []
+    for line in tops:
+        key = line[:40]
+        if key in seen:
             continue
-        if len(summary) >= MAX:
-            break
-        avail = MAX - len(summary) - 50
-        if avail > 200:
-            if len(detail) > avail:
-                detail = detail[:avail] + "\n\n...（详情见 Jenkins 构建日志）"
-            summary += f"\n\n---\n**{label} 详细报告:**\n{detail}"
+        seen.add(key)
+        uniq.append(line)
+    if uniq:
+        summary += "**关键发现：**\n" + "\n".join(uniq[:5]) + "\n\n"
+    else:
+        summary += "✅ 未发现需要处理的代码问题。\n\n"
+
+    if jira_url:
+        summary += f"📎 {jira_url}"
     return summary
 
 

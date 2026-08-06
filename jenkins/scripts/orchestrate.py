@@ -344,10 +344,11 @@ def _append_fix_options(summary, branch):
     so button callbacks never fire — see arch-A note)."""
     hint = (
         "\n\n---\n🤖 **交互**：回复本话题 `@机器人` 并附带指令：\n"
-        f"  - `1` 生成修复补丁预览\n"
+        f"  - `1` 生成修复补丁方案\n"
         f"  - `2` 重新审查 `{branch}`\n"
         f"  - `3 <关键词>` 解释某个 finding\n"
         f"  - `4` 关闭话题（发起人或管理员）\n"
+        f"  - `MR单` 生成 MR 描述\n"
         f"  - `/状态` 当前审查状态\n"
         f"  - 直接提问会自动按当前 diff 答疑"
     )
@@ -598,6 +599,32 @@ def interact(args):
             f"- [{e.get('time','')}] {e.get('actor','')} -> {e.get('action','')}"
             f" {e.get('target','')} [{e.get('result','')}]" for e in log[-20:]]
         _finalize(key, "\n".join(lines), render_id, [], state_file, app_id, app_secret)
+        return 0
+
+    # ── Reliable command routing (arch: 1/2/3/4 + keywords go to FIXED actions, not
+    #    LLM guesses). Matches whole-word / prefix so "2" always = re-review, etc. ──
+    word = low.strip().split()[0] if low.strip() else ""
+    if word in ("1", "补丁", "生成补丁", "修复"):
+        # Propose a fix patch for the findings (suggestion-based, staged for later).
+        return _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
+                              app_id, app_secret, actor)
+    if word in ("2", "重新审查", "重审", "review", "重新review"):
+        _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor)
+        return 0
+    if word in ("3", "解释"):
+        rest = low.strip()[1:].strip() if low.strip().startswith("3") else low.strip()[2:].strip()
+        answer = _answer_question(rest or "请解释当前发现", all_findings, api_key, base_url, model)
+        _finalize(key, answer, render_id, [], state_file, app_id, app_secret)
+        return 0
+    if word in ("4", "关闭", "关闭话题"):
+        _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor)
+        return 0
+    if word in ("mr", "生成mr", "出mr单", "mr单"):
+        text = _generate_mr_card(topic, all_findings, workspace, key)
+        _finalize(key, text, render_id, [], state_file, app_id, app_secret)
+        return 0
+    if word in ("状态", "/状态", "status"):
+        _finalize(key, _build_status_text(topic), render_id, [], state_file, app_id, app_secret)
         return 0
 
     # ── Agent loop ──────────────────────────────────────────────────────────
@@ -1259,6 +1286,83 @@ def cmd_action(args):
         print(f"[action] unknown action: {action}", flush=True)
         return 1
     return 0
+
+
+# ── Reliable interaction commands (routed from 1/2/3/4 + keywords) ───────────
+
+def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor=""):
+    """指令 `2/重新审查`: owner/admin 校验后入队 re_review（Jenkins 执行）。"""
+    ok, why = _approve(key, topic, actor, "re_review")
+    if not ok:
+        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        return
+    pipeline_state.set_pending(state_file, key, "re_review")
+    _update_card_text(app_id, app_secret, render_id,
+                      "⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查。")
+
+
+def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
+    """指令 `4/关闭`: owner/admin 关闭话题。"""
+    ok, why = _approve(key, topic, actor, "close_topic")
+    if not ok:
+        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        return
+    pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
+    _update_card_text(app_id, app_secret, render_id, "🔒 本话题已关闭，不再处理。")
+
+
+def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
+                   app_id, app_secret, actor=""):
+    """指令 `1/补丁`: 生成修复补丁方案（基于 findings 的建议，供确认后应用）。"""
+    ok, why = _approve(key, topic, actor, "apply_patch")
+    if not ok:
+        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        return 0
+    patch = _build_patch_target(all_findings, "all")
+    if not all_findings or not (patch.get("diff") or "").strip():
+        _update_card_text(app_id, app_secret, render_id,
+                          "ℹ️ 当前没有可生成补丁的 findings，或 `@ok` 后再应用。")
+        return 0
+    pipeline_state.set_pending_patch(state_file, key, {
+        "file": "all", "target": "all", "repo": "engine", "diff": patch.get("diff", ""),
+        "created_at": "now",
+    })
+    _update_card_text(app_id, app_secret, render_id,
+                      "✏️ 已生成修复补丁方案（基于 findings 建议，未应用）。\n"
+                      "回复 `@ok` 让 Jenkins 应用，`@confirm push` 推送，`@撤销` 取消。")
+    return 0
+
+
+def _generate_mr_card(topic, all_findings, workspace, key):
+    """指令 `mr/生成MR单`: 基于 findings + 已应用修改，生成一份 MR 描述（仅文案，不 push）。"""
+    jira = topic.get("jira_key") or key
+    branch = topic.get("review_branch") or ""
+    mr_url = topic.get("mr_url") or ""
+    c = (topic.get("applied_patches") or [])
+    lines = [f"# MR 单：{jira}", ""]
+    if branch:
+        lines.append(f"**源分支**：`{branch}`")
+    if mr_url:
+        lines.append(f"**MR**：{mr_url}")
+    lines.append("")
+    # 变更要点来自 findings（最多 5 条）
+    lines.append("**变更要点：**")
+    if all_findings:
+        crit = [f for f in all_findings if (f.get('severity') or '').lower() in ('critical', 'high')]
+        shows = (crit or all_findings)[:5]
+        for f in shows:
+            file = f.get("file") or "?"
+            lines.append(f"- {file}: {(f.get('issue') or '').strip()[:90]}")
+    else:
+        lines.append("- （无 findings）")
+    lines.append("")
+    if c:
+        lines.append(f"**已应用补丁**：{len(c)} 个。")
+    else:
+        lines.append("**已应用补丁**：无。")
+    lines.append("")
+    lines.append("> 由 code-review 机器人生成，请人工核对后用于 GitLab MR 提交。")
+    return "\n".join(lines)
 
 
 def cmd_ci(args):
