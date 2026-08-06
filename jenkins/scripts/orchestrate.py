@@ -287,6 +287,14 @@ def run(args):
     # to select a fix / re-review / ask a follow-up (real-time event server routes it).
     summary = _append_fix_options(summary, review_branch)
     if reply_msg_id:
+        # Persist the rendered review summary so later card refreshes (e.g. ci-poll)
+        # can append CI status WITHOUT wiping the findings.
+        st = pipeline_state.load_state(state_file)
+        t2 = st["topics"].get(key)
+        if t2 is not None:
+            t2["review_summary"] = summary
+            st["updated_at"] = pipeline_state._now_iso()
+            pipeline_state.save_state(st, state_file)
         rc, _, err = _run_py("feishu_notifier.py", [
             "update-reply", "--app-id", app_id, "--app-secret", app_secret,
             "--message-id", reply_msg_id, "--message-base64", _b64_str(summary)])
@@ -1390,7 +1398,10 @@ def cmd_ci(args):
     print(f"[ci] {key}: {block.replace(chr(10), ' ')[:150]}", flush=True)
     render = topic.get("render_msg_id")
     if render and app_id and app_secret:
-        base = feishu_notifier.render_state_card(pipeline_state.get_topic(state_file, key))
+        # Build on the REVIEW SUMMARY (findings), not the sparse state card, so the
+        # findings stay visible and CI status is appended — NOT replacing them.
+        base = (topic.get("review_summary") or
+                feishu_notifier.render_state_card(pipeline_state.get_topic(state_file, key)))
         _run_py("feishu_notifier.py", [
             "update-reply", "--app-id", app_id, "--app-secret", app_secret,
             "--message-id", render, "--message-base64",
