@@ -1088,7 +1088,25 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
     return file, d.stdout, None
 
 
-EDIT_MODEL = "deepseek-v4-flash"  # gateway-available model (deepseek-v4-flash[1m] is 503/model_not_found in this gateway)
+EDIT_MODEL = "glm-5.2[1m]"  # used via local claude -p CLI (reaches [1m] models that 503 on raw HTTP)
+
+
+def _claude_p_call(prompt, model="glm-5.2[1m]", timeout=180):
+    """Run the local `claude -p` CLI (the exact tool that can reach the [1m] model on
+    this machine). Falls back to None on failure (caller retries elsewhere)."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["claude", "-p", prompt, "--model", model],
+                    capture_output=True, text=True, timeout=timeout,
+                    stdin=_sp.PIPE)
+        if r.returncode != 0:
+            print(f"[claude-p] rc={r.returncode} err={r.stderr[:200]}", file=sys.stderr)
+            return None
+        return r.stdout.strip()
+    except Exception as e:
+        print(f"[claude-p] err: {e}", file=sys.stderr)
+        return None
+
 
 
 def _locate_context(content, needle):
@@ -1135,7 +1153,10 @@ def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_
                   f"Round {rnd+1}. Output @@START@@...@@END@@ (corrected window).")
         if prev_bad:
             prompt += f"\n[previous fix failed to apply, error: {prev_bad[:200]}. Correct the window so git apply succeeds.]"
-        raw = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=4000)
+        raw = _claude_p_call(prompt, model)
+        if raw is None:
+            prev_bad = "claude -p call failed"
+            continue
         m = _re.search(r"@@START@@(.*?)@@END@@", raw or "", _re.S)
         if not m:
             prev_bad = "no @@START@@ block"
