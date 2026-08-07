@@ -25,24 +25,27 @@
 | watchdog + startup + apply | ✅ | 进程级自愈 + 容器重启恢复 + 一键部署 |
 | 健康监控 + 僵尸清理 | ✅ | healthcheck + zombie-cleaner host cron |
 | **AI 自动改码(claude -p)** | ✅ | _agent_edit_one 用 `claude -p --model glm-5.2[1m]` 驱动，窗口定位 + 迭代，产出干净 git diff |
+| **改码闭环：改码→确认→push→自动建MR** | ✅ | _cmd_auto_edit(改码/自动修复) 多文件改码→展示 diff→staged；_cmd_confirm_agent_edit(@确认) commit+push 到 `{src}-fix-{task}` + _create_or_get_mr 自动建修复MR + 回填真实 URL |
+| **claude 绝对路径调用** | ✅ | _find_claude() 探测绝对路径，规避 cr-env/env.sh 剥 PATH 导致的 `claude not found` |
+| **改码路由** | ✅ | interact 可靠路由 + pending-gating 新增 `改码`/`@确认`/`自动修复` 指令 |
 
 ### 🔧 待完成（闭环最后几步）
 
 | # | 待做 | 说明 |
 |---|------|------|
-| 1 | **自动改码 → commit → push 新分支** | _agent_edit_one 产出了 diff，但还没 commit + push 到 `{src}-fix-{task}` 新分支 |
-| 2 | **push 后自动建 MR** | _create_or_get_mr 已就绪，push 后调它即可 |
-| 3 | **`改码` 指令路由** | 在 interact 里加 `改码`/`自动修复` 指令 → 调 _agent_edit_preview → 展示 diff → 确认后 push+建MR |
-| 4 | **多文件改码** | 当前 _agent_edit_one 只改 1 个 finding，需扩展到遍历所有 critical |
-| 5 | **编译验证（可选）** | push 前可选跑编译检查（容器有 gcc/make），确保改动不破坏编译 |
-| 6 | **端到端联调** | 群里发 Jira → review → 回复 `改码` → AI 改+push+建MR → 你确认合入 |
+| ~~1~~ | ~~自动改码 → commit → push 新分支~~ | ✅ 已实现 `_cmd_confirm_agent_edit`：commit + push 到 `{src}-fix-{task}` |
+| ~~2~~ | ~~push 后自动建 MR~~ | ✅ `_cmd_confirm_agent_edit` 调 `_create_or_get_mr(create_if_missing=True)` 自动建修复 MR 并回填真实 URL |
+| ~~3~~ | ~~`改码` 指令路由~~ | ✅ interact 可靠路由新增 `改码`/`自动修改`/`自动修复`/`autofix` → `_cmd_auto_edit`；`@确认` → `_cmd_confirm_agent_edit` |
+| ~~4~~ | ~~多文件改码~~ | ✅ `_agent_edit_all` 遍历 critical/high(≤3) 在同一工作树累积改码，diff 整体 staging |
+| 5 | 编译验证（可选） | push 前可选跑编译检查（容器有 gcc/make），确保改动不破坏编译 —— 未实现 |
+| 6 | 端到端联调 | 群里发 Jira → review → 回复 `改码` → AI 改+push+建MR → 你确认合入 —— 待实测 |
 
 ### ⚠️ 已知限制
 
 - **`deepseek-v4-flash[1m]` 网关 503**：raw HTTP 调 `/v1/messages` 返回 model_not_found。只有 `claude -p` CLI 能通（它走 Claude Code 内部通道）。
 - **`glm-5.2[1m]` 同理**：只能通过 `claude -p` 调用，不能裸 HTTP。
+- **`claude` 绝对路径**：`_find_claude()` 探测 `/usr/local/bin/claude` 等绝对路径。容器 `chaos-agent-cr` **已有 claude**（可改码），但 `cr-env/env.sh:25` 的 `PATH=/usr/bin:/bin` 会剥掉 `/usr/local/bin`，故必须用绝对路径调用（已修）。
 - **root 下 claude -p 限制**：`--dangerously-skip-permissions` 在 root 下被拒。需 settings.json `skipDangerousModePermissionPrompt=false` + `defaultMode=default`（已改）。
-- **容器内无 claude CLI**：`claude` 只装在 host `/usr/local/bin/claude`（→ `/root/.hermes/node/bin/claude`）。自动改码只能在 host 侧跑，或把 claude 装进容器。
 - **CI 不触发**：项目 `.gitlab-ci.yml` rules 只认 `merge_request_event`，手动 api 触发为空。ci-poll 只跟踪不触发。
 - **review 大 MR 慢**：103 文件/95万字符的 diff，LLM 审查需 5-10 分钟（clone 缓存后 fetch 快，但 LLM 审查本身慢）。
 
@@ -55,9 +58,9 @@
   → 重点突出结果卡(结论 + Top findings + 交互指引)
   → 用户回复 `指引` → 精确修改指引
   → 用户回复 `改码` → AI(claude -p glm-5.2[1m])自动改 checkout 里的代码
-  → 展示 git diff 给用户确认
-  → 用户确认 → commit + push 到新分支 {src}-fix-{task}
-  → 自动建 MR(source=fix分支, target=master) → 返回真实新 MR URL
+  → 展示所有文件 git diff + 提示新分支，staged 待确认
+  → 用户回复 `@确认 提交并建mr` → commit + push 到新分支 {src}-fix-{task}（受控写操作，仅 topic 发起人可确认）
+  → 自动建 MR(source=fix分支, target=base) → 返回真实新 MR URL
   → 用户在 GitLab 审核合入(需用户同意)
   → ci-poll 跟踪 CI 状态回写卡片
   → 用户回复 `4` 关闭话题 → 自动关闭 fix 分支 OPEN MR
@@ -67,7 +70,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `orchestrate.py` | 主逻辑：run(review) / interact(交互) / consume(执行) / ci(CI跟踪) / _agent_edit_one(自动改码) |
+| `orchestrate.py` | 主逻辑：run(review) / interact(交互) / consume(执行) / ci(CI跟踪) / _agent_edit_all/_cmd_auto_edit/_cmd_confirm_agent_edit(改码闭环) / _create_or_get_mr(建修复MR) |
 | `code_reviewer.py` | 审查引擎：prepare_repo(clone/fetch) + diff + LLM 审查 |
 | `jira_parser.py` | Jira/MR 解析：GitLab 反查 OPEN MR + gitlab_branch_exists + gitlab_search_issue_mrs |
 | `feishu_notifier.py` | 卡片渲染：build_summary_text(重点突出) + with_action_row(按钮,已退场) |
@@ -85,6 +88,6 @@
 - **持久 env**：`/var/lib/report-server/daily/cr-env/env.sh`（GITLAB_TOKEN/FEISHU/ANTHROPIC 凭证，不入 git）
 - **共享 workspace**：`/var/lib/report-server/daily/cr-workspace`（checkout + result + cache）
 - **共享 checkout**：`chaos-cb-2`（code_reviewer 复用 clone 缓存）
-- **claude CLI**：`/usr/local/bin/claude`（host only），settings.json `skipDangerousModePermissionPrompt=false`
+- **claude CLI**：`/usr/local/bin/claude`（host 与容器 `chaos-agent-cr` 均可用；`_find_claude()` 探测绝对路径）。settings.json `skipDangerousModePermissionPrompt=false`
 - **EDIT_MODEL**：`glm-5.2[1m]`（通过 `claude -p` 调用）
 - **host cron**：healthcheck(5min) + zombie(5min) + cleanup(每天3:15)

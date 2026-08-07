@@ -635,15 +635,27 @@ def interact(args):
     pending = topic.get("pending_patch") or {}
     is_ok = low in ("@ok", "ok", "好的", "执行", "确认")
     is_confirm_push = low in ("@confirm push", "确认push", "@push", "推")
-    is_rollback = low in ("@撤销", "@revert", "撤销", "回退")
+    is_confirm_edit = low in ("@确认", "确认提交", "确认并建mr", "git提交") or \
+        any(t in low for t in ("@确认", "确认提交", "确认并建mr", "git提交"))
+    is_rollback = low in ("@撤销", "@revert", "撤销", "回退") or any(t in low for t in ("@撤销", "@revert"))
 
     if pending:
-        if is_ok:
-            return _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor)
-        if low in ("@confirm push", "确认push", "@push"):
-            return _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor)
-        if is_rollback:
-            return _rollback(key, topic, workspace, state_file, app_id, app_secret, actor)
+        if pending.get("state") == "staged_agent_edit":
+            # auto-edit closure: 确认/提交 -> commit+push fix branch+建MR ; 撤销 -> cancel
+            if is_confirm_edit or is_ok:
+                return _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace,
+                                               app_id, app_secret, actor)
+            if is_rollback:
+                pipeline_state.set_pending_patch(state_file, key, None)
+                _update_card_text(app_id, app_secret, render_id, "↩️ 已取消本次自动改码（未推送、未建MR）。")
+                return 0
+        else:
+            if is_ok:
+                return _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor)
+            if low in ("@confirm push", "确认push", "@push"):
+                return _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor)
+            if is_rollback:
+                return _rollback(key, topic, workspace, state_file, app_id, app_secret, actor)
 
     # Also handle @撤销 globally (rollback last applied patch even without pending).
     if is_rollback:
@@ -693,6 +705,9 @@ def interact(args):
         text = _generate_fix_guidance(topic, all_findings, api_key, base_url, model, workspace)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
+    if word in ("改码", "自动修改", "自动修复", "autofix", "改码并提交"):
+        return _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
+                              app_id, app_secret, actor)
     if word in ("应用并提交", "确认提交", "push并建mr"):
         text = _build_patch_preview_target(all_findings, "all")
         _finalize(key, "⏳ 「应用并提交」将 push 新分支 + 建 MR（受控写操作，暂未执行）。\n"
@@ -1091,12 +1106,30 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
 EDIT_MODEL = "glm-5.2[1m]"  # used via local claude -p CLI (reaches [1m] models that 503 on raw HTTP)
 
 
+def _find_claude():
+    """Locate the claude CLI. MUST use an absolute path: the persistent env
+    (cr-env/env.sh) sets PATH=/usr/bin:/bin which strips /usr/local/bin, so a bare
+    `claude` lookup can fail even when claude is installed. Candidates are ordered
+    by how claude is actually laid out on this host / peer containers."""
+    for c in ("/usr/local/bin/claude",
+              "/root/.hermes/node/bin/claude",
+              "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def _claude_p_call(prompt, model="glm-5.2[1m]", timeout=180):
     """Run the local `claude -p` CLI (the exact tool that can reach the [1m] model on
-    this machine). Falls back to None on failure (caller retries elsewhere)."""
+    this machine). Falls back to None on failure (caller retries elsewhere). Uses an
+    absolute path so a PATH override (cr-env/env.sh) cannot hide the binary."""
     import subprocess as _sp
+    exe = _find_claude()
+    if not exe:
+        print("[claude-p] claude CLI not found (need absolute path scan)", file=sys.stderr)
+        return None
     try:
-        r = _sp.run(["claude", "-p", prompt, "--model", model],
+        r = _sp.run([exe, "-p", prompt, "--model", model],
                     capture_output=True, text=True, timeout=timeout,
                     stdin=_sp.PIPE)
         if r.returncode != 0:
@@ -1167,15 +1200,11 @@ def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_
         if new_content == content:
             prev_bad = "no change produced"
             continue
-        # apply to working tree only (not committed)
-        backup = p + ".__bak"
-        open(backup, "w", encoding="utf-8").write(content)
+        # apply to working tree only (not committed): ensure the file is clean
+        # first, then write the corrected window. The orphaned checkout -- file and
+        # .__bak backup below were dead code — drop them.
+        _sp.run(["git", "-C", checkout, "checkout", "--", file], capture_output=True, text=True, timeout=60)
         open(p, "w", encoding="utf-8").write(new_content)
-        # validate the edit is still syntactically near-identical (diff sane)
-        _sp.run(["git", "-C", checkout, "checkout", "--", file], capture_output=True, text=True)  # restore? no
-        # restore our edit back
-        open(p, "w", encoding="utf-8").write(new_content)
-        os.path.exists(backup) and os.unlink(backup)
         d = _sp.run(["git", "-C", checkout, "diff", "--", file], capture_output=True, text=True, timeout=60)
         return file, d.stdout, True, None
     return None, "", False, "max rounds without an applyable edit"
@@ -1199,6 +1228,173 @@ def _agent_edit_preview(topic, all_findings, api_key, base_url, workspace=None, 
             return file, diff, None
         # failure: report, try next
     return show[0].get("file") if show else None, "", "agent edit failed on all candidate findings"
+
+
+def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, model=EDIT_MODEL):
+    """Multi-file agent edit (closure #4): iterate over critical/high findings (up to 3)
+    and fix each in the SAME working tree on the fix branch `{src}-fix-{task}`. Changes are
+    cumulative (each later file is edited against the tree mutated by earlier fixes), so the
+    returned diffs form one coherent change set. Returns (ok_diffs, failed, branch, checkout, err)."""
+    import subprocess as _sp
+    ws = workspace or _DEFAULT_WORKSPACE
+    src = topic.get("review_branch") or ""
+    task = topic.get("jira_key") or "task"
+    branch = f"{src}-fix-{task}" if src else f"fix-{task}"
+    checkout, err = _ensure_checkout(topic, ws)
+    if err:
+        return [], [], branch, None, err
+    # Work on the new fix branch (create locally if absent) — never touch review_branch.
+    _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
+            capture_output=True, text=True, timeout=60)
+    crit = [f for f in (all_findings or [])
+            if (f.get("severity") or "").lower() in ("critical", "high")]
+    show = crit or (all_findings or [])[:3]
+    ok_diffs, failed = [], []
+    for f in show[:3]:
+        file = f.get("file") or f.get("path") or ""
+        issue = f.get("issue") or ""
+        _file, diff, ok, e = _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model)
+        if ok and diff:
+            ok_diffs.append({"file": _file, "diff": diff})
+        else:
+            failed.append((file, e or "edit failed"))
+    return ok_diffs, failed, branch, checkout, None
+
+
+def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
+                   app_id, app_secret, actor=""):
+    """指令 `改码/自动修复`: use claude -p to auto-fix critical/high findings in a real
+    checkout on the new fix branch, show every produced diff for review, and STAGE the
+    change set (pending_patch, state="staged_agent_edit") so `@确认`/`确认提交` later
+    commits + pushes the fix branch + auto-creates the MR. Does NOT push here."""
+    api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
+    base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    model = _env("ANTHROPIC_MODEL") or "deepseek-v4-flash"
+    ok, why = _approve(key, topic, actor, "auto_edit")
+    if not ok:
+        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        return 0
+    if not _find_claude():
+        _update_card_text(app_id, app_secret, render_id,
+                          "⚠️ 无法执行自动改码：未在本机找到 claude CLI（自动改码需 `claude` 可执行）。")
+        return 0
+    ok_diffs, failed, branch, _checkout, err = _agent_edit_all(
+        topic, all_findings, api_key, base_url, workspace)
+    if err:
+        pipeline_state.append_approval(state_file, key, actor, "auto_edit", branch, "fail", err)
+        _update_card_text(app_id, app_secret, render_id, f"⛔ 自动改码准备失败：{err}")
+        return 0
+    if not ok_diffs:
+        pipeline_state.append_approval(state_file, key, actor, "auto_edit", branch, "fail",
+                                       "no fixed finding (stack: claude-p or apply)")
+        _update_card_text(app_id, app_secret, render_id,
+                          "⚠️ 自动改码未生成任何可用 diff（可能找不到可改的 critical finding，"
+                          "或 claude -p 未返回可应用的修改）。可改用 `指引` 看人工修改方案。")
+        return 0
+    # Stage the full change set for the confirm step.
+    pipeline_state.set_pending_patch(state_file, key, {
+        "file": "all", "repo": "engine", "target": "agent_edit",
+        "state": "staged_agent_edit", "branch": branch,
+        "diff": "",  # diffs live in per-file blocks; keep aggregate empty to avoid a huge state bloat
+        "files": ok_diffs,
+        "created_at": "now",
+    })
+    pipeline_state.append_approval(state_file, key, actor, "auto_edit", branch, "ok",
+                                   f"staged {len(ok_diffs)} files")
+    lines = [f"## ⚠️ 自动改码完成，请确认\n",
+             f"将修复推送到**新分支** `{branch}`（不覆盖原始 `{topic.get('review_branch') or ''}`），"
+             f"并在确认后自动创建修复 MR。\n"]
+    for d in ok_diffs:
+        lines.append(f"\n### {d['file']}\n```diff\n{d['diff'][:1500]}\n```")
+    if failed:
+        lines.append("\n---\n**未能自动修复的文件**：")
+        for file, why in failed:
+            lines.append(f"- `{file}`: {why}")
+    lines.append("\n> 回复 `@确认 提交并建mr` 推送并建 MR；回复 `@撤销` 取消。")
+    _finalize(key, "\n".join(lines), render_id, [], state_file, app_id, app_secret)
+    return 0
+
+
+def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app_id, app_secret, actor=""):
+    """确认自动改码: consume the staged_agent_edit change set — commit on the fix branch,
+    push it, auto-create the fix MR, and report the real MR url. Returns rc."""
+    import subprocess as _sp
+    render = topic.get("render_msg_id") or ""
+    pending = (topic.get("pending_patch") or {})
+    if pending.get("state") != "staged_agent_edit":
+        _update_card_text(app_id, app_secret, render,
+                          "⛔ 当前没有待确认的自动改码。请先回复 `改码` 生成修改。")
+        return 0
+    files = pending.get("files") or []
+    branch = pending.get("branch") or ""
+    if not files or not branch:
+        pipeline_state.set_pending_patch(state_file, key, None)
+        _update_card_text(app_id, app_secret, render, "⛔ 待确认改码内容缺失，已取消。")
+        return 0
+    # Guard: never push to a protected branch.
+    if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
+        _update_card_text(app_id, app_secret, render, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。")
+        return 0
+    ok, why = _approve(key, topic, actor, "push_fix_branch", branch=branch)
+    if not ok:
+        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        return 0
+    checkout, err = _ensure_checkout(topic, workspace)
+    if err:
+        _update_card_text(app_id, app_secret, render, f"⛔ checkout 失败：{err}")
+        return 0
+    # Ensure we're on the fix branch and the diffs are applied. The staged edits were
+    # written to the shared checkout's working tree by _cmd_auto_edit; if a later
+    # process reset the tree (nothing-to-commit), re-apply the stored diffs.
+    _sp.run(["git", "-C", checkout, "checkout", "-B", branch], capture_output=True, text=True, timeout=60)
+    _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60)
+    _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                      capture_output=True, text=True, timeout=60)
+    if _commit.returncode != 0 and "nothing to commit" in (_commit.stderr or ""):
+        # tree is clean relative to HEAD on the fix branch -> replay stored diffs
+        import tempfile
+        for d in files:
+            diff = d.get("diff") or ""
+            if not diff:
+                continue
+            with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                _f.write(diff)
+                _pf = _f.name
+            _ap = _sp.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True, timeout=60)
+            try:
+                os.unlink(_pf)
+            except OSError:
+                pass
+        _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60)
+        _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                          capture_output=True, text=True, timeout=60)
+    if _commit.returncode != 0 and "nothing to commit" not in (_commit.stderr or ""):
+        _update_card_text(app_id, app_secret, render,
+                          f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
+        return 0
+    push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
+                   capture_output=True, text=True, timeout=180)
+    if push.returncode != 0:
+        _update_card_text(app_id, app_secret, render,
+                          f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
+        return 0
+    # Auto-create / detect the fix-branch MR and report its real url.
+    mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+    for f in files:
+        pipeline_state.record_applied_patch(state_file, key, {
+            "file": f.get("file", ""), "repo": "engine", "branch": branch,
+            "applied_at": "now", "mode": "agent_edit",
+        })
+    pipeline_state.append_approval(state_file, key, actor, "push_fix_branch", branch, "ok",
+                                   "pushed + MR " + (murl or ""))
+    pipeline_state.set_pending_patch(state_file, key, None)
+    text = (f"✅ **自动改码已推送** `{branch}`（{len(files)} 个文件）。\n"
+            f"- 推送分支：`{branch}`\n"
+            f"- 本次修复 MR：{murl if murl else '（创建失败：' + mrnote + '）'}\n"
+            f"- 原评审 MR：{topic.get('mr_url') or ''}\n\n"
+            f"> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
+    _finalize(key, text, render_id, [], state_file, app_id, app_secret)
+    return 0
 
 
 def _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace=None):
@@ -1329,6 +1525,7 @@ DEFAULT_POLICY = {
             "apply_patch": {"approver": "topic_owner"},
             "apply_local": {"approver": "topic_owner"},
             "push_remote": {"approver": "topic_owner", "branch": "{topic.review_branch}"},
+            "push_fix_branch": {"approver": "topic_owner"},
             "rollback": {"approver": "topic_owner"},
         },
     },

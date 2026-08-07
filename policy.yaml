@@ -39,6 +39,11 @@ agent:
       confirm: ["@confirm push", "确认push", "@push", "推"]
       branch: "{topic.review_branch}"      # 只推该话题的 review 分支
 
+    # 自动改码闭环：确认后 push 到新建的 fix 分支 {src}-fix-{task}（机器人生成的修复）
+    push_fix_branch:
+      approver: "topic_owner"
+      confirm: ["@确认", "确认提交", "确认并建mr"]
+
     # 回退（@撤销）
     rollback:
       approver: "topic_owner"
