@@ -99,6 +99,21 @@ def gitlab_get_mr(mr_url, token):
     }
 
 
+def gitlab_branch_exists(project_path, branch, token):
+    """True if a branch actually exists in the GitLab repo. Used to reject MRs whose
+    source branch is gone (e.g. closed/merged/remote-deleted), so review binds to a
+    real, current branch rather than a guessed/stale one."""
+    if not branch or not token:
+        return False
+    try:
+        proj = urllib.parse.quote(project_path, safe="")
+        b = urllib.parse.quote(branch, safe="")
+        data = gitlab_api_get(f"projects/{proj}/repository/branches/{b}", token)
+        return bool(data and data.get("name"))
+    except Exception:
+        return False
+
+
 def extract_issue_key(url):
     """Extract Jira issue key from URL like https://jira.company/browse/EV-123"""
     m = re.search(r'(?:browse|issues)/([A-Za-z][A-Za-z0-9]+-\d+)', url)
@@ -267,34 +282,42 @@ def main():
                 "target_branch": project_cfg["default_branch"],
             }
 
-        # Step 3b: Try remote links for GitLab MR info (with GitLab API)
-        if not result.get("mr_info"):
-            remote_links = get_remote_links(issue_key, args.jira_host, args.jira_token, gitlab_token)
-            if remote_links:
-                result["mr_links"] = remote_links
-                # Use the first MR URL
-                if remote_links:
-                    result["mr_url"] = remote_links[0].get("url", "")
-                # Use branch info from GitLab API if available
-                # Prefer opened MRs over closed/merged ones
-                best_mr = None
-                for link in remote_links:
-                    branch = link.get("branch", "")
-                    target_branch = link.get("target_branch", "")
-                    mr_state = link.get("state", "")
-                    if branch:
-                        mr_info = {
-                            "branch": branch,
-                            "target_branch": target_branch or project_cfg["default_branch"],
-                            "state": mr_state,
-                        }
-                        # Prefer opened MRs; if no open MR found, use the last one with a branch
-                        if mr_state == "opened":
-                            best_mr = mr_info
-                            break
-                        best_mr = mr_info
-                if best_mr:
-                    result["mr_info"] = best_mr
+        # Step 3b: Try remote links for GitLab MR info (with GitLab API).
+        # ALWAYS scan them; 3a's guessed branch may be stale (bare issue name), so the
+        # authoritative pick is: first MR that is OPEN and whose source branch exists.
+        remote_links = get_remote_links(issue_key, args.jira_host, args.jira_token, gitlab_token)
+        if remote_links:
+            result["mr_links"] = remote_links
+            result["mr_url"] = remote_links[0].get("url", "")
+            best_mr = None
+            for link in remote_links:
+                branch = link.get("branch", "")
+                target_branch = link.get("target_branch", "")
+                mr_state = link.get("state", "")
+                # Resolve the project path from THIS MR's URL (authoritative), so branch
+                # existence is checked against the right repo.
+                proj_path = ""
+                murl = link.get("url", "")
+                if murl:
+                    proj_path, _ = parse_gitlab_mr_url(murl)
+                if branch:
+                    candidate = {
+                        "branch": branch,
+                        "target_branch": target_branch or project_cfg["default_branch"],
+                        "state": mr_state,
+                    }
+                    # Only accept a branch that really exists in the repo.
+                    if not proj_path or not gitlab_branch_exists(proj_path, branch, gitlab_token):
+                        print(f"[gitlab] skip MR branch not present: {branch}", file=sys.stderr)
+                        continue
+                    # Prefer OPENED MRs (authoritative); else fall back to the first with a live branch.
+                    if (mr_state or "").lower() == "opened":
+                        best_mr = candidate
+                        break
+                    if best_mr is None:
+                        best_mr = candidate
+            if best_mr:
+                result["mr_info"] = best_mr
 
         # Step 3c: If we have mr_info from GitLab, also try to find per-repo MR URLs
         # (engine and game repos may use different MRs)
