@@ -1344,35 +1344,49 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
         return 0
     # Ensure we're on the fix branch and the diffs are applied. The staged edits were
     # written to the shared checkout's working tree by _cmd_auto_edit; if a later
-    # process reset the tree (nothing-to-commit), re-apply the stored diffs.
-    _sp.run(["git", "-C", checkout, "checkout", "-B", branch], capture_output=True, text=True, timeout=60)
-    _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60)
+    # process reset the tree (nothing-to-commit), re-apply the stored diffs. git's
+    # "nothing to commit" message goes to STDOUT and is locale-dependent, so force
+    # LC_ALL=C and match on output, not stderr.
+    _git_env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0")
+    # Ensure a git identity exists in this checkout so `git commit` does not fail
+    # with "Author identity unknown" on a fresh container without global git config.
+    _sp.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
+            capture_output=True, text=True, timeout=30, env=_git_env)
+    _sp.run(["git", "-C", checkout, "config", "user.name", "codereview-agent"],
+            capture_output=True, text=True, timeout=30, env=_git_env)
+    _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
+            capture_output=True, text=True, timeout=60, env=_git_env)
+    _sp.run(["git", "-C", checkout, "add", "-A"],
+            capture_output=True, text=True, timeout=60, env=_git_env)
     _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                      capture_output=True, text=True, timeout=60)
-    if _commit.returncode != 0 and "nothing to commit" in (_commit.stderr or ""):
-        # tree is clean relative to HEAD on the fix branch -> replay stored diffs
-        import tempfile
-        for d in files:
-            diff = d.get("diff") or ""
-            if not diff:
-                continue
-            with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
-                _f.write(diff)
-                _pf = _f.name
-            _ap = _sp.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True, timeout=60)
-            try:
-                os.unlink(_pf)
-            except OSError:
-                pass
-        _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60)
-        _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                          capture_output=True, text=True, timeout=60)
-    if _commit.returncode != 0 and "nothing to commit" not in (_commit.stderr or ""):
+                      capture_output=True, text=True, timeout=60, env=_git_env)
+    if _commit.returncode != 0:
+        _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
+        if "nothing to commit" in _commit_out:
+            # tree is clean relative to HEAD on the fix branch -> replay stored diffs
+            import tempfile
+            for d in files:
+                diff = d.get("diff") or ""
+                if not diff:
+                    continue
+                with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                    _f.write(diff)
+                    _pf = _f.name
+                _ap = _sp.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
+                              timeout=60, env=_git_env)
+                try:
+                    os.unlink(_pf)
+                except OSError:
+                    pass
+            _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
+            _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                              capture_output=True, text=True, timeout=60, env=_git_env)
+    if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
         _update_card_text(app_id, app_secret, render,
                           f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
         return 0
     push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
-                   capture_output=True, text=True, timeout=180)
+                   capture_output=True, text=True, timeout=180, env=_git_env)
     if push.returncode != 0:
         _update_card_text(app_id, app_secret, render,
                           f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
@@ -1392,7 +1406,7 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             f"- 本次修复 MR：{murl if murl else '（创建失败：' + mrnote + '）'}\n"
             f"- 原评审 MR：{topic.get('mr_url') or ''}\n\n"
             f"> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
-    _finalize(key, text, render_id, [], state_file, app_id, app_secret)
+    _finalize(key, text, render, [], state_file, app_id, app_secret)
     return 0
 
 
@@ -1522,6 +1536,7 @@ DEFAULT_POLICY = {
         "guarded": {
             "re_review": {"approver": "topic_owner"},
             "apply_patch": {"approver": "topic_owner"},
+            "auto_edit": {"approver": "topic_owner"},
             "apply_local": {"approver": "topic_owner"},
             "push_remote": {"approver": "topic_owner", "branch": "{topic.review_branch}"},
             "push_fix_branch": {"approver": "topic_owner"},

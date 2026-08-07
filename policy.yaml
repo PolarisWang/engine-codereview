@@ -28,6 +28,11 @@ agent:
       approver: "topic_owner"
       confirm: ["@ok", "ok", "好的", "执行", "确认"]
 
+    # 自动改码（改码）：在共享 checkout 上跑 claude -p 修改代码并 stage。
+    # 会改本地工作树 + 消耗 LLM，故与 apply_patch 同级，仅 topic 发起人可触发。
+    auto_edit:
+      approver: "topic_owner"
+
     # 本地应用补丁（@ok 后）
     apply_local:
       approver: "topic_owner"
