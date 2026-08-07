@@ -259,6 +259,20 @@ def run(args):
     game_repo = info.get("game_repo", "")
     mr_url = info.get("mr_url", "") or ""
     mr_state = (mr_info or {}).get("state", "") or ""
+    # arch: when an MR URL is known, the review branch MUST be the MR's real
+    # source_branch (authoritative). The jira-guessed branch (bare issue name) is
+    # unreliable and yields an empty diff (da39a3ee) when the real branch is
+    # feature/.... Re-resolve from GitLab to be safe.
+    if mr_url and "merge_requests" in mr_url:
+        try:
+            import jira_parser as _jp
+            mi = _jp.gitlab_get_mr(mr_url, _env("GITLAB_TOKEN"))
+            if mi and mi.get("source_branch"):
+                review_branch = mi["source_branch"]
+                if mi.get("target_branch"):
+                    base_branch = mi["target_branch"]
+        except Exception as e:
+            print(f"[orchestrate] warn: re-resolve MR source failed: {e}", file=sys.stderr)
     pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
                               review_branch=review_branch, base_branch=base_branch,
                               mr_url=mr_url)
