@@ -25,7 +25,10 @@
 | watchdog + startup + apply | ✅ | 进程级自愈 + 容器重启恢复 + 一键部署 |
 | 健康监控 + 僵尸清理 | ✅ | healthcheck + zombie-cleaner host cron |
 | **AI 自动改码(claude -p)** | ✅ | _agent_edit_one 用 `claude -p --model deepseek-v4-flash[1m]` 驱动，窗口定位 + 迭代，产出干净 git diff |
-| **改码闭环：改码→确认→push→自动建MR** | ✅ | _cmd_auto_edit(改码/自动修复) 多文件改码→展示 diff→staged；_cmd_confirm_agent_edit(@确认) commit+push 到 `{src}-fix-{task}` + _create_or_get_mr 自动建修复MR + 回填真实 URL |
+| **改码并发安全** | ✅ | 改码由 Jenkins executor 异步执行（消除 1800s 超时 SIGKILL）；每 tick 限 1 个 agent_edit 防饥饿；approval 留在入队端 |
+| **状态存储 v2(每-topic-一文件)** | ✅ | pipeline_state 目录布局(manifest.json + topics/<key>.json + index.json + archive/)；14 个 mutator 全部 per-topic 原子写；损坏抛错保留(不再静默清空全量)；并发写不同 topic 零丢失；migrate/migrate-rollback 带备份；已对线上 21 topic 就地迁移 |
+| **token 泄漏修复** | ✅ | _ensure_checkout 改 GIT_ASKPASS(不再 token-in-URL 持久化到 .git/config)；清除 chaos-cb-2-review / chaos-cb-2-32714 的明文 glpat；env.sh 改 0600；watchdog 去掉硬编码 FEISHU_SECRET |
+| **僵尸告警修复** | ✅ | zombie-cleaner 补 source env.sh(告警从未触发已修)；healthcheck 断言 watchdog；startup.sh 修僵尸计数 bug |
 | **claude 绝对路径调用** | ✅ | _find_claude() 探测绝对路径，规避 cr-env/env.sh 剥 PATH 导致的 `claude not found` |
 | **改码路由** | ✅ | interact 可靠路由 + pending-gating 新增 `改码`/`@确认`/`自动修复` 指令 |
 
@@ -84,9 +87,10 @@
 
 ## 配置要点
 
-- **持久 env**：`/var/lib/report-server/daily/cr-env/env.sh`（GITLAB_TOKEN/FEISHU/ANTHROPIC 凭证，不入 git）
+- **持久 env**：`/var/lib/report-server/daily/cr-env/env.sh`（GITLAB_TOKEN/FEISHU/ANTHROPIC 凭证，不入 git，mode 0600）
 - **共享 workspace**：`/var/lib/report-server/daily/cr-workspace`（checkout + result + cache）
 - **共享 checkout**：`chaos-cb-2`（code_reviewer 复用 clone 缓存）
+- **状态存储 v2（目录）**：`/root/.codereview-pipeline-state.json` 现为**目录**（manifest.json + topics/<hash>.json + index.json + archive/），schema_version=2。原 v1 单文件备份在 `.bak-v1`（回滚入口 `pipeline_state.py migrate-rollback`）。topic key 可能含 `/`（Jira URL），磁盘文件名用 sha1 hash 映射。
 - **claude CLI**：`/usr/local/bin/claude`（host 与容器 `chaos-agent-cr` 均可用；`_find_claude()` 探测绝对路径）。settings.json `skipDangerousModePermissionPrompt=false`
 - **EDIT_MODEL**：`deepseek-v4-flash[1m]`（通过 `claude -p` 调用）
 - **host cron**：healthcheck(5min) + zombie(5min) + cleanup(每天3:15)
