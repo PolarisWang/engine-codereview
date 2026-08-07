@@ -1599,13 +1599,48 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
 
 
 def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
-    """指令 `4/关闭`: owner/admin 关闭话题。"""
+    """指令 `4/关闭`: owner/admin 关闭话题。关闭时会一并关闭该话题创建的 OPEN MR。"""
     ok, why = _approve(key, topic, actor, "close_topic")
     if not ok:
         _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
         return
+    closed = _close_topic_created_mrs(topic)
     pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
-    _update_card_text(app_id, app_secret, render_id, "🔒 本话题已关闭，不再处理。")
+    note = f"🔒 本话题已关闭。{closed} 不处理。" if closed else "🔒 本话题已关闭，不再处理。"
+    _update_card_text(app_id, app_secret, render_id, note)
+
+
+def _close_topic_created_mrs(topic):
+    """Find the topic's fix-branch MRs (source_branch == {src}-fix-{task}) that are still
+    OPEN and close them. Returns a human note ('' if none). Only closes MRs created for
+    THIS topic's fix branch; leaves the original review MR and unrelated MRs untouched."""
+    import urllib.request, urllib.error, urllib.parse, json as _json
+    pp = _project_path(topic)
+    tok = _env("GITLAB_TOKEN")
+    if not pp or not tok:
+        return ""
+    new_branch = _new_branch_name(topic)
+    proj = urllib.parse.quote(pp, safe="")
+    try:
+        r = urllib.request.Request(
+            f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests?state=opened&per_page=100",
+            headers={"PRIVATE-TOKEN": tok})
+        mrs = _json.loads(urllib.request.urlopen(r, timeout=20).read())
+    except Exception:
+        return ""
+    closed = 0
+    for m in mrs:
+        if m.get("source_branch") == new_branch:
+            try:
+                data = _json.dumps({"state_event": "close"}).encode()
+                req = urllib.request.Request(
+                    f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests/{m.get('iid')}",
+                    data=data, method="PUT", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=20)
+                closed += 1
+            except Exception:
+                pass
+    return f"（已关闭本轮创建的 {closed} 个 OPEN MR）" if closed else ""
 
 
 def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
