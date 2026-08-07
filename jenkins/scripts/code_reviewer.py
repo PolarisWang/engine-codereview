@@ -245,7 +245,12 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         print(f"[git] WARNING: No GITLAB_TOKEN set, clone may fail", flush=True)
 
     # If MR URL is available, fetch diff directly from GitLab API (most reliable)
-    if mr_url and gitlab_token:
+    # NOTE (arch): this pins diff_hash to the MR's fixed diff and ignores later
+    # pushes to the source branch, so findings go stale vs the real code — which is
+    # exactly why auto-fix findings didn't match the checkout. We now prefer the REAL
+    # git-branch diff (below); MR diffs API stays only as a last-resort fallback.
+    use_mr_api_diff = False  # flip to True only if you explicitly want MR-snapshot diff
+    if use_mr_api_diff and mr_url and gitlab_token:
         print(f"[gitlab] Fetching MR diff from {mr_url}", flush=True)
         mr_diff = get_mr_diff_from_gitlab(mr_url, gitlab_token)
         if mr_diff and mr_diff["diff_text"]:
