@@ -356,12 +356,12 @@ def _append_fix_options(summary, branch):
     so button callbacks never fire — see arch-A note)."""
     hint = (
         "\n\n---\n🤖 **交互**：回复本话题 `@机器人` 并附带指令：\n"
-        f"  - `1` 生成修复补丁方案\n"
+        f"  - `指引` 给出每个关键问题的修改指引（用于人工改码）\n"
         f"  - `2` 重新审查 `{branch}`\n"
         f"  - `3 <关键词>` 解释某个 finding\n"
-        f"  - `4` 关闭话题（发起人或管理员）\n"
         f"  - `MR单` 生成 MR 描述\n"
         f"  - `/状态` 当前审查状态\n"
+        f"  - 改完推到新分支后 `更新MR`\n"
         f"  - 直接提问会自动按当前 diff 答疑"
     )
     return summary + hint
@@ -642,6 +642,10 @@ def interact(args):
         return 0
     if word in ("预览", "预览补丁", "patch预览"):
         text = _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace)
+        _finalize(key, text, render_id, [], state_file, app_id, app_secret)
+        return 0
+    if word in ("指引", "修改指引", "怎么改"):
+        text = _generate_fix_guidance(topic, all_findings, api_key, base_url, model, workspace)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
     if word in ("应用并提交", "确认提交", "push并建mr"):
@@ -1001,6 +1005,53 @@ def _render_patch_preview(topic, all_findings, api_key, base_url, model, workspa
     if not ok and not failed:
         lines.append("\n（没有可自动修复的 findings。）")
     lines.append("\n> 确认后回复 `@机器人 应用并提交` 才会 push 新分支 + 建 MR。")
+    return "\n".join(lines)
+
+
+def _generate_fix_guidance(topic, all_findings, api_key, base_url, model, workspace=None):
+    """Route-P: give PRECISE per-critical modification guidance ("which file / which
+    location / how to change") so a developer can implement the fix reliably. LLM is
+    good at this; producing apply-able diffs is not reliable ("Y" failed). Returns
+    human guidance text."""
+    ws = workspace or _DEFAULT_WORKSPACE
+    src = topic.get("review_branch") or ""
+    task = topic.get("jira_key") or "task"
+    branch = f"{src}-fix-{task}" if src else f"fix-{task}"
+    crit = [f for f in (all_findings or [])
+            if (f.get("severity") or "").lower() in ("critical", "high")]
+    show = crit or (all_findings or [])[:3]
+    checkout, _err = _ensure_checkout(topic, ws)
+    lines = [f"🛠 **修改指引（供人工实现）**\n",
+             f"建议新分支：`{branch}`\n"]
+    for f in show[:3]:
+        file = f.get("file") or f.get("path") or ""
+        issue = (f.get("issue") or "").strip()
+        suggestion = (f.get("suggestion") or "").strip()
+        ctx = ""
+        if checkout and file:
+            p = os.path.join(checkout, file)
+            if os.path.isfile(p):
+                ctx = open(p, encoding="utf-8", errors="ignore").read()
+        lines.append(f"\n**🔴 {file}**")
+        lines.append(f"- 问题：{issue[:200]}")
+        if suggestion:
+            lines.append(f"- 建议：{suggestion[:200]}")
+        if ctx:
+            sysp = ("You give CONCISE, PRECISE code-change instructions to a developer "
+                    "for one file. Output: (1) the exact location (function/block/line "
+                    "range) to change, (2) what to change it to (specific). No full file "
+                    "rewrite; no diff required; no markdown fences. Keep under 200 chars.")
+            prompt = (f"FILE: {file}\n\n```\n{ctx[:5000]}\n```\n\nISSUE: {issue}\n\n"
+                      f"Give the precise change instructions.")
+            try:
+                g = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=400)
+                if g:
+                    lines.append(f"- 改动位置/方式：{g[:400]}")
+            except Exception:
+                pass
+        else:
+            lines.append("- （无法读取真实文件，请按上述问题/建议自查）")
+    lines.append("\n> 改完后把新分支推到 GitLab，回复 `@机器人 更新MR` 生成/更新 MR。")
     return "\n".join(lines)
 
 
