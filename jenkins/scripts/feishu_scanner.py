@@ -246,16 +246,14 @@ def main():
     # ── Defense-in-depth: drop topics already CLOSED in the pipeline state ──
     if args.pipeline_state_file:
         try:
-            with open(args.pipeline_state_file, encoding="utf-8") as f:
-                pstate = json.load(f)
-            topics = pstate.get("topics") or {}
-            closed_ids = {k for k, t in topics.items() if (t or {}).get("phase") == "CLOSED"}
+            import pipeline_state as ps
+            closed_ids = set(ps.terminal_topic_keys(args.pipeline_state_file))
             if closed_ids:
                 before = len(items)
                 items = [it for it in items if it.get("message_id") not in closed_ids]
                 if len(items) != before:
                     print(f"[feishu] skipped {before - len(items)} CLOSED topic(s)", flush=True)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except Exception:
             print("[feishu] could not read pipeline state for CLOSED filter; continuing", file=sys.stderr)
 
     # ── Write output ──

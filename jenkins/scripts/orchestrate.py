@@ -340,12 +340,7 @@ def run(args):
     if reply_msg_id:
         # Persist the rendered review summary so later card refreshes (e.g. ci-poll)
         # can append CI status WITHOUT wiping the findings.
-        st = pipeline_state.load_state(state_file)
-        t2 = st["topics"].get(key)
-        if t2 is not None:
-            t2["review_summary"] = summary
-            st["updated_at"] = pipeline_state._now_iso()
-            pipeline_state.save_state(st, state_file)
+        pipeline_state.set_topic_fields(state_file, key, review_summary=summary)
         rc, _, err = _run_py("feishu_notifier.py", [
             "update-reply", "--app-id", app_id, "--app-secret", app_secret,
             "--message-id", reply_msg_id, "--message-base64", _b64_str(summary)])
@@ -2389,12 +2384,7 @@ def cmd_ci(args):
             "--message-id", render, "--message-base64",
             _b64_str(base + "\n\n---\n" + block)])
     # record last reported status to prevent repeat posts
-    st = pipeline_state.load_state(state_file)
-    topic2 = st["topics"].get(key)
-    if topic2 is not None:
-        topic2["ci_status"] = new_status
-        st["updated_at"] = pipeline_state._now_iso()
-        pipeline_state.save_state(st, state_file)
+    pipeline_state.set_topic_fields(state_file, key, ci_status=new_status)
     return 0
 
 

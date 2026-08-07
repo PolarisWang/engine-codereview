@@ -512,6 +512,21 @@ def transition(path, key, *, to, status, last_error="", render_msg_id=None,
     return topic
 
 
+def set_topic_fields(path, key, **fields):
+    """Atomically set one or more arbitrary fields on a topic (dir mode: single-file
+    write). Used by callers that previously hand-rolled whole-document read-modify-
+    writes (e.g. review_summary, ci_status), which would corrupt concurrent writes.
+    Returns the updated topic, or None if the topic doesn't exist."""
+    topic = _load_topic(path, key)
+    if topic is None:
+        return None
+    for k, v in fields.items():
+        topic[k] = v
+    topic["updated_at"] = _now_iso()
+    _save_topic(path, key, topic)
+    return topic
+
+
 # ── Retry with exponential backoff ───────────────────────────────────────────
 
 # Backoff schedule (seconds) between automatic retries of a failed topic, by
