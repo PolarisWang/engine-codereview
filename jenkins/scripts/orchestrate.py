@@ -1704,7 +1704,19 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
             return m.get("iid"), m.get("web_url", ""), new_branch, "detected existing"
     if not create_if_missing:
         return None, None, new_branch, "no MR for fix branch yet"
-    # 2) create
+    # 2) Only create if the fix branch actually has changes vs target — never create an
+    #    empty/meaningless MR (a real defect we hit: an MR with 0 diffs and wrong intent).
+    target = topic.get("base_branch") or "master"
+    try:
+        cmp = _get(f"https://gitlab.booming-inc.com/api/v4/projects/{proj}"
+                   f"/repository/compare?from={urllib.parse.quote(target, safe='')}"
+                   f"&to={urllib.parse.quote(new_branch, safe='')}")
+        diffs = cmp.get("diffs") or []
+    except Exception:
+        diffs = []
+    if not diffs:
+        return None, None, new_branch, "fix 分支相对 " + target + " 无改动，先推送修复再更新MR"
+    # 3) create
     title = f"Fix {topic.get('jira_key') or topic.get('message_id') or ''}: code review fixes"
     # NOTE: must not call _generate_mr_card here (it calls back into _create_or_get_mr
     # -> infinite recursion). Build a simple description instead.
@@ -1713,7 +1725,6 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
     for f in (crit or (all_findings or []))[:5]:
         desc_lines.append(f"- {(f.get('file') or '?')}: {(f.get('issue') or '').strip()[:90]}")
     desc = "\n".join(desc_lines)
-    target = topic.get("base_branch") or "master"
     payload = _json.dumps({"source_branch": new_branch, "target_branch": target,
                            "title": title, "description": desc}).encode()
     try:
