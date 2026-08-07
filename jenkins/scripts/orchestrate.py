@@ -2032,7 +2032,10 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         rc, out, err = _run_py("code_reviewer.py", base_args + ["--output", out_path + ".dry", "--dry"])
         dry = _read_json_file(out_path + ".dry") or {}
         diff_hash = dry.get("diff_hash") or ""
-        if diff_hash:
+        # Guard: an empty diff (sha1 of "") must never be cached/reused as a valid
+        # review — it means the branch/base produced no diff. Only cache real diffs.
+        EMPTY_DIFF_HASHES = {"da39a3ee5e6b4b0d3255bfef95601890afd80709", ""}
+        if diff_hash not in EMPTY_DIFF_HASHES:
             cached = os.path.join(cache_dir, f"{key}_{repo}_{diff_hash}.json")
             if os.path.exists(cached):
                 # Reuse cached review result (same diff, already reviewed).
@@ -2046,8 +2049,8 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         # 2) Real review (LLM).
         rc2, _, err2 = _run_py("code_reviewer.py", base_args + ["--output", out_path])
         res = _read_json_file(out_path)
-        # Save to cache for reuse if we have a diff hash.
-        if res and diff_hash:
+        # Save to cache for reuse only for a REAL (non-empty) diff.
+        if res and diff_hash and diff_hash not in EMPTY_DIFF_HASHES:
             os.makedirs(cache_dir, exist_ok=True)
             with open(os.path.join(cache_dir, f"{key}_{repo}_{diff_hash}.json"), "w", encoding="utf-8") as f:
                 json.dump(res, f, ensure_ascii=False)
