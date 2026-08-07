@@ -641,7 +641,7 @@ def interact(args):
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
     if word in ("预览", "预览补丁", "patch预览"):
-        text = _render_patch_preview(topic, all_findings, api_key, base_url, model)
+        text = _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
     if word in ("应用并提交", "确认提交", "push并建mr"):
@@ -885,21 +885,122 @@ def _extract_clean_diff(raw):
     return diff.strip()
 
 
-def _render_patch_preview(topic, all_findings, api_key, base_url, model):
-    """Build a human preview: real diffs (if obtainable) + proposed new branch name."""
-    real = _generate_real_patch(topic, all_findings, api_key, base_url, model)
+def _ensure_checkout(topic, workspace):
+    """Clone (or reuse) the topic's review branch to a deterministic checkout dir in
+    workspace. Returns (checkout_dir, err) or (None, err). Uses oauth2 token auth."""
+    import subprocess as _sp
+    src = topic.get("review_branch") or topic.get("base_branch") or ""
+    if not src:
+        return None, "no review branch"
+    mr_url = topic.get("mr_url") or ""
+    import jira_parser as _jp
+    pp, _ = _jp.parse_gitlab_mr_url(mr_url) if "merge_requests" in mr_url else (None, None)
+    if not pp:
+        return None, "no mr project path"
+    repo_name = pp.rstrip("/").split("/")[-1]
+    dest = os.path.join(workspace, f"{repo_name}-review")
+    tok = _env("GITLAB_TOKEN")
+    if not tok or os.path.isdir(os.path.join(dest, ".git")):
+        if os.path.isdir(os.path.join(dest, ".git")):
+            return dest, None
+        return None, "no GITLAB_TOKEN for checkout"
+    repo_url = f"https://oauth2:{tok}@gitlab.booming-inc.com/{pp}.git"
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        r = _sp.run(["git", "clone", "--quiet", "--single-branch", "--branch", src,
+                     "--depth", "2", repo_url, dest], capture_output=True, text=True,
+                    env=env, timeout=600)
+        if r.returncode != 0 or not os.path.isdir(os.path.join(dest, ".git")):
+            return None, f"clone failed: {r.stderr[:200]}"
+        return dest, None
+    except Exception as e:
+        return None, f"clone err: {e}"
+
+
+def _git_apply_check(checkout, diff_text):
+    """Run `git apply --check` on a diff. Returns (ok, err)."""
+    import subprocess as _sp, tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+        f.write(diff_text or "")
+        pf = f.name
+    try:
+        r = _sp.run(["git", "-C", checkout, "apply", "--check", pf],
+                    capture_output=True, text=True, timeout=120)
+        return r.returncode == 0, r.stderr or r.stdout
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try: os.unlink(pf)
+        except OSError: pass
+
+
+def _auto_fix_in_checkout(topic, all_findings, api_key, base_url, model, workspace,
+                          max_rounds=4):
+    """Y: generate LLM diffs in a REAL checkout and validate with `git apply --check`,
+    iterating per finding until the patch applies (or rounds exhausted). Returns
+    (ok_diffs, failed, branch_name, checkout). Never pushes."""
     src = topic.get("review_branch") or ""
     task = topic.get("jira_key") or "task"
-    new_branch = f"{src}-fix-{task}" if src else f"fix-{task}"
-    lines = [f"✏️ **补丁预览**（未应用/未推送）\n",
-             f"建议新分支：`{new_branch}`（基于源分支，不覆盖原始）\n"]
-    if real:
-        for r in real:
-            lines.append(f"\n**{r['file']}**\n```diff\n{r['diff'][:1200]}\n```")
-    else:
-        fallback = _build_patch_preview_target(all_findings, "all")
-        lines.append("\n（无法读到文件/生成真实 diff，给出建议：）\n" + fallback)
-    lines.append("\n> 确认无误后回复 `@机器人 应用并提交` 才会 push 新分支 + 建 MR。")
+    branch_name = f"{src}-fix-{task}" if src else f"fix-{task}"
+    checkout, err = _ensure_checkout(topic, workspace)
+    if err:
+        return [], [], branch_name, err
+    crit = [f for f in (all_findings or [])
+            if (f.get("severity") or "").lower() in ("critical", "high")]
+    show = crit or (all_findings or [])[:3]
+    ok_diffs, failed = [], []
+    for f in show[:3]:
+        file = f.get("file") or f.get("path") or ""
+        if not file or not os.path.isfile(os.path.join(checkout, file)):
+            failed.append((file, "checkout 缺失该文件"))
+            continue
+        issue = (f.get("issue") or "")[:500]
+        attained = False
+        for rnd in range(max_rounds):
+            content = open(os.path.join(checkout, file), encoding="utf-8", errors="ignore").read()
+            sysp = ("You fix a code review finding. Output ONE git-apply-able unified diff "
+                    "for the file, starting with 'diff --git'. Exact hunks with correct "
+                    "line numbers/context from the CURRENT file. No prose, no fences. "
+                    "If cannot safely fix, reply NO_SAFE_FIX.")
+            prompt = (f"FILE: {file}\n\n```\n{content[:6000]}\n```\n\nISSUE: {issue}\n\n"
+                      f"Round {rnd+1}/{max_rounds}. Produce the unified diff.")
+            raw = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=1800)
+            clean = _extract_clean_diff(raw)
+            if not clean:
+                failed.append((file, "LLM 未能生成干净 diff"))
+                break
+            ok, apply_err = _git_apply_check(checkout, clean)
+            if ok:
+                ok_diffs.append({"file": file, "diff": clean})
+                attained = True
+                break
+            # feed error back into issue text for next round
+            issue = issue + f"\n[apply failed round {rnd+1}: {apply_err[:200]}. Produce a corrected diff.]"
+        if not attained:
+            failed.append((file, "apply --check 始终失败"))
+    return ok_diffs, failed, branch_name, None
+
+
+def _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace=None):
+    """Build a human preview using the Y auto-fix (real checkout + apply --check)."""
+    ok, failed, branch_name, err = _auto_fix_in_checkout(
+        topic, all_findings, api_key, base_url, model,
+        workspace or _DEFAULT_WORKSPACE)
+    lines = [f"✏️ **补丁预览（严格校验，可 apply 才展示）**\n",
+             f"建议新分支：`{branch_name}`（基于源分支，不覆盖原始）\n"]
+    if err:
+        lines.append(f"\n⚠️ {err}")
+    if ok:
+        for r in ok:
+            lines.append(f"\n✅ **{r['file']}**\n```diff\n{r['diff'][:1200]}\n```")
+    if failed:
+        lines.append("\n❌ **自动修复失败的文件**：")
+        for file, why in failed:
+            lines.append(f"- `{file}`: {why}")
+        lines.append("\n（失败文件请人工修改；机器人不会 push 未通过 `git apply --check` 的补丁。）")
+    if not ok and not failed:
+        lines.append("\n（没有可自动修复的 findings。）")
+    lines.append("\n> 确认后回复 `@机器人 应用并提交` 才会 push 新分支 + 建 MR。")
     return "\n".join(lines)
 
 
