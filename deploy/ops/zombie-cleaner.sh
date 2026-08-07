@@ -26,6 +26,12 @@
 set -u
 CONTAINER="${CONTAINER:-chaos-agent-cr}"
 THRESHOLD="${THRESHOLD:-5000}"
+# Source the shared env so FEISHU_WEBHOOK_URL is available in cron context (the
+# cron job does not set it; without this the Feishu alert branch never fires).
+ENV_FILE="${ENV_FILE:-/var/lib/report-server/daily/cr-env/env.sh}"
+set -a
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+set +a
 WEBHOOK_URL="${FEISHU_WEBHOOK_URL:-}"
 CMD="${1:-probe}"
 

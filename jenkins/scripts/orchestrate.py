@@ -954,7 +954,10 @@ def _extract_clean_diff(raw):
 
 def _ensure_checkout(topic, workspace):
     """Clone (or reuse) the topic's review branch to a deterministic checkout dir in
-    workspace. Returns (checkout_dir, err) or (None, err). Uses oauth2 token auth."""
+    workspace. Returns (checkout_dir, err) or (None, err). Authenticates via the
+    GIT_ASKPASS helper (token delivered through env, never on argv or in the clone
+    URL) so the token is not persisted into <checkout>/.git/config — same rule the
+    reviewer's prepare_repo uses."""
     import subprocess as _sp
     src = topic.get("review_branch") or topic.get("base_branch") or ""
     if not src:
@@ -967,12 +970,16 @@ def _ensure_checkout(topic, workspace):
     repo_name = pp.rstrip("/").split("/")[-1]
     dest = os.path.join(workspace, f"{repo_name}-review")
     tok = _env("GITLAB_TOKEN")
-    if not tok or os.path.isdir(os.path.join(dest, ".git")):
-        if os.path.isdir(os.path.join(dest, ".git")):
-            return dest, None
+    if os.path.isdir(os.path.join(dest, ".git")):
+        return dest, None
+    if not tok:
         return None, "no GITLAB_TOKEN for checkout"
-    repo_url = f"https://oauth2:{tok}@gitlab.booming-inc.com/{pp}.git"
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    # Clean URL — no token; git_askpass.sh supplies credentials via env.
+    repo_url = f"https://gitlab.booming-inc.com/{pp}.git"
+    _askpass = os.path.join(SCRIPTS_DIR, "git_askpass.sh")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=_askpass,
+               CR_GITLAB_USER=_env("GITLAB_USER", "gitlab-ci-token"),
+               CR_GITLAB_TOKEN=tok)
     try:
         r = _sp.run(["git", "clone", "--quiet", "--single-branch", "--branch", src,
                      "--depth", "2", repo_url, dest], capture_output=True, text=True,

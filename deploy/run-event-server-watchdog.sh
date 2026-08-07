@@ -51,9 +51,12 @@ fi
 set +a
 export HOME="${HOME:-/root}"
 export PATH="${PATH:-/usr/bin:/bin}"
-# Belt-and-suspenders: these must never be empty for the bot to operate.
-export FEISHU_APP_ID="${FEISHU_APP_ID:-cli_aab26e8f92789bda}"
-export FEISHU_APP_SECRET="${FEISHU_APP_SECRET:-3A1h16w3pODY47pcmm1CedyGqyCaphyn}"
+# FEISHU_APP_ID / FEISHU_APP_SECRET must come from ENV_FILE (cr-env/env.sh),
+# NOT from fallbacks in this file — a committed literal would leak the secret.
+# Warn loudly if they are missing so a mis-configured env is obvious.
+if [ -z "${FEISHU_APP_ID:-}" ] || [ -z "${FEISHU_APP_SECRET:-}" ]; then
+    echo "[watchdog] WARNING: FEISHU_APP_ID/FEISHU_APP_SECRET empty (expected from $ENV_FILE); bot auth will fail." >&2
+fi
 
 cd "$SCRIPTS_DIR" || { echo "[watchdog] cannot cd $SCRIPTS_DIR"; exit 1; }
 

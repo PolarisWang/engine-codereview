@@ -65,7 +65,8 @@ else
 fi
 
 # 4. Health / pid-pressure report (zombies indicate terminal-process buildup to clean later).
-ZOMBIES=$(ps -eo stat= 2>/dev/null | grep -c '^Z' || echo 0)
+ZOMBIES=$(ps -eo stat= 2>/dev/null | grep -c '^Z' || true)
+[ -z "$ZOMBIES" ] && ZOMBIES=0
 TOTAL=$(ps -e -o pid= 2>/dev/null | wc -l)
 echo "[startup] pid-pressure: total=$TOTAL zombies=$ZOMBIES"
 if [ "$ZOMBIES" -gt 5000 ]; then

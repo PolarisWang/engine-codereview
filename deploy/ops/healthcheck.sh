@@ -37,6 +37,11 @@ ok=1
 WATCHDOG=$(sudo docker exec "$CONTAINER" bash -c "pgrep -fc run-event-server-watchdog.sh 2>/dev/null" 2>/dev/null || echo 0)
 BOT=$(sudo docker exec "$CONTAINER" bash -c "pgrep -f 'python3 -B /home/jenkins/workspace/code-review-pipeline/jenkins/scripts/event_server.py --mode ws' 2>/dev/null | wc -l" 2>/dev/null || echo 0)
 echo "[health] watchdog_pid=$WATCHDOG bot_count=$BOT"
+if [ "${WATCHDOG:-0}" -lt 1 ]; then
+    echo "  FAIL: no watchdog (a dead watchdog means the next bot crash is permanent)"
+    alert "CodeReview watchdog 不在" "容器 $CONTAINER 里没有 run-event-server-watchdog.sh。\n跑 \`deploy/startup.sh\` 拉起。"
+    ok=0
+fi
 if [ "$BOT" -lt 1 ]; then
     echo "  FAIL: no event-server bot process"
     alert "CodeReview bot 进程不在" "容器 $CONTAINER 里没有 event_server.py 进程。\n跑 \`deploy/startup.sh\` 拉起。"
@@ -53,8 +58,8 @@ fi
 LATEST=$(sudo docker exec "$CONTAINER" bash -c "ls -t /tmp/ev-server-logs/ 2>/dev/null | head -1" 2>/dev/null)
 CONN=0; LOGAGE=0
 if [ -n "$LATEST" ]; then
-    CONN=$(sudo docker exec "$CONTAINER" bash -c "grep -c 'connected to wss' /tmp/ev-server-logs/$LATEST 2>/dev/null" 2>/dev/null || echo 0)
-    LOGAGE=$(sudo docker exec "$CONTAINER" bash -c "echo \$(( \$(date +%s) - \$(stat -c %Y /tmp/ev-server-logs/$LATEST 2>/dev/null || date +%s) ))" 2>/dev/null || echo 0)
+    CONN=$(sudo docker exec "$CONTAINER" bash -c "grep -c 'connected to wss' \"/tmp/ev-server-logs/$LATEST\" 2>/dev/null" 2>/dev/null || echo 0)
+    LOGAGE=$(sudo docker exec "$CONTAINER" bash -c "echo \$(( \$(date +%s) - \$(stat -c %Y \"/tmp/ev-server-logs/$LATEST\" 2>/dev/null || date +%s) ))" 2>/dev/null || echo 0)
 fi
 echo "[health] bot_log_conn=$CONN log_age_s=$LOGAGE"
 if [ "$CONN" -lt 1 ]; then
