@@ -51,6 +51,29 @@ REPO_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", ".."))
 # container at the same path, so it survives restarts and is reachable from Jenkins.
 _DEFAULT_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
 
+# ── Load credentials from the persistent env (cr-env) into the process ─────────
+# The interaction/executor process may carry an EMPTY GITLAB_TOKEN (key present but
+# blank), which silently makes code_reviewer fail to fetch -> empty diff (da39a3ee).
+# Ensure non-empty credential values from the persistent env (bind-mounted, secrets
+# not in git) are used for any key whose current os.environ value is missing/empty.
+_PERSISTENT_ENV = "/var/lib/report-server/daily/cr-env/env.sh"
+_CRED_KEYS = ("GITLAB_TOKEN", "GITLAB_USER", "JIRA_HOST", "JIRA_TOKEN",
+              "CR_GITLAB_TOKEN", "CR_GITLAB_USER")
+for _k in _CRED_KEYS:
+    if not os.environ.get(_k):
+        try:
+            with open(_PERSISTENT_ENV, encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line.startswith(_k + "="):
+                        _v = _line.split("=", 1)[1].strip().strip('"')
+                        if _v:
+                            os.environ[_k] = _v
+                        break
+        except Exception:
+            pass
+
+
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
