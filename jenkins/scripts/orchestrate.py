@@ -2055,6 +2055,12 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         rc, out, err = _run_py("code_reviewer.py", base_args + ["--output", out_path + ".dry", "--dry"])
         dry = _read_json_file(out_path + ".dry") or {}
         diff_hash = dry.get("diff_hash") or ""
+        # DEBUG (finding empty-diff vs sim): log env + dry outcome
+        import logging as _lg
+        _dbg = (f"[deepdebug] repo={repo} branch={rb} base={baseb} "
+                f"rc={rc} GITLAB_TOKEN_len={len(_env('GITLAB_TOKEN'))} "
+                f"diff_hash={diff_hash[:8]} changed={len(dry.get('changed_files') or [])} stderr={err[:80]}")
+        print(_dbg, flush=True)
         # Guard: an empty diff (sha1 of "") must never be cached/reused as a valid
         # review — it means the branch/base produced no diff. Only cache real diffs.
         EMPTY_DIFF_HASHES = {"da39a3ee5e6b4b0d3255bfef95601890afd80709", ""}
