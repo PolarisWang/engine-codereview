@@ -636,7 +636,7 @@ def interact(args):
     if word in ("4", "关闭", "关闭话题"):
         _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor)
         return 0
-    if word in ("mr", "生成mr", "出mr单", "mr单"):
+    if word in ("mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单"):
         text = _generate_mr_card(topic, all_findings, workspace, key)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
@@ -1630,19 +1630,79 @@ def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
     return 0
 
 
+def _new_branch_name(topic):
+    src = topic.get("review_branch") or ""
+    task = topic.get("jira_key") or "task"
+    return f"{src}-fix-{task}" if src else f"fix-{task}"
+
+
+def _project_path(topic):
+    mr_url = topic.get("mr_url") or ""
+    if "merge_requests" in mr_url:
+        import jira_parser as _jp
+        pp, _ = _jp.parse_gitlab_mr_url(mr_url)
+        return pp
+    return ""
+
+
+def _create_or_get_mr(topic, all_findings, create_if_missing=False):
+    """Detect an MR whose source_branch == the fix's new branch; optionally create it.
+    Returns (mr_iid, mr_web_url, source_branch, note)."""
+    import urllib.request, urllib.error, urllib.parse, json as _json
+    pp = _project_path(topic)
+    tok = _env("GITLAB_TOKEN")
+    if not pp or not tok:
+        return None, None, "", "no project path or token"
+    new_branch = _new_branch_name(topic)
+    proj = urllib.parse.quote(pp, safe="")
+    def _get(url):
+        r = urllib.request.Request(url, headers={"PRIVATE-TOKEN": tok})
+        return _json.loads(urllib.request.urlopen(r, timeout=20).read())
+    # 1) detect existing MR on the fix branch
+    try:
+        mrs = _get(f"https://gitlab.booming-inc.com/api/v4/projects/{proj}"
+                   f"/merge_requests?state=all&per_page=50")
+    except Exception:
+        mrs = []
+    for m in mrs:
+        if m.get("source_branch") == new_branch:
+            return m.get("iid"), m.get("web_url", ""), new_branch, "detected existing"
+    if not create_if_missing:
+        return None, None, new_branch, "no MR for fix branch yet"
+    # 2) create
+    title = f"Fix {topic.get('jira_key') or topic.get('message_id') or ''}: code review fixes"
+    desc = _generate_mr_card(topic, all_findings, _DEFAULT_WORKSPACE, topic.get("message_id") or "")
+    target = topic.get("base_branch") or "master"
+    payload = _json.dumps({"source_branch": new_branch, "target_branch": target,
+                           "title": title, "description": desc}).encode()
+    try:
+        r = urllib.request.Request(
+            f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests",
+            data=payload, method="POST", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
+        m = _json.loads(urllib.request.urlopen(r, timeout=30).read())
+        return m.get("iid"), m.get("web_url", ""), new_branch, "created"
+    except urllib.error.HTTPError as e:
+        return None, None, new_branch, f"create failed HTTP {e.code}: {e.read()[:150]}"
+
+
 def _generate_mr_card(topic, all_findings, workspace, key):
-    """指令 `mr/生成MR单`: 基于 findings + 已应用修改，生成一份 MR 描述（仅文案，不 push）。"""
+    """指令 `mr/生成MR单/更新MR`: 基于 findings + 已应用修改生成 MR 描述。区分
+    评审 MR（原始）与本次修复 MR（新分支）。检测/创建新 MR 后填真实新 URL。"""
     jira = topic.get("jira_key") or key
     branch = topic.get("review_branch") or ""
+    new_branch = _new_branch_name(topic)
+    # detect/create fix-branch MR to get its REAL url
+    mriid, murl, nbranch, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
     mr_url = topic.get("mr_url") or ""
     c = (topic.get("applied_patches") or [])
     lines = [f"# MR 单：{jira}", ""]
-    if branch:
-        lines.append(f"**源分支**：`{branch}`")
-    if mr_url:
-        lines.append(f"**MR**：{mr_url}")
+    lines.append(f"**评审 MR**（原始）: {mr_url if mr_url else '（无）'}")
+    lines.append(f"**本次修复分支**: `{nbranch or new_branch}`")
+    if murl:
+        lines.append(f"**本次修复 MR**: {murl}　({mrnote})")
+    elif mrnote:
+        lines.append(f"**本次修复 MR**: 未创建 — {mrnote}")
     lines.append("")
-    # 变更要点来自 findings（最多 5 条）
     lines.append("**变更要点：**")
     if all_findings:
         crit = [f for f in all_findings if (f.get('severity') or '').lower() in ('critical', 'high')]
@@ -1653,12 +1713,9 @@ def _generate_mr_card(topic, all_findings, workspace, key):
     else:
         lines.append("- （无 findings）")
     lines.append("")
-    if c:
-        lines.append(f"**已应用补丁**：{len(c)} 个。")
-    else:
-        lines.append("**已应用补丁**：无。")
+    lines.append(f"**已应用补丁**：{len(c)} 个。" if c else "**已应用补丁**：无。")
     lines.append("")
-    lines.append("> 由 code-review 机器人生成，请人工核对后用于 GitLab MR 提交。")
+    lines.append("> 本次修复 MR 为机器人通过 GitLab API 创建/检测得到；请人工核对后合并。")
     return "\n".join(lines)
 
 
