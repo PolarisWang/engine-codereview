@@ -1088,7 +1088,7 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
     return file, d.stdout, None
 
 
-EDIT_MODEL = "deepseek-v4-flash[1m]"  # as configured for Claude Code
+EDIT_MODEL = "deepseek-v4-flash"  # gateway-available model (deepseek-v4-flash[1m] is 503/model_not_found in this gateway)
 
 
 def _locate_context(content, needle):
@@ -1110,8 +1110,7 @@ def _locate_context(content, needle):
 def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_MODEL, max_rounds=4):
     """Edit one file's exact problem window with the model, apply, and iterate on
     `git apply --check` feedback. Returns (file, git_diff, ok, error)."""
-    import subprocess as _sp, re as _re
-    p = os.path.join(checkout, file)
+    import subprocess as _sp, re as _re    p = os.path.join(checkout, file)
     if not os.path.isfile(p):
         return None, "", False, f"file missing: {file}"
     # a distinctive needle from the issue to locate context (prefer an alphanumeric token)
@@ -1136,7 +1135,7 @@ def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_
         if prev_bad:
             prompt += f"\n[previous fix failed to apply, error: {prev_bad[:200]}. Correct the window so git apply succeeds.]"
         raw = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=4000)
-        m = _re.search(r"@@START@@(.*?)@@END@@", raw or "", re.S)
+        m = _re.search(r"@@START@@(.*?)@@END@@", raw or "", _re.S)
         if not m:
             prev_bad = "no @@START@@ block"
             continue
