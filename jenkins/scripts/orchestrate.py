@@ -1110,7 +1110,8 @@ def _locate_context(content, needle):
 def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_MODEL, max_rounds=4):
     """Edit one file's exact problem window with the model, apply, and iterate on
     `git apply --check` feedback. Returns (file, git_diff, ok, error)."""
-    import subprocess as _sp, re as _re    p = os.path.join(checkout, file)
+    import subprocess as _sp, re as _re
+    p = os.path.join(checkout, file)
     if not os.path.isfile(p):
         return None, "", False, f"file missing: {file}"
     # a distinctive needle from the issue to locate context (prefer an alphanumeric token)
