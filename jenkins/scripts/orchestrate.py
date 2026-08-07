@@ -1700,7 +1700,9 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
     except Exception:
         mrs = []
     for m in mrs:
-        if m.get("source_branch") == new_branch:
+        # Only treat an OPENED MR as "the current MR". A closed/merged MR on this
+        # branch is stale (e.g. a prior empty MR) — do not surface it as yours.
+        if m.get("source_branch") == new_branch and (m.get("state") or "").lower() == "opened":
             return m.get("iid"), m.get("web_url", ""), new_branch, "detected existing"
     if not create_if_missing:
         return None, None, new_branch, "no MR for fix branch yet"
