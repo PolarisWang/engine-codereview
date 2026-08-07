@@ -51,7 +51,8 @@ import sys
 import time
 
 DEFAULT_STATE_FILE = ".pipeline-state.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2 = directory layout (topics/<key>.json + manifest.json)
+SCHEMA_VERSION_V1 = 1
 
 # Ordered topic phases. FAILED is a terminal sink reachable from any non-DONE
 # phase; phase order is enforced so we cannot accidentally jump backwards.
@@ -68,12 +69,50 @@ def _now_iso():
 
 
 # ── Low-level load/save (atomic) ─────────────────────────────────────────────
+#
+# Two layouts are supported, selected automatically by whether `path` is a
+# directory or a file:
+#   - FILE mode (schema v1, legacy): single whole-file JSON document.
+#   - DIR mode  (schema v2): `path/` is a directory holding:
+#         manifest.json   {schema_version:2, updated_at,
+#                          topics:{<key>:"topics/<key>.json"}}
+#         topics/<key>.json    one topic record
+#         index.json      {<key>: {phase,status,pending,updated_at,mr_url}}
+#         archive/<key>.json   closed/archived topics
+#         patches/<key>.p<n>.diff   sidecar diff blobs (refs stored in topic)
+#   DIR mode gives per-topic atomic writes + true per-topic locking, so concurrent
+#   writers (event server / ci-poll / run / cleanup) cannot clobber whole-file state.
+
+def _atomic_write(path, data):
+    """Write `data` (dict) to `path` atomically (unique temp + fsync + rename).
+    Raises OSError on failure — never silently returns on a bad write."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _is_dir_mode(path):
+    return os.path.isdir(path)
+
 
 def load_state(path=DEFAULT_STATE_FILE):
-    """Read the state file. Missing/invalid JSON yields an empty store. Always
-    returns a well-formed store: {"schema_version", "updated_at", "topics"}."""
+    """Read the state store. In FILE mode returns the whole document
+    ({"schema_version","updated_at","topics",...}) for legacy callers. In DIR mode
+    returns a minimal envelope {"schema_version":2,"updated_at","topics":{}} whose
+    "topics" values are RELATIVE PATHS — callers must use _load_topic() to read an
+    actual topic record (never a whole-document reader on dir mode)."""
+    if _is_dir_mode(path):
+        m = _load_manifest(path)
+        topics = {}
+        for k in (m.get("topics") or {}):
+            topics[k] = m["topics"][k]  # relative path string
+        return {"schema_version": SCHEMA_VERSION, "updated_at": m.get("updated_at", ""),
+                "topics": topics}
     default = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION_V1,
         "updated_at": _now_iso(),
         "scanner": {},
         "topics": {},
@@ -81,25 +120,247 @@ def load_state(path=DEFAULT_STATE_FILE):
     try:
         with open(path, encoding="utf-8") as f:
             state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         return default
-    # Normalize / repair partial documents (e.g. hand-edited or legacy).
+    except (json.JSONDecodeError, OSError):
+        # Distinguish missing vs corrupt: NEVER silently return empty on a corrupt
+        # legacy file, or the next save would erase it. Raise instead so ops see it.
+        raise RuntimeError(
+            f"state file corrupt (not JSON): {path} — refusing to overwrite. "
+            "Inspect the file; recovery is manual or via pipeline_state.migrate()")
     if not isinstance(state, dict):
-        return default
-    state.setdefault("schema_version", SCHEMA_VERSION)
-    state.setdefault("updated_at", _now_iso())
-    state.setdefault("scanner", {})
-    state.setdefault("topics", {})
+        raise RuntimeError(f"state file wrong type at {path}: {type(state)}")
     return state
 
 
 def save_state(state, path=DEFAULT_STATE_FILE):
-    """Atomically persist state: write to <path>.tmp then os.replace() over
-    path. Raises OSError on failure (callers must not swallow silently)."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    """Persist a state store. In FILE mode writes the whole document atomically.
+    In DIR mode this is only valid for one-topic stores produced by load_state on a
+    single key; mutators should prefer _save_topic(). Raises OSError on failure."""
+    if _is_dir_mode(path):
+        # Dir mode supports per-topic saves only; refuse whole-doc writes that were
+        # routed here with a full document (they would clobber unrelated topics).
+        raise RuntimeError(
+            f"save_state() in dir mode is unsupported; use _save_topic(path, key, topic): {path}")
+    _atomic_write(path, state)
+
+
+def _manifest_path(path):
+    return os.path.join(path, "manifest.json")
+
+
+def _index_path(path):
+    return os.path.join(path, "index.json")
+
+
+def _load_raw(path, default):
+    """Low-level JSON read that distinguishes a missing file (returns default) from
+    a corrupt file (raises). Never silently returns a fresh store on corruption."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return default
+    except (json.JSONDecodeError, OSError):
+        raise RuntimeError(f"state file corrupt (not JSON): {path}")
+    return data if isinstance(data, dict) else default
+
+
+def _load_manifest(path):
+    d = _load_raw(_manifest_path(path), {})
+    d.setdefault("schema_version", SCHEMA_VERSION)
+    d.setdefault("updated_at", _now_iso())
+    d.setdefault("topics", {})
+    return d
+
+
+def _save_manifest(path, manifest):
+    _atomic_write(_manifest_path(path), manifest)
+
+
+def _load_index(path):
+    return _load_raw(_index_path(path), {})
+
+
+def _save_index(path, index):
+    _atomic_write(_index_path(path), index)
+
+
+def _topic_path(path, key):
+    return os.path.join(path, "topics", f"{key}.json")
+
+
+def _topic_dir(path):
+    return os.path.join(path, "topics")
+
+
+def _load_topic(path, key):
+    """Return the topic dict for `key`, or None. Works in both file and dir mode."""
+    if _is_dir_mode(path):
+        try:
+            with open(_topic_path(path, key), encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError):
+            raise RuntimeError(f"topic file corrupt: {_topic_path(path, key)}")
+    state = load_state(path)
+    return state["topics"].get(key)
+
+
+def _save_topic(path, key, topic):
+    """Atomically persist one topic. Dir mode: write topics/<key>.json, update the
+    manifest + hot index. File mode: legacy whole-doc write (for migration source).
+    Returns the topic."""
+    if _is_dir_mode(path):
+        os.makedirs(_topic_dir(path), exist_ok=True)
+        topic["updated_at"] = _now_iso()
+        _atomic_write(_topic_path(path, key), topic)
+        # manifest: register key -> path
+        m = _load_manifest(path)
+        m["topics"].setdefault(key, f"topics/{key}.json")
+        m["updated_at"] = _now_iso()
+        _save_manifest(path, m)
+        # hot index: phase/status/pending/updated_at/mr_url for cheap scans
+        idx = _load_index(path)
+        idx[key] = {
+            "phase": topic.get("phase", ""),
+            "status": topic.get("status", ""),
+            "pending": topic.get("pending"),
+            "updated_at": topic.get("updated_at", ""),
+            "mr_url": topic.get("mr_url", ""),
+            "jira_url": topic.get("jira_url", ""),
+        }
+        _save_index(path, idx)
+        return topic
+    # file mode (only used during migration before the fan-out)
+    state = load_state(path)
+    state["topics"][key] = topic
+    state["updated_at"] = _now_iso()
+    _atomic_write(path, state)
+    return topic
+
+
+def _delete_topic(path, key):
+    """Remove a topic record (used when archiving). Dir mode only."""
+    if not _is_dir_mode(path):
+        return
+    try:
+        os.unlink(_topic_path(path, key))
+    except OSError:
+        pass
+    m = _load_manifest(path)
+    m["topics"].pop(key, None)
+    m["updated_at"] = _now_iso()
+    _save_manifest(path, m)
+    idx = _load_index(path)
+    idx.pop(key, None)
+    _save_index(path, idx)
+
+
+def _set_index_field(path, key, field, value):
+    """Update a single hot-index field cheaply (used by scanners that only need
+    index values and don't want to read the whole topic)."""
+    if not _is_dir_mode(path):
+        return
+    idx = _load_index(path)
+    if key in idx:
+        idx[key][field] = value
+        if field == "updated_at":
+            idx[key]["updated_at"] = _now_iso()
+        _save_index(path, idx)
+
+
+def list_topic_keys(path):
+    """Return the topic keys in the store (dir: directory listing; file: dict keys)."""
+    if _is_dir_mode(path):
+        try:
+            return sorted(fn[:-5] for fn in os.listdir(_topic_dir(path)) if fn.endswith(".json"))
+        except OSError:
+            return []
+    return list(load_state(path)["topics"].keys())
+
+
+def get_topic(path, key):
+    return _load_topic(path, key)
+
+
+def list_topics(path):
+    if _is_dir_mode(path):
+        topics = [_load_topic(path, k) for k in list_topic_keys(path)]
+        topics = [t for t in topics if t is not None]
+    else:
+        topics = list(load_state(path)["topics"].values())
+    topics.sort(key=lambda t: (t.get("updated_at") or ""), reverse=True)
+    return topics
+
+
+def terminal_topic_keys(path):
+    if _is_dir_mode(path):
+        idx = _load_index(path)
+        return [k for k, v in idx.items()
+                if (v or {}).get("phase") in TERMINAL_PHASES]
+    return [k for k, t in load_state(path)["topics"].items()
+            if t.get("phase") in TERMINAL_PHASES]
+
+
+def migrate(path=DEFAULT_STATE_FILE):
+    """Fan out a legacy v1 single-file state into the v2 directory layout. Creates a
+    backup at <path>.bak-v1 first; fails without destroying the source on error.
+    Idempotent: already-dir or no-source is a no-op. Returns (migrated_count, err)."""
+    if _is_dir_mode(path):
+        return 0, None
+    if not os.path.isfile(path):
+        return 0, "no legacy state file to migrate"
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return 0, f"legacy file unreadable: {e}"
+    # backup v1
+    bak = path + ".bak-v1"
+    if not os.path.exists(bak):
+        try:
+            with open(path, "rb") as src, open(bak, "wb") as dst:
+                dst.write(src.read())
+        except OSError as e:
+            return 0, f"backup failed: {e}"
+    # Remove the original FILE at `path` so we can create a DIRECTORY there. The
+    # data is safe in the <path>.bak-v1 backup (migrate_rollback restores it).
+    try:
+        os.unlink(path)
+    except OSError as e:
+        return 0, f"could not move legacy file aside: {e}"
+    os.makedirs(path, exist_ok=True)
+    topics = (state.get("topics") or {})
+    os.makedirs(_topic_dir(path), exist_ok=True)
+    manifest = {"schema_version": SCHEMA_VERSION, "updated_at": state.get("updated_at", _now_iso()),
+                "topics": {}}
+    for k, t in topics.items():
+        if not isinstance(t, dict):
+            continue
+        _atomic_write(_topic_path(path, k), t)
+        manifest["topics"][k] = f"topics/{k}.json"
+        idx = _load_index(path)
+        idx[k] = {"phase": t.get("phase", ""), "status": t.get("status", ""),
+                  "pending": t.get("pending"), "updated_at": t.get("updated_at", ""),
+                  "mr_url": t.get("mr_url", ""), "jira_url": t.get("jira_url", "")}
+        _save_index(path, idx)
+    _save_manifest(path, manifest)
+    return len(topics), None
+
+
+def migrate_rollback(path=DEFAULT_STATE_FILE):
+    """Restore the v1 backup, removing the dir layout. Returns (ok, msg)."""
+    if not _is_dir_mode(path):
+        return False, "not in dir mode; nothing to roll back"
+    bak = path + ".bak-v1"
+    if not os.path.isfile(bak):
+        return False, "no v1 backup found"
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
+    os.rename(bak, path)
+    return True, "restored v1 backup"
 
 
 # ── Topic record helpers ─────────────────────────────────────────────────────
@@ -163,6 +424,16 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 
+def _get_or_create_stub(path, key):
+    """Return an existing topic or create-return a fresh stub (unknown keys attach
+    early so later probes can fill fields). Dir mode uses _load_topic/_save_topic."""
+    topic = _load_topic(path, key)
+    if topic is None:
+        topic = _topic_default(key, key, "", "", "scan", None, "", "", "")
+        _save_topic(path, key, topic)
+    return topic
+
+
 def add_topic(path, *, message_id, jira_key, project="", jira_url="",
               mode="scan", text_preview="", sender_id="", sender_name="",
               build_number=None):
@@ -177,41 +448,18 @@ def add_topic(path, *, message_id, jira_key, project="", jira_url="",
       restart and should re-run (and pass the phase-order guard on the first
       transition).
     """
-    state = load_state(path)
-    existing = state["topics"].get(message_id)
+    existing = _load_topic(path, message_id)
     if existing is None:
-        state["topics"][message_id] = _topic_default(
-            message_id, jira_key, project, jira_url, mode, build_number,
-            text_preview, sender_id, sender_name)
-        state["updated_at"] = _now_iso()
-        save_state(state, path)
+        fresh = _topic_default(message_id, jira_key, project, jira_url, mode,
+                               build_number, text_preview, sender_id, sender_name)
+        _save_topic(path, message_id, fresh)
+        return fresh
     elif mode == "manual" and existing.get("phase") in TERMINAL_PHASES:
-        # Manual restart: reset a terminal record so the review re-runs.
         fresh = _topic_default(message_id, jira_key, project, jira_url, "manual",
                                build_number, text_preview, sender_id, sender_name)
-        state["topics"][message_id] = fresh
-        state["updated_at"] = _now_iso()
-        save_state(state, path)
-    return state["topics"][message_id]
-
-
-def get_topic(path, key):
-    state = load_state(path)
-    return state["topics"].get(key)
-
-
-def list_topics(path):
-    state = load_state(path)
-    topics = list(state["topics"].values())
-    topics.sort(key=lambda t: (t.get("updated_at") or ""), reverse=True)
-    return topics
-
-
-def terminal_topic_keys(path):
-    """Return keys of topics in a terminal phase (used as a dedup signal)."""
-    state = load_state(path)
-    return [k for k, t in state["topics"].items()
-            if t.get("phase") in TERMINAL_PHASES]
+        _save_topic(path, message_id, fresh)
+        return fresh
+    return existing
 
 
 # ── Phase transition ─────────────────────────────────────────────────────────
@@ -226,12 +474,11 @@ def transition(path, key, *, to, status, last_error="", render_msg_id=None,
     write_topic: controls whether to persist (True) or read-only simulation.
     Returns the updated topic record.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         # Unknown key — create a minimal stub so later probes can attach.
         topic = _topic_default(key, key, "", "", "scan", build_number, "", "", "")
-        state["topics"][key] = topic
+        _save_topic(path, key, topic)
 
     prev = topic.get("phase", "SCANNED")
     # CLOSED is a hard terminal state: nothing may transition out of it (no retry,
@@ -261,8 +508,7 @@ def transition(path, key, *, to, status, last_error="", render_msg_id=None,
     if build_number is not None:
         topic["build_number"] = build_number
 
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -280,11 +526,10 @@ def record_failure(path, key, error=""):
     time (exponential backoff), and set failed_exhausted when the schedule runs
     out. Returns the topic dict.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         topic = _topic_default(key, key, "", "", "scan", None, "", "", "")
-        state["topics"][key] = topic
+        _save_topic(path, key, topic)
     if error:
         topic["last_error"] = error
 
@@ -305,8 +550,7 @@ def record_failure(path, key, error=""):
     topic["phase"] = "FAILED"
     topic["status"] = "FAILED"
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -317,8 +561,7 @@ def close_topic(path, key, *, closed_by="", reason=""):
     mirrors record_failure by writing phase/status directly. Writes an audit
     entry to approval_log. Returns the topic dict.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     topic["phase"] = "CLOSED"
@@ -327,8 +570,7 @@ def close_topic(path, key, *, closed_by="", reason=""):
     topic["closed_reason"] = reason or ""
     topic["closed_at"] = _now_iso()
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     # Audit trail (append after save so a failed save doesn't double-log).
     append_approval(path, key, closed_by or "auto", "close_topic",
                     target="", result="ok", note=reason or "topic closed")
@@ -345,8 +587,7 @@ def can_retry(path, key):
     Return True if a failed topic may be retried now (backoff elapsed, not
     exhausted). Also returns True if the topic isn't in a failed state.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return True
     if topic.get("failed_exhausted"):
@@ -371,10 +612,9 @@ def get_retryable(path, limit=5):
     Returns a list of topic dicts (most recently updated first), capped at
     `limit` to bound retry volume per build.
     """
-    state = load_state(path)
     now = time.time()
     out = []
-    for t in state["topics"].values():
+    for t in list_topics(path):
         if t.get("phase") != "FAILED":
             continue
         if t.get("failed_exhausted"):
@@ -402,8 +642,7 @@ def reset_for_retry(path, key):
     (clears the terminal FAILED phase and the backoff schedule). Keeps the
     original jira_url/branch fields. Returns the topic dict.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     topic["phase"] = "SCANNED"
@@ -414,8 +653,7 @@ def reset_for_retry(path, key):
     # so clear the exhausted flag so it can actually retry.
     topic["failed_exhausted"] = False
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -432,12 +670,10 @@ def set_repo(path, key, repo, *, status, error="", skip_reason="",
     if status not in REPO_STATUSES:
         raise ValueError(f"invalid repo status: {status}")
 
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
-        state["topics"][key] = _topic_default(key, key, "", "", "scan", None,
-                                              "", "", "")
-        topic = state["topics"][key]
+        topic = _topic_default(key, key, "", "", "scan", None, "", "", "")
+        _save_topic(path, key, topic)
 
     r = topic["repos"].setdefault(repo, _repo_default())
     r["status"] = status
@@ -461,8 +697,7 @@ def set_repo(path, key, repo, *, status, error="", skip_reason="",
         r["finished_at"] = _now_iso()
 
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -476,8 +711,7 @@ def append_chat(path, key, message):
     Append one chat message {"role","content"} to a topic's chat_history.
     Trims to the newest MAX_CHAT_HISTORY entries.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     history = topic.setdefault("chat_history", [])
@@ -486,8 +720,7 @@ def append_chat(path, key, message):
         if len(history) > MAX_CHAT_HISTORY:
             topic["chat_history"] = history[-MAX_CHAT_HISTORY:]
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -495,14 +728,12 @@ def set_pending_patch(path, key, patch):
     """
     Set (or clear) the topic's pending_patch. patch is a dict or None.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     topic["pending_patch"] = patch
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -510,10 +741,10 @@ def set_pending_patch(path, key, patch):
 
 def set_pending(path, key, action, patch=None):
     """Write an async action marker for the Jenkins executor to consume. `action`
-    is one of: re_review | apply | push | rollback. `patch` is carried only for
-    apply (the suggested diff the executor should git-apply). Returns the topic."""
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    is one of: re_review | apply | push | rollback | agent_edit | agent_edit_confirm.
+    `patch` is carried only for apply (the suggested diff the executor should
+    git-apply) / agent actions (the real actor). Returns the topic."""
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     entry = {"action": action}
@@ -521,8 +752,7 @@ def set_pending(path, key, action, patch=None):
         entry["patch"] = patch
     topic["pending"] = entry
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -534,24 +764,30 @@ def get_pending(path, key):
 
 def clear_pending(path, key):
     """Clear the topic's pending action (executor finished). Records nothing extra."""
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     if topic.get("pending") is not None:
         topic["pending"] = None
         topic["updated_at"] = _now_iso()
-        state["updated_at"] = _now_iso()
-        save_state(state, path)
+        _save_topic(path, key, topic)
     return topic
 
 
 def list_pending_topics(path):
     """Return [(key, pending_dict), ...] for every topic with a non-empty pending
-    action — this is the queue the Jenkins executor consumes."""
-    state = load_state(path)
+    action — this is the queue the Jenkins executor consumes. Uses the hot index so
+    this (every tick) is cheap even with many topics."""
+    if _is_dir_mode(path):
+        idx = _load_index(path)
+        out = []
+        for k, v in idx.items():
+            p = (v or {}).get("pending")
+            if p:
+                out.append((k, p))
+        return out
     out = []
-    for k, t in (state.get("topics") or {}).items():
+    for k, t in (load_state(path)["topics"] or {}).items():
         p = t.get("pending")
         if p:
             out.append((k, p))
@@ -595,8 +831,7 @@ def record_applied_patch(path, key, patch):
     Move a confirmed/executed patch into applied_patches (append) and clear
     pending_patch. patch includes {"file","diff","repo","commit","applied_at"}.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     applied = topic.setdefault("applied_patches", [])
@@ -604,22 +839,19 @@ def record_applied_patch(path, key, patch):
         applied.append(patch)
     topic["pending_patch"] = None
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
 def pop_last_applied_patch(path, key):
     """Remove and return the most recently applied patch (for @撤销)."""
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     applied = topic.get("applied_patches") or []
     patch = applied.pop() if applied else None
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return patch
 
 
@@ -632,8 +864,7 @@ def append_approval(path, key, actor, action, target="", result="ok", note=""):
     Append one audit entry to the topic's approval_log.
     Fields: actor, action, target, time, result, note.
     """
-    state = load_state(path)
-    topic = state["topics"].get(key)
+    topic = _load_topic(path, key)
     if topic is None:
         return None
     log = topic.setdefault("approval_log", [])
@@ -650,8 +881,7 @@ def append_approval(path, key, actor, action, target="", result="ok", note=""):
         if len(log) > MAX_APPROVAL_LOG:
             topic["approval_log"] = log[-MAX_APPROVAL_LOG:]
     topic["updated_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_state(state, path)
+    _save_topic(path, key, topic)
     return topic
 
 
@@ -812,6 +1042,11 @@ def main(argv=None):
     p.add_argument("--key", required=True)
     p.add_argument("--error", default="")
 
+    p = sub.add_parser("migrate", parents=[common],
+                       help="Fan out a legacy v1 single-file state into the v2 dir layout")
+    p = sub.add_parser("migrate-rollback", parents=[common],
+                       help="Restore the v1 backup and remove the v2 dir layout")
+
     args = parser.parse_args(argv)
     path = (args.state_file or os.environ.get("PIPELINE_STATE_FILE")
             or DEFAULT_STATE_FILE)
@@ -826,6 +1061,15 @@ def main(argv=None):
     elif args.command == "fail":
         record_failure(path, args.key, args.error)
         print(f"[ok] topic {args.key} recorded failure; retry={can_retry(path, args.key)}")
+    elif args.command == "migrate":
+        n, err = migrate(path)
+        if err:
+            print(f"[migrate] {err}", file=sys.stderr)
+        else:
+            print(f"[migrate] moved {n} topics into dir layout at {path} (backup: {path}.bak-v1)")
+    elif args.command == "migrate-rollback":
+        ok, msg = migrate_rollback(path)
+        print(f"[migrate-rollback] {'ok: ' if ok else 'ERR: '}{msg}")
     elif args.command == "transition":
         try:
             transition(path, args.key, to=args.to, status=args.status,
