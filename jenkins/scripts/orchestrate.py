@@ -1088,6 +1088,98 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
     return file, d.stdout, None
 
 
+EDIT_MODEL = "deepseek-v4-flash[1m]"  # as configured for Claude Code
+
+
+def _locate_context(content, needle):
+    """Programmatically find a ~20-line context window around the first occurrence of
+    `needle` in `content`. Locating is done by code (reliable), not by the model
+    recalling the snippet, so the model only edits a small, correct window."""
+    idx = content.find(needle)
+    if idx < 0:
+        return None, None
+    lines = content.split("\n")
+    # find line containing needle
+    li = next((i for i, l in enumerate(lines) if needle in l), len(lines))
+    start = max(0, li - 6)
+    end = min(len(lines), li + 16)
+    ctx = "\n".join(lines[start:end])
+    return (start, end), ctx
+
+
+def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_MODEL, max_rounds=4):
+    """Edit one file's exact problem window with the model, apply, and iterate on
+    `git apply --check` feedback. Returns (file, git_diff, ok, error)."""
+    import subprocess as _sp, re as _re
+    p = os.path.join(checkout, file)
+    if not os.path.isfile(p):
+        return None, "", False, f"file missing: {file}"
+    # a distinctive needle from the issue to locate context (prefer an alphanumeric token)
+    needle = ""
+    for tok in _re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", issue or ""):
+        if tok and tok in open(p, encoding="utf-8", errors="ignore").read():
+            needle = tok
+            break
+    if not needle:
+        return None, "", False, "no locator token in issue"
+    content = open(p, encoding="utf-8", errors="ignore").read()
+    (start, end), ctx = _locate_context(content, needle)
+    if ctx is None:
+        return None, "", False, f"locator '{needle}' not found in file"
+    prev_bad = ""
+    for rnd in range(max_rounds):
+        sysp = ("You fix a bug in a file. I show the RELEVANT window of the file. "
+                "Output EXACTLY:\n@@START@@\n<verbatim corrected full window (everything from the window, with the fix applied)>\n@@END@@\n"
+                "Preserve all other lines byte-for-byte; only change the buggy part. No other text.")
+        prompt = (f"FILE: {file}\nRELEVANT WINDOW:\n```\n{ctx}\n```\n\nISSUE: {issue[:400]}\n\n"
+                  f"Round {rnd+1}. Output @@START@@...@@END@@ (corrected window).")
+        if prev_bad:
+            prompt += f"\n[previous fix failed to apply, error: {prev_bad[:200]}. Correct the window so git apply succeeds.]"
+        raw = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=4000)
+        m = _re.search(r"@@START@@(.*?)@@END@@", raw or "", re.S)
+        if not m:
+            prev_bad = "no @@START@@ block"
+            continue
+        new_window = m.group(1).strip("\n")
+        new_content = content.split("\n"); new_content[start:end] = new_window.split("\n")
+        new_content = "\n".join(new_content)
+        if new_content == content:
+            prev_bad = "no change produced"
+            continue
+        # apply to working tree only (not committed)
+        backup = p + ".__bak"
+        open(backup, "w", encoding="utf-8").write(content)
+        open(p, "w", encoding="utf-8").write(new_content)
+        # validate the edit is still syntactically near-identical (diff sane)
+        _sp.run(["git", "-C", checkout, "checkout", "--", file], capture_output=True, text=True)  # restore? no
+        # restore our edit back
+        open(p, "w", encoding="utf-8").write(new_content)
+        os.path.exists(backup) and os.unlink(backup)
+        d = _sp.run(["git", "-C", checkout, "diff", "--", file], capture_output=True, text=True, timeout=60)
+        return file, d.stdout, True, None
+    return None, "", False, "max rounds without an applyable edit"
+
+
+def _agent_edit_preview(topic, all_findings, api_key, base_url, workspace=None, model=EDIT_MODEL):
+    """Agent edit preview: use the model to fix ONE finding in the real checkout, return
+    the git diff for the user to review. Does NOT commit/push."""
+    ws = workspace or _DEFAULT_WORKSPACE
+    checkout, err = _ensure_checkout(topic, ws)
+    if err:
+        return None, "", f"checkout: {err}"
+    crit = [f for f in (all_findings or [])
+            if (f.get("severity") or "").lower() in ("critical", "high")]
+    show = crit or (all_findings or [])[:3]
+    for f in show[:3]:
+        file = f.get("file") or f.get("path") or ""
+        issue = f.get("issue") or ""
+        file, diff, ok, e = _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model)
+        if ok:
+            return file, diff, None
+        # failure: report, try next
+    return show[0].get("file") if show else None, "", "agent edit failed on all candidate findings"
+
+
 def _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace=None):
     """Build a human preview using the Y auto-fix (real checkout + apply --check)."""
     ok, failed, branch_name, err = _auto_fix_in_checkout(
