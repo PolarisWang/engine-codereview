@@ -643,10 +643,16 @@ def interact(args):
 
     if pending:
         if pending.get("state") == "staged_agent_edit":
-            # auto-edit closure: 确认/提交 -> commit+push fix branch+建MR ; 撤销 -> cancel
+            # auto-edit closure: 确认/提交 -> enqueue commit+push+建MR ; 撤销 -> cancel
             if is_confirm_edit or is_ok:
-                return _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace,
-                                               app_id, app_secret, actor)
+                pipeline_state.set_pending(state_file, key, "agent_edit_confirm",
+                                           patch={"actor": actor})
+                pipeline_state.append_approval(state_file, key, actor, "push_fix_branch",
+                                               pending.get("branch", ""), "ok", "@确认改码 enqueued")
+                _update_card_text(app_id, app_secret, render_id,
+                                  "⏳ 已记录确认，Jenkins 将推送修复分支 `{0}` 并自动建 MR。".format(
+                                      pending.get("branch", "")))
+                return 0
             if is_rollback:
                 pipeline_state.set_pending_patch(state_file, key, None)
                 _update_card_text(app_id, app_secret, render_id, "↩️ 已取消本次自动改码（未推送、未建MR）。")
@@ -1245,6 +1251,13 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     checkout, err = _ensure_checkout(topic, ws)
     if err:
         return [], [], branch, None, err
+    # Refresh the review branch so the fix branch is based on the latest remote
+    # HEAD (not a stale/foreign HEAD left by an earlier topic sharing this tree).
+    if src:
+        _sp.run(["git", "-C", checkout, "fetch", "origin", src],
+                capture_output=True, text=True, timeout=300)
+        _sp.run(["git", "-C", checkout, "reset", "--hard", f"origin/{src}"],
+                capture_output=True, text=True, timeout=60)
     # Work on the new fix branch (create locally if absent) — never touch review_branch.
     _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
             capture_output=True, text=True, timeout=60)
@@ -1265,12 +1278,11 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
 
 def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
                    app_id, app_secret, actor=""):
-    """指令 `改码/自动修复`: use claude -p to auto-fix critical/high findings in a real
-    checkout on the new fix branch, show every produced diff for review, and STAGE the
-    change set (pending_patch, state="staged_agent_edit") so `@确认`/`确认提交` later
-    commits + pushes the fix branch + auto-creates the MR. Does NOT push here."""
-    api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
-    base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    """指令 `改码/自动修复`: enqueue an agent_edit intent for the Jenkins executor,
+    which runs claude -p to auto-fix critical/high findings in the checkout, stages
+    the change set (pending_patch, state="staged_agent_edit"), and posts the diff
+    preview. Async: the preview arrives on the next scan tick, not in this reply.
+    Approval happens here (enqueue side); the executor does not re-gate owner."""
     ok, why = _approve(key, topic, actor, "auto_edit")
     if not ok:
         _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
@@ -1279,40 +1291,11 @@ def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
         _update_card_text(app_id, app_secret, render_id,
                           "⚠️ 无法执行自动改码：未在本机找到 claude CLI（自动改码需 `claude` 可执行）。")
         return 0
-    ok_diffs, failed, branch, _checkout, err = _agent_edit_all(
-        topic, all_findings, api_key, base_url, workspace)
-    if err:
-        pipeline_state.append_approval(state_file, key, actor, "auto_edit", branch, "fail", err)
-        _update_card_text(app_id, app_secret, render_id, f"⛔ 自动改码准备失败：{err}")
-        return 0
-    if not ok_diffs:
-        pipeline_state.append_approval(state_file, key, actor, "auto_edit", branch, "fail",
-                                       "no fixed finding (stack: claude-p or apply)")
-        _update_card_text(app_id, app_secret, render_id,
-                          "⚠️ 自动改码未生成任何可用 diff（可能找不到可改的 critical finding，"
-                          "或 claude -p 未返回可应用的修改）。可改用 `指引` 看人工修改方案。")
-        return 0
-    # Stage the full change set for the confirm step.
-    pipeline_state.set_pending_patch(state_file, key, {
-        "file": "all", "repo": "engine", "target": "agent_edit",
-        "state": "staged_agent_edit", "branch": branch,
-        "diff": "",  # diffs live in per-file blocks; keep aggregate empty to avoid a huge state bloat
-        "files": ok_diffs,
-        "created_at": "now",
-    })
-    pipeline_state.append_approval(state_file, key, actor, "auto_edit", branch, "ok",
-                                   f"staged {len(ok_diffs)} files")
-    lines = [f"## ⚠️ 自动改码完成，请确认\n",
-             f"将修复推送到**新分支** `{branch}`（不覆盖原始 `{topic.get('review_branch') or ''}`），"
-             f"并在确认后自动创建修复 MR。\n"]
-    for d in ok_diffs:
-        lines.append(f"\n### {d['file']}\n```diff\n{d['diff'][:1500]}\n```")
-    if failed:
-        lines.append("\n---\n**未能自动修复的文件**：")
-        for file, why in failed:
-            lines.append(f"- `{file}`: {why}")
-    lines.append("\n> 回复 `@确认 提交并建mr` 推送并建 MR；回复 `@撤销` 取消。")
-    _finalize(key, "\n".join(lines), render_id, [], state_file, app_id, app_secret)
+    pipeline_state.set_pending(state_file, key, "agent_edit", patch={"actor": actor})
+    pipeline_state.append_approval(state_file, key, actor, "auto_edit", "", "ok", "@改码 enqueued")
+    _update_card_text(app_id, app_secret, render_id,
+                      "⏳ 已记录自动改码，Jenkins 将稍后调用 AI 修改代码并展示 diff 待你确认。\n"
+                      "（结果可能延迟到下一轮扫描；完成后回复 `@确认 提交并建mr` 推送并建 MR，`@撤销` 取消。）")
     return 0
 
 
@@ -1798,6 +1781,9 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         return False, "no pending action"
     action = pending.get("action")
     render = topic.get("render_msg_id") or ""
+    # For auto-edit actions we need the findings the review produced.
+    _eng_f, _gam_f, _fs = _load_findings(workspace, key)
+    all_findings = (_eng_f or []) + (_gam_f or [])
 
     if action == "re_review":
         # Re-run the full review (Jenkins has creds). Reuse the run() pipeline.
@@ -1813,10 +1799,10 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         # SAME as the previous result, the outcome intentionally did not change —
         # surface that so the user does not read "no reaction" as a failure.
         try:
+            note = ""
             if ok:
                 fresh = pipeline_state.get_topic(state_file, key)
                 render = fresh.get("render_msg_id") or render
-                note = ""
                 if render:
                     eng_res, gam_res, st = _load_findings(workspace, key)
                     all_f = (eng_res or []) + (gam_res or [])
@@ -1850,8 +1836,13 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             f.write(diff)
             patch_file = f.name
         _, head_before, _ = _run_git(["rev-parse", "HEAD"], checkout)
-        rc2, out2, err2 = _run_git(["apply", patch_file], checkout)
-        os.path.exists(patch_file) and os.unlink(patch_file)
+        try:
+            rc2, out2, err2 = _run_git(["apply", patch_file], checkout)
+        finally:
+            try:
+                os.unlink(patch_file)
+            except OSError:
+                pass
         if rc2 != 0:
             pipeline_state.clear_pending(state_file, key)
             return False, f"apply: git apply failed: {err2 or out2}"
@@ -1898,6 +1889,141 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         pipeline_state.clear_pending(state_file, key)
         return True, ("rolled back to " + before[:8]) if before else "rolled back"
 
+    if action == "agent_edit":
+        # 改码: run claude -p to auto-fix findings, stage the diffs for @确认.
+        # Approval was done at enqueue time in interact (owner-gated); the real
+        # actor rides in pending.patch.actor (consume_all_pending hardcodes "jenkins").
+        act = (pending.get("patch") or {}).get("actor") or "jenkins"
+        api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
+        base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+        try:
+            ok_diffs, failed, branch, _co, err = _agent_edit_all(
+                topic, all_findings, api_key, base_url, workspace)
+        except Exception as e:
+            pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render, f"⛔ 自动改码执行异常：{str(e)[:200]}")
+            return False, f"agent_edit error: {e}"
+        if err:
+            pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail", err)
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render, f"⛔ 自动改码准备失败：{err}")
+            return False, f"agent_edit checkout: {err}"
+        if not ok_diffs:
+            pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail",
+                                           "no fixed finding")
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render,
+                              "⚠️ 自动改码未生成任何可用 diff（可改用 `指引` 看人工修改方案）。")
+            return False, "agent_edit: no usable diff"
+        pipeline_state.set_pending_patch(state_file, key, {
+            "file": "all", "repo": "engine", "target": "agent_edit",
+            "state": "staged_agent_edit", "branch": branch,
+            "diff": "", "files": ok_diffs, "created_at": "now",
+        })
+        pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "ok",
+                                       f"staged {len(ok_diffs)} files")
+        pipeline_state.clear_pending(state_file, key)
+        lines = [f"## ⚠️ 自动改码完成，请确认\n",
+                 f"将修复推送到**新分支** `{branch}`（不覆盖原始 `{topic.get('review_branch') or ''}`），"
+                 f"确认后自动创建修复 MR。\n"]
+        for d in ok_diffs:
+            lines.append(f"\n### {d['file']}\n```diff\n{d['diff'][:1500]}\n```")
+        if failed:
+            lines.append("\n---\n**未能自动修复的文件**：")
+            for file, why in failed:
+                lines.append(f"- `{file}`: {why}")
+        lines.append("\n> 回复 `@确认 提交并建mr` 推送并建 MR；回复 `@撤销` 取消。")
+        _finalize(key, "\n".join(lines), render, [], state_file, app_id, app_secret)
+        return True, f"agent_edit: staged {len(ok_diffs)} files for confirm"
+
+    if action == "agent_edit_confirm":
+        # 确认改码: commit + push the fix branch + auto-create the MR. Approval was
+        # done at enqueue time; the actor rides in pending.patch.actor.
+        act = (pending.get("patch") or {}).get("actor") or "jenkins"
+        pp = topic.get("pending_patch") or {}
+        files = pp.get("files") or []
+        branch = pp.get("branch") or ""
+        if pp.get("state") != "staged_agent_edit" or not files or not branch:
+            pipeline_state.set_pending_patch(state_file, key, None)
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render, "⛔ 没有待确认的自动改码内容，已取消。")
+            return False, "agent_edit_confirm: no staged change set"
+        if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。")
+            return False, f"agent_edit_confirm: protected branch {branch}"
+        import subprocess as _sp2
+        _git_env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0")
+        checkout, err = _ensure_checkout(topic, workspace)
+        if err:
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render, f"⛔ checkout 失败：{err}")
+            return False, f"agent_edit_confirm: {err}"
+        _sp2.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
+                 capture_output=True, text=True, timeout=30, env=_git_env)
+        _sp2.run(["git", "-C", checkout, "config", "user.name", "codereview-agent"],
+                 capture_output=True, text=True, timeout=30, env=_git_env)
+        # Unshallow the depth-2 clone so the push won't be rejected by the server.
+        _sp2.run(["git", "-C", checkout, "fetch", "--unshallow", "origin"],
+                 capture_output=True, text=True, timeout=600, env=_git_env)
+        _sp2.run(["git", "-C", checkout, "checkout", "-B", branch],
+                 capture_output=True, text=True, timeout=60, env=_git_env)
+        _sp2.run(["git", "-C", checkout, "add", "-A"],
+                 capture_output=True, text=True, timeout=60, env=_git_env)
+        _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                           capture_output=True, text=True, timeout=60, env=_git_env)
+        if _commit.returncode != 0:
+            _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
+            if "nothing to commit" in _commit_out:
+                # replay the staged diffs into the (possibly reset) tree
+                import tempfile as _tf
+                for d in files:
+                    diff = d.get("diff") or ""
+                    if not diff:
+                        continue
+                    with _tf.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                        _f.write(diff)
+                        _pf = _f.name
+                    _sp2.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
+                             timeout=60, env=_git_env)
+                    try:
+                        os.unlink(_pf)
+                    except OSError:
+                        pass
+                _sp2.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
+                _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                                   capture_output=True, text=True, timeout=60, env=_git_env)
+        if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render,
+                              f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
+            return False, f"agent_edit_confirm: commit failed"
+        push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
+                        capture_output=True, text=True, timeout=300, env=_git_env)
+        if push.returncode != 0:
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render,
+                              f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
+            return False, f"agent_edit_confirm: push failed"
+        _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+        for f in files:
+            pipeline_state.record_applied_patch(state_file, key, {
+                "file": f.get("file", ""), "repo": "engine", "branch": branch,
+                "applied_at": "now", "mode": "agent_edit", "commit_before": "",
+            })
+        pipeline_state.append_approval(state_file, key, act, "push_fix_branch", branch, "ok",
+                                       "pushed + MR " + (murl or ""))
+        pipeline_state.set_pending_patch(state_file, key, None)
+        pipeline_state.clear_pending(state_file, key)
+        text = (f"✅ **自动改码已推送** `{branch}`（{len(files)} 个文件）。\n"
+                f"- 推送分支：`{branch}`\n"
+                f"- 本次修复 MR：{murl if murl else '（创建失败：' + mrnote + '）'}\n"
+                f"- 原评审 MR：{topic.get('mr_url') or ''}\n\n"
+                f"> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
+        _finalize(key, text, render, [], state_file, app_id, app_secret)
+        return True, f"agent_edit_confirm: pushed {branch} + MR"
+
     pipeline_state.clear_pending(state_file, key)
     return False, f"unknown pending action: {action}"
 
@@ -1920,14 +2046,25 @@ def _run_review_subprocess(key, jira_url, workspace, state_file):
 
 def consume_all_pending(state_file, workspace, app_id, app_secret, lock_dir=None):
     """Jenkins entry: consume every topic's pending action, serialized per topic
-    with a cross-process lock. Returns a dict {key: (ok, message)}."""
+    with a cross-process lock. Returns a dict {key: (ok, message)}.
+    Starvation guard: agent_edit(_confirm) runs claude -p and can take ~minutes,
+    blocking this single serialized Jenkins tick; do at most ONE such long action
+    per tick so message scanning / other topics aren't starved out."""
     lock_dir = lock_dir or pipeline_state.DEFAULT_LOCK_DIR()
     results = {}
+    AGENT_ACTIONS = {"agent_edit", "agent_edit_confirm"}
+    agent_done = False
     for key, _pending in pipeline_state.list_pending_topics(state_file):
+        action = (_pending or {}).get("action") if isinstance(_pending, dict) else ""
+        if action in AGENT_ACTIONS and agent_done:
+            # skip a second long-running auto-edit this tick; it stays pending
+            continue
         try:
             with pipeline_state.topic_lock_context(lock_dir, key):
                 ok, msg = consume_pending(key, state_file, workspace, app_id, app_secret)
                 results[key] = (ok, msg)
+                if action in AGENT_ACTIONS:
+                    agent_done = True
         except Exception as e:
             results[key] = (False, f"executor error: {e}")
     return results
