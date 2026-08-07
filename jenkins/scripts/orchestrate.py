@@ -296,6 +296,10 @@ def run(args):
                     base_branch = mi["target_branch"]
         except Exception as e:
             print(f"[orchestrate] warn: re-resolve MR source failed: {e}", file=sys.stderr)
+    # Engine base must follow the (MR-resolved) base_branch so it diffs vs the MR's
+    # real target (e.g. master), not the config default (which may be 'main' but the
+    # actual repo base is master) — otherwise engine diff becomes empty (da39a3ee).
+    engine_base = info.get("engine_default_branch") or base_branch
     pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
                               review_branch=review_branch, base_branch=base_branch,
                               mr_url=mr_url)
