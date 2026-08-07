@@ -114,6 +114,34 @@ def gitlab_branch_exists(project_path, branch, token):
         return False
 
 
+def gitlab_search_issue_mrs(project_path, issue_key, token):
+    """GitLab fallback (Jira remote-links may be unavailable without Jira creds):
+    find OPEN MRs in the repo whose source_branch or title mentions the issue key.
+    Returns list of dicts {branch, target_branch} for OPEN MRs whose source branch
+    actually exists. Used to bind review to the real, current MR."""
+    if not issue_key or not token or not project_path:
+        return []
+    try:
+        proj = urllib.parse.quote(project_path, safe="")
+        data = gitlab_api_get(
+            f"projects/{proj}/merge_requests?state=opened&per_page=100&scope=all", token) or []
+        out = []
+        for m in data or []:
+            src = m.get("source_branch", "")
+            title = m.get("title", "") or ""
+            if issue_key in src or issue_key in title:
+                if gitlab_branch_exists(project_path, src, token):
+                    out.append({
+                        "branch": src,
+                        "target_branch": m.get("target_branch", ""),
+                        "iid": m.get("iid"),
+                    })
+        return out
+    except Exception:
+        return []
+
+
+
 def extract_issue_key(url):
     """Extract Jira issue key from URL like https://jira.company/browse/EV-123"""
     m = re.search(r'(?:browse|issues)/([A-Za-z][A-Za-z0-9]+-\d+)', url)
@@ -318,6 +346,30 @@ def main():
                         best_mr = candidate
             if best_mr:
                 result["mr_info"] = best_mr
+
+        # Step 3b2: GitLab fallback — if we still have no MR (e.g. Jira remote-links
+        # unavailable without Jira creds, or no OPEN MR among them), find the real OPEN
+        # MR for this issue directly from GitLab and use its source branch.
+        if not result.get("mr_info"):
+            project_path = ""
+            if remote_links:
+                project_path, _ = parse_gitlab_mr_url(remote_links[0].get("url") or "")
+            if not project_path:
+                # derive from engine_repo config: git@host:path/repo.git -> path/repo
+                eng = project_cfg.get("engine_repo") or ""
+                if eng and "git@" in eng:
+                    project_path = eng.split(":")[-1].lstrip("/").rstrip(".git")
+            if project_path and gitlab_token:
+                gl_mrs = gitlab_search_issue_mrs(project_path, issue_key, gitlab_token)
+                print(f"[gitlab] gitlab-search found {len(gl_mrs)} OPEN MR(s) for {issue_key}", file=sys.stderr)
+                for gm in gl_mrs:
+                    if gm.get("branch"):
+                        result["mr_info"] = {
+                            "branch": gm["branch"],
+                            "target_branch": gm.get("target_branch") or project_cfg["default_branch"],
+                        }
+                        result["mr_url"] = f"https://gitlab.booming-inc.com/{project_path}/-/merge_requests/{gm.get('iid')}"
+                        break
 
         # Step 3c: If we have mr_info from GitLab, also try to find per-repo MR URLs
         # (engine and game repos may use different MRs)
