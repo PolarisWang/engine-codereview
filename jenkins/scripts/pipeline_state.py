@@ -186,8 +186,17 @@ def _save_index(path, index):
     _atomic_write(_index_path(path), index)
 
 
+def _safe_filename(key):
+    """Map an arbitrary topic key (may be a Jira URL, message id with '/', etc.)
+    to a filesystem-safe filename. We hash it so the on-disk name never depends on
+    the key's content, avoiding path traversal / invalid filenames. The real key is
+    recovered from manifest['topics'] (real_key -> filename)."""
+    import hashlib
+    return hashlib.sha1((key or "?").encode("utf-8")).hexdigest() + ".json"
+
+
 def _topic_path(path, key):
-    return os.path.join(path, "topics", f"{key}.json")
+    return os.path.join(path, "topics", _safe_filename(key))
 
 
 def _topic_dir(path):
@@ -208,17 +217,61 @@ def _load_topic(path, key):
     return state["topics"].get(key)
 
 
+def import_topic(path, topic):
+    """Import a fully-formed topic dict into the store. Dir mode writes it as a
+    topic file; file mode inserts it into the document. Returns the topic."""
+    key = topic.get("message_id") or ""
+    if not key:
+        return None
+    _save_topic(path, key, topic)
+    return topic
+
+
+def archive_topic(path, key):
+    """Archive a topic record: move it out of the live set. Dir mode: move
+    topics/<key>.json to archive/<key>.json and drop from manifest/index. File
+    mode: move into the topics_archive sub-dict. Returns True if archived, False
+    if the topic didn't exist."""
+    topic = _load_topic(path, key)
+    if topic is None:
+        return False
+    if _is_dir_mode(path):
+        arch_dir = os.path.join(path, "archive")
+        os.makedirs(arch_dir, exist_ok=True)
+        _atomic_write(os.path.join(arch_dir, f"{key}.json"), topic)
+        _delete_topic(path, key)
+    else:
+        state = load_state(path)  # file mode: legacy single-doc
+        state.setdefault("topics_archive", {})[key] = topic
+        state["topics"].pop(key, None)
+        _atomic_write(path, state)
+    return True
+
+
+def list_archived_keys(path):
+    """Return the keys currently archived (dir mode: archive/ listing; file mode:
+    the topics_archive key)."""
+    if _is_dir_mode(path):
+        try:
+            return sorted(fn[:-5] for fn in os.listdir(os.path.join(path, "archive"))
+                          if fn.endswith(".json"))
+        except OSError:
+            return []
+    st = load_state(path)
+    return list((st.get("topics_archive") or {}).keys())
+
+
 def _save_topic(path, key, topic):
-    """Atomically persist one topic. Dir mode: write topics/<key>.json, update the
+    """Atomically persist one topic. Dir mode: write topics/<safe>.json, update the
     manifest + hot index. File mode: legacy whole-doc write (for migration source).
     Returns the topic."""
     if _is_dir_mode(path):
         os.makedirs(_topic_dir(path), exist_ok=True)
         topic["updated_at"] = _now_iso()
         _atomic_write(_topic_path(path, key), topic)
-        # manifest: register key -> path
+        # manifest: register real_key -> safe path
         m = _load_manifest(path)
-        m["topics"].setdefault(key, f"topics/{key}.json")
+        m["topics"].setdefault(key, f"topics/{_safe_filename(key)}")
         m["updated_at"] = _now_iso()
         _save_manifest(path, m)
         # hot index: phase/status/pending/updated_at/mr_url for cheap scans
@@ -272,12 +325,10 @@ def _set_index_field(path, key, field, value):
 
 
 def list_topic_keys(path):
-    """Return the topic keys in the store (dir: directory listing; file: dict keys)."""
+    """Return the topic keys in the store (dir: from the manifest real_key -> filename
+    map, since on-disk filenames are hashed; file: dict keys)."""
     if _is_dir_mode(path):
-        try:
-            return sorted(fn[:-5] for fn in os.listdir(_topic_dir(path)) if fn.endswith(".json"))
-        except OSError:
-            return []
+        return sorted((_load_manifest(path).get("topics") or {}).keys())
     return list(load_state(path)["topics"].keys())
 
 
@@ -340,7 +391,7 @@ def migrate(path=DEFAULT_STATE_FILE):
         if not isinstance(t, dict):
             continue
         _atomic_write(_topic_path(path, k), t)
-        manifest["topics"][k] = f"topics/{k}.json"
+        manifest["topics"][k] = f"topics/{_safe_filename(k)}"
         idx = _load_index(path)
         idx[k] = {"phase": t.get("phase", ""), "status": t.get("status", ""),
                   "pending": t.get("pending"), "updated_at": t.get("updated_at", ""),
