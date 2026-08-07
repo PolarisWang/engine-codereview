@@ -24,7 +24,7 @@
 | workspace 释放/清理 | ✅ | cleanup.sh：超龄 CLOSED 话题归档 + result 文件释放 + checkout 释放 + .review_cache 清理 |
 | watchdog + startup + apply | ✅ | 进程级自愈 + 容器重启恢复 + 一键部署 |
 | 健康监控 + 僵尸清理 | ✅ | healthcheck + zombie-cleaner host cron |
-| **AI 自动改码(claude -p)** | ✅ | _agent_edit_one 用 `claude -p --model glm-5.2[1m]` 驱动，窗口定位 + 迭代，产出干净 git diff |
+| **AI 自动改码(claude -p)** | ✅ | _agent_edit_one 用 `claude -p --model deepseek-v4-flash[1m]` 驱动，窗口定位 + 迭代，产出干净 git diff |
 | **改码闭环：改码→确认→push→自动建MR** | ✅ | _cmd_auto_edit(改码/自动修复) 多文件改码→展示 diff→staged；_cmd_confirm_agent_edit(@确认) commit+push 到 `{src}-fix-{task}` + _create_or_get_mr 自动建修复MR + 回填真实 URL |
 | **claude 绝对路径调用** | ✅ | _find_claude() 探测绝对路径，规避 cr-env/env.sh 剥 PATH 导致的 `claude not found` |
 | **改码路由** | ✅ | interact 可靠路由 + pending-gating 新增 `改码`/`@确认`/`自动修复` 指令 |
@@ -42,8 +42,7 @@
 
 ### ⚠️ 已知限制
 
-- **`deepseek-v4-flash[1m]` 网关 503**：raw HTTP 调 `/v1/messages` 返回 model_not_found。只有 `claude -p` CLI 能通（它走 Claude Code 内部通道）。
-- **`glm-5.2[1m]` 同理**：只能通过 `claude -p` 调用，不能裸 HTTP。
+- **`deepseek-v4-flash[1m]` 网关 503**：raw HTTP 调 `/v1/messages` 返回 model_not_found。只有 `claude -p` CLI 能通（它走 Claude Code 内部通道）。改码即用此「claude -p --model deepseek-v4-flash[1m]」通道（`_claude_p_call`，EDIT_MODEL = `deepseek-v4-flash[1m]`）。
 - **`claude` 绝对路径**：`_find_claude()` 探测 `/usr/local/bin/claude` 等绝对路径。容器 `chaos-agent-cr` **已有 claude**（可改码），但 `cr-env/env.sh:25` 的 `PATH=/usr/bin:/bin` 会剥掉 `/usr/local/bin`，故必须用绝对路径调用（已修）。
 - **root 下 claude -p 限制**：`--dangerously-skip-permissions` 在 root 下被拒。需 settings.json `skipDangerousModePermissionPrompt=false` + `defaultMode=default`（已改）。
 - **CI 不触发**：项目 `.gitlab-ci.yml` rules 只认 `merge_request_event`，手动 api 触发为空。ci-poll 只跟踪不触发。
@@ -57,7 +56,7 @@
   → review(真实 git diff, 绑定 OPEN MR source_branch)
   → 重点突出结果卡(结论 + Top findings + 交互指引)
   → 用户回复 `指引` → 精确修改指引
-  → 用户回复 `改码` → AI(claude -p glm-5.2[1m])自动改 checkout 里的代码
+  → 用户回复 `改码` → AI(claude -p deepseek-v4-flash[1m])自动改 checkout 里的代码
   → 展示所有文件 git diff + 提示新分支，staged 待确认
   → 用户回复 `@确认 提交并建mr` → commit + push 到新分支 {src}-fix-{task}（受控写操作，仅 topic 发起人可确认）
   → 自动建 MR(source=fix分支, target=base) → 返回真实新 MR URL
@@ -89,5 +88,5 @@
 - **共享 workspace**：`/var/lib/report-server/daily/cr-workspace`（checkout + result + cache）
 - **共享 checkout**：`chaos-cb-2`（code_reviewer 复用 clone 缓存）
 - **claude CLI**：`/usr/local/bin/claude`（host 与容器 `chaos-agent-cr` 均可用；`_find_claude()` 探测绝对路径）。settings.json `skipDangerousModePermissionPrompt=false`
-- **EDIT_MODEL**：`glm-5.2[1m]`（通过 `claude -p` 调用）
+- **EDIT_MODEL**：`deepseek-v4-flash[1m]`（通过 `claude -p` 调用）
 - **host cron**：healthcheck(5min) + zombie(5min) + cleanup(每天3:15)

@@ -1103,7 +1103,7 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
     return file, d.stdout, None
 
 
-EDIT_MODEL = "glm-5.2[1m]"  # used via local claude -p CLI (reaches [1m] models that 503 on raw HTTP)
+EDIT_MODEL = "deepseek-v4-flash[1m]"  # used via local claude -p CLI (reaches [1m] models that 503 on raw HTTP)
 
 
 def _find_claude():
@@ -1119,7 +1119,7 @@ def _find_claude():
     return None
 
 
-def _claude_p_call(prompt, model="glm-5.2[1m]", timeout=180):
+def _claude_p_call(prompt, model=EDIT_MODEL, timeout=180):
     """Run the local `claude -p` CLI (the exact tool that can reach the [1m] model on
     this machine). Falls back to None on failure (caller retries elsewhere). Uses an
     absolute path so a PATH override (cr-env/env.sh) cannot hide the binary."""
@@ -1269,7 +1269,6 @@ def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
     commits + pushes the fix branch + auto-creates the MR. Does NOT push here."""
     api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
     base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-    model = _env("ANTHROPIC_MODEL") or "deepseek-v4-flash"
     ok, why = _approve(key, topic, actor, "auto_edit")
     if not ok:
         _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
