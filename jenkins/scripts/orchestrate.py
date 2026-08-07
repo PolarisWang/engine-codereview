@@ -1671,7 +1671,13 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
         return None, None, new_branch, "no MR for fix branch yet"
     # 2) create
     title = f"Fix {topic.get('jira_key') or topic.get('message_id') or ''}: code review fixes"
-    desc = _generate_mr_card(topic, all_findings, _DEFAULT_WORKSPACE, topic.get("message_id") or "")
+    # NOTE: must not call _generate_mr_card here (it calls back into _create_or_get_mr
+    # -> infinite recursion). Build a simple description instead.
+    desc_lines = [f"Code review fix for {topic.get('jira_key') or topic.get('message_id') or ''}"]
+    crit = [f for f in (all_findings or []) if (f.get('severity') or '').lower() in ('critical', 'high')]
+    for f in (crit or (all_findings or []))[:5]:
+        desc_lines.append(f"- {(f.get('file') or '?')}: {(f.get('issue') or '').strip()[:90]}")
+    desc = "\n".join(desc_lines)
     target = topic.get("base_branch") or "master"
     payload = _json.dumps({"source_branch": new_branch, "target_branch": target,
                            "title": title, "description": desc}).encode()
