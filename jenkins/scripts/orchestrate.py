@@ -985,6 +985,64 @@ def _auto_fix_in_checkout(topic, all_findings, api_key, base_url, model, workspa
     return ok_diffs, failed, branch_name, None
 
 
+def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=None, file_target=None):
+    """Auto-edit ONE file in the real checkout per the fix guidance; apply the LLM diff
+    for real and return the resulting `git diff` as a preview (NOT committed/pushed).
+
+    This gives the user a concrete look at what the bot would change before any push.
+    Returns (file, diff_text, error)."""
+    import subprocess as _sp
+    ws = workspace or _DEFAULT_WORKSPACE
+    checkout, err = _ensure_checkout(topic, ws)
+    if err:
+        return None, "", f"checkout: {err}"
+    crit = [f for f in (all_findings or [])
+            if (f.get("severity") or "").lower() in ("critical", "high")]
+    show = crit or (all_findings or [])[:3]
+    file = file_target
+    issue = ""
+    for f in show:
+        if file_target and (f.get("file") or "") != file_target:
+            continue
+        file = f.get("file") or file
+        issue = f.get("issue") or ""
+        break
+    if not file or not issue:
+        return None, "", "no finding for target"
+    src = topic.get("review_branch") or ""
+    task = topic.get("jira_key") or "task"
+    new_branch = f"{src}-fix-{task}" if src else f"fix-{task}"
+    # ensure on the new branch (create if absent)
+    _sp.run(["git", "-C", checkout, "checkout", "-B", new_branch],
+            capture_output=True, text=True, timeout=60)
+    p = os.path.join(checkout, file)
+    if not os.path.isfile(p):
+        return None, "", f"file not in checkout: {file}"
+    content = open(p, encoding="utf-8", errors="ignore").read()
+    sysp = ("You produce ONE git-apply-able unified diff that fixes the issue in this "
+            "file, given the CURRENT content. Output diff only, starting 'diff --git', "
+            "exact hunks with correct line numbers from the current file. No prose/fences. "
+            "If cannot safely fix, reply NO_SAFE_FIX.")
+    prompt = (f"FILE: {file}\n\n```\n{content[:6000]}\n```\n\nISSUE: {issue}\n\nUnified diff:")
+    raw = _call_llm_simple(prompt, api_key, base_url, model, max_tokens=2000)
+    diff = _extract_clean_diff(raw)
+    if not diff:
+        return None, "", "LLM 未能生成干净 diff"
+    # reset any partial apply then apply for real
+    _sp.run(["git", "-C", checkout, "checkout", "--", "."], capture_output=True, text=True, timeout=60)
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as f:
+        f.write(diff)
+        pf = f.name
+    r = _sp.run(["git", "-C", checkout, "apply", pf], capture_output=True, text=True, timeout=120)
+    os.path.exists(pf) and os.unlink(pf)
+    if r.returncode != 0:
+        return None, "", f"git apply failed: {r.stderr[:200]}"
+    # show the resulting diff for this file
+    d = _sp.run(["git", "-C", checkout, "diff", "--", file], capture_output=True, text=True, timeout=60)
+    return file, d.stdout, None
+
+
 def _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace=None):
     """Build a human preview using the Y auto-fix (real checkout + apply --check)."""
     ok, failed, branch_name, err = _auto_fix_in_checkout(
