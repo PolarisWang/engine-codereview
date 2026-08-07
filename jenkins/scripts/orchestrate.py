@@ -320,8 +320,10 @@ def run(args):
         engine_repo, game_repo, mr_url, workspace, eng_out, gam_out)
 
     # 4. Record per-repo terminal states + update the in-flight card.
-    _record_repo_state(state_file, key, "engine", eng_out, eng_res, review_branch, base_branch)
-    _record_repo_state(state_file, key, "game", gam_out, gam_res, review_branch, base_branch)
+    _record_repo_state(state_file, key, "engine", eng_out, eng_res, review_branch, base_branch,
+                       repo_url=engine_repo)
+    _record_repo_state(state_file, key, "game", gam_out, gam_res, review_branch, base_branch,
+                       repo_url=game_repo)
     _log('REPO', 'DONE', key, issue_key, project, '', 'repo states recorded')
     _update_state_card(state_file, app_id, app_secret, key)
 
@@ -1634,6 +1636,18 @@ def state_file_default(key, topic):
     return os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
 
 
+def _repo_url_from_mr(topic):
+    """For legacy topics with no persisted repo_url, derive the git https URL from
+    the recorded MR url (mirrors _ensure_checkout's project-path parsing, but with a
+    clean https URL — the executor authenticates via git_askpass, not token-in-URL)."""
+    mr_url = topic.get("mr_url") or ""
+    if "merge_requests" not in mr_url:
+        return ""
+    import jira_parser as _jp
+    pp, _ = _jp.parse_gitlab_mr_url(mr_url)
+    return f"https://gitlab.booming-inc.com/{pp}.git" if pp else ""
+
+
 def _resolve_repo_checkout(workspace, topic, repo):
     """
     Locate a topic repo's git checkout under workspace. Returns (checkout_dir, real_repo_name)
@@ -1642,7 +1656,9 @@ def _resolve_repo_checkout(workspace, topic, repo):
     """
     repos = {}
     for r in ("engine", "game"):
-        url = topic.get(f"{r}_repo") or topic.get("repos", {}).get(r, {}).get("repo_url") or ""
+        url = (topic.get(f"{r}_repo")
+               or topic.get("repos", {}).get(r, {}).get("repo_url")
+               or (_repo_url_from_mr(topic) if r == repo else "") or "")
         if url:
             repos[r] = url
     url = repos.get(repo) or (list(repos.values())[0] if repos else "")
@@ -1750,7 +1766,9 @@ def _ensure_shared_checkout(topic, repo, workspace):
     url = ""
     for r in ("engine", "game"):
         if repo == r:
-            url = topic.get(f"{r}_repo") or topic.get("repos", {}).get(r, {}).get("repo_url") or ""
+            url = (topic.get(f"{r}_repo")
+                   or topic.get("repos", {}).get(r, {}).get("repo_url")
+                   or _repo_url_from_mr(topic) or "")
             break
     if not url:
         return None, f"no repo_url recorded for '{repo}'"
@@ -2424,9 +2442,11 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
     return eng_res, gam_res
 
 
-def _record_repo_state(state_file, key, repo, out_path, res, review_branch, base_branch):
+def _record_repo_state(state_file, key, repo, out_path, res, review_branch, base_branch, repo_url=""):
+    repo_url = repo_url or ""
     if not res:
-        pipeline_state.set_repo(state_file, key, repo, status="FAILED", error="no result")
+        pipeline_state.set_repo(state_file, key, repo, status="FAILED", error="no result",
+                                repo_url=repo_url)
         _log('REPO', 'FAILED', key, '', '', repo, 'no result')
         return
     review = res.get("review") or {}
@@ -2440,19 +2460,20 @@ def _record_repo_state(state_file, key, repo, out_path, res, review_branch, base
     if branch_exists is False:
         pipeline_state.set_repo(state_file, key, repo, status="SKIPPED",
                                 skip_reason=f"branch {review_branch} not remote",
-                                result_file=os.path.basename(out_path))
+                                result_file=os.path.basename(out_path), repo_url=repo_url)
     elif branch_merged:
         pipeline_state.set_repo(state_file, key, repo, status="SKIPPED",
                                 skip_reason="already merged",
-                                result_file=os.path.basename(out_path))
+                                result_file=os.path.basename(out_path), repo_url=repo_url)
     elif not err and changed == 0:
         pipeline_state.set_repo(state_file, key, repo, status="SKIPPED",
                                 skip_reason=f"no changes vs {base_branch}",
-                                result_file=os.path.basename(out_path))
+                                result_file=os.path.basename(out_path), repo_url=repo_url)
     else:
         pipeline_state.set_repo(state_file, key, repo, status="SUCCESS", error=err,
                                 result_file=os.path.basename(out_path),
-                                severity_counts=sev, stats=stats, changed_files=changed)
+                                severity_counts=sev, stats=stats, changed_files=changed,
+                                repo_url=repo_url)
 
 
 def _update_state_card(state_file, app_id, app_secret, key):

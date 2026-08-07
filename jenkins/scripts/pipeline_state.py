@@ -110,6 +110,7 @@ def _repo_default():
         "error": "",
         "skip_reason": "",
         "result_file": "",
+        "repo_url": "",
         "changed_files": 0,
         "stats": "",
         "severity_counts": {},
@@ -421,9 +422,11 @@ def reset_for_retry(path, key):
 # ── Per-repo status ──────────────────────────────────────────────────────────
 
 def set_repo(path, key, repo, *, status, error="", skip_reason="",
-             result_file="", severity_counts=None, stats="", changed_files=0):
+             result_file="", severity_counts=None, stats="", changed_files=0,
+             repo_url=""):
     """Update a repo's status + granular fields. Sets finished_at when the repo
-    reaches a terminal state (SUCCESS/SKIPPED/FAILED)."""
+    reaches a terminal state (SUCCESS/SKIPPED/FAILED). repo_url is persisted so
+    the executor can later locate this repo's shared checkout."""
     if repo not in VALID_REPOS:
         raise ValueError(f"invalid repo: {repo}")
     if status not in REPO_STATUSES:
@@ -438,6 +441,8 @@ def set_repo(path, key, repo, *, status, error="", skip_reason="",
 
     r = topic["repos"].setdefault(repo, _repo_default())
     r["status"] = status
+    if repo_url:
+        r["repo_url"] = repo_url
     if error:
         r["error"] = error
     if skip_reason:
