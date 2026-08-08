@@ -707,10 +707,17 @@ def reset_for_retry(path, key):
     Reset a FAILED topic to a fresh SCANNED/RUNNING state so a retry can run
     (clears the terminal FAILED phase and the backoff schedule). Keeps the
     original jira_url/branch fields. Returns the topic dict.
+
+    CLOSED is a hard terminal state (see transition()): it must never be re-opened
+    by a retry/reset, so a CLOSED topic is returned unchanged. FAILED stays
+    retryable via this function.
     """
     topic = _load_topic(path, key)
     if topic is None:
         return None
+    if topic.get("phase") == "CLOSED":
+        # Hard terminal — never reopen. Mirrors the transition() guard.
+        return topic
     topic["phase"] = "SCANNED"
     topic["status"] = "RUNNING"
     topic["next_retry_at"] = ""
