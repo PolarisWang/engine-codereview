@@ -621,6 +621,48 @@ def _should_auto_close(topic, now_ts=None):
     return idle_days > IDLE_CLOSE_DAYS
 
 
+# First-token command keywords recognized by the reliable router (orchestrate.py
+# "Reliable command routing" block + the confirmation gating handled earlier).
+# Used by _strip_mention so an @-mention that IS itself a command keyword (e.g.
+# `@指引 ...`) is treated as the command, not stripped away into an agent loop.
+_COMMAND_FIRST_WORDS = {
+    "1", "补丁", "生成补丁", "修复",
+    "2", "重新审查", "重审", "review", "重新review",
+    "3", "解释",
+    "4", "关闭", "关闭话题",
+    "mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单",
+    "预览", "预览补丁", "patch预览",
+    "指引", "修改指引", "怎么改",
+    "改码", "自动修改", "自动修复", "autofix", "改码并提交",
+    "应用并提交", "确认提交", "push并建mr",
+    "状态", "/状态", "status",
+}
+
+
+def _strip_mention(text):
+    """Strip a leading @-mention so the first real command token is used for
+    routing. Handles BOTH ASCII mentions ("@_user_1 指引 ...") and Chinese ones
+    ("@机器人 改码 ..."). Crucially, if the token after '@' is itself a known
+    command keyword ("@指引 ...", "@改码 ..."), we do NOT strip it — the keyword
+    IS the command. Without this, `@指引 修复所有问题` was mis-routed into the
+    agent loop (producing raw [tool_use] history) instead of the fixed 指引 path."""
+    import re as _re
+    s = (text or "").strip()
+    if not s.startswith("@"):
+        return s
+    # token immediately after '@' (run of non-whitespace)
+    m2 = _re.match(r'^@([^\s]+)', s)
+    if not m2:
+        return s
+    token = m2.group(1)
+    if token in _COMMAND_FIRST_WORDS:
+        # e.g. `@指引 修复...` — the @-token IS the command keyword; strip only the
+        # leading '@' so `word = split()[0]` yields `指引` and routes correctly.
+        return s[1:].strip()  # drop the '@' before the keyword, keep the rest
+    # a genuine mention placeholder (bot id / user id / bot's display name) -> strip
+    return s[m2.end():].strip()
+
+
 def interact(args):
     """
     Multi-turn agent handler for a reply / @bot in a topic thread.
@@ -730,9 +772,7 @@ def interact(args):
     #    LLM guesses). Matches whole-word / prefix so "2" always = re-review, etc. ──
     # Drop a leading @-mention (e.g. "@_user_1 MR ...", "@机器人 1") so the first
     # real command token is used for matching.
-    cmd = low.strip()
-    import re as _re
-    cmd = _re.sub(r'^@[\w.\-]+', '', cmd).strip()
+    cmd = _strip_mention(low)
     word = cmd.split()[0] if cmd else ""
     if word in ("1", "补丁", "生成补丁", "修复"):
         # Propose a fix patch for the findings (suggestion-based, staged for later).
