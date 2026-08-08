@@ -50,12 +50,12 @@
     },
     {
       "id": 102,
-      "title": "Concurrency / Locks",
+      "title": "Reviews In Flight / Lock Files",
       "type": "stat",
       "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
       "targets": [
-        {"expr": "cr_review_slots_held", "refId": "A"},
-        {"expr": "cr_locks_total", "refId": "B"}
+        {"expr": "cr_proc_reviewers", "refId": "A", "legendFormat": "in-flight"},
+        {"expr": "cr_locks_total", "refId": "B", "legendFormat": "lock-files"}
       ],
       "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
     },
@@ -139,19 +139,19 @@
       "targets": [
         {"expr": "cr_open_topics_total", "refId": "A", "legendFormat": "open_topics"},
         {"expr": "cr_pending_actions", "refId": "B", "legendFormat": "pending"},
-        {"expr": "cr_review_slots_held", "refId": "C", "legendFormat": "slots_held"}
+        {"expr": "cr_proc_reviewers", "refId": "C", "legendFormat": "reviews_in_flight"}
       ]
     },
     {
       "id": 200,
-      "title": "Host: CPU / Mem / Load",
+      "title": "宿主机 Host: CPU / Mem / Load (非容器)",
       "type": "stat",
       "gridPos": {"h": 4, "w": 12, "x": 0, "y": 24},
       "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "percentunit"}},
       "targets": [
-        {"expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", "refId": "CPU", "legendFormat": "CPU"},
-        {"expr": "node_memory_Active_bytes / node_memory_MemTotal_bytes", "refId": "MEM", "legendFormat": "Mem"},
-        {"expr": "node_load1", "refId": "LOAD", "legendFormat": "Load1"}
+        {"expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", "refId": "CPU", "legendFormat": "CPU(宿主机)"},
+        {"expr": "node_memory_Active_bytes / node_memory_MemTotal_bytes", "refId": "MEM", "legendFormat": "Mem(宿主机)"},
+        {"expr": "node_load1", "refId": "LOAD", "legendFormat": "Load1(宿主机)"}
       ],
       "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"]}}
     },
@@ -193,7 +193,7 @@
     },
     {
       "id": 205,
-      "title": "Review Duration (s) / Changed Files per Topic",
+      "title": "Review Duration (s, 0=缓存复用) / Changed Files per Topic",
       "type": "timeseries",
       "gridPos": {"h": 5, "w": 8, "x": 0, "y": 32},
       "targets": [
