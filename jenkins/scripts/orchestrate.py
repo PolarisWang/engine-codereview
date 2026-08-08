@@ -992,6 +992,27 @@ def _extract_clean_diff(raw):
     return diff.strip()
 
 
+def _safe_checkout_path(checkout, file):
+    """Map an LLM-provided `file` (untrusted) onto a path that is GUARANTEED to
+    stay inside the topic's checkout dir (R9).
+
+    Finding `file` values come from model output and the code-review prompt does
+    not constrain them. A crafted/errant value could use `..`, an absolute path,
+    or a symlink to escape the checkout and let the auto-edit write files outside
+    the topic's tree (scope: repo_checkout_only is *declared* in policy.yaml but
+    was not enforced in code). `realpath` resolves any `..`/symlinks, and
+    `commonpath` asserts the resolved target still lives under the checkout.
+
+    Raises ValueError on any escape so the caller can mark that finding as
+    failed (refuse-to-write), never silently writing outside the checkout.
+    """
+    base = os.path.realpath(checkout)
+    target = os.path.realpath(os.path.join(base, file or ""))
+    if os.path.commonpath([base, target]) != base:
+        raise ValueError(f"path escapes checkout: {file!r}")
+    return target
+
+
 def _ensure_checkout(topic, workspace):
     """Clone (or reuse) the topic's review branch to a deterministic checkout dir in
     workspace. Returns (checkout_dir, err) or (None, err). Authenticates via the
@@ -1076,13 +1097,18 @@ def _auto_fix_in_checkout(topic, all_findings, api_key, base_url, model, workspa
     ok_diffs, failed = [], []
     for f in show[:3]:
         file = f.get("file") or f.get("path") or ""
-        if not file or not os.path.isfile(os.path.join(checkout, file)):
+        try:
+            fpath = _safe_checkout_path(checkout, file)
+        except ValueError as _e:
+            failed.append((file, f"不安全路径: {_e}"))
+            continue
+        if not file or not os.path.isfile(fpath):
             failed.append((file, "checkout 缺失该文件"))
             continue
         issue = (f.get("issue") or "")[:500]
         attained = False
         for rnd in range(max_rounds):
-            content = open(os.path.join(checkout, file), encoding="utf-8", errors="ignore").read()
+            content = open(fpath, encoding="utf-8", errors="ignore").read()
             sysp = ("You fix a code review finding. Output ONE git-apply-able unified diff "
                     "for the file, starting with 'diff --git'. Exact hunks with correct "
                     "line numbers/context from the CURRENT file. No prose, no fences. "
@@ -1136,7 +1162,10 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
     # ensure on the new branch (create if absent)
     _sp.run(["git", "-C", checkout, "checkout", "-B", new_branch],
             capture_output=True, text=True, timeout=60)
-    p = os.path.join(checkout, file)
+    try:
+        p = _safe_checkout_path(checkout, file)
+    except ValueError as _e:
+        return None, "", f"file escapes checkout: {file}"
     if not os.path.isfile(p):
         return None, "", f"file not in checkout: {file}"
     content = open(p, encoding="utf-8", errors="ignore").read()
@@ -1223,7 +1252,10 @@ def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_
     """Edit one file's exact problem window with the model, apply, and iterate on
     `git apply --check` feedback. Returns (file, git_diff, ok, error)."""
     import subprocess as _sp, re as _re
-    p = os.path.join(checkout, file)
+    try:
+        p = _safe_checkout_path(checkout, file)
+    except ValueError as _e:
+        return None, "", False, f"file escapes checkout: {file}"
     if not os.path.isfile(p):
         return None, "", False, f"file missing: {file}"
     # a distinctive needle from the issue to locate context (prefer an alphanumeric token)
@@ -1487,8 +1519,11 @@ def _generate_fix_guidance(topic, all_findings, api_key, base_url, model, worksp
         suggestion = (f.get("suggestion") or "").strip()
         ctx = ""
         if checkout and file:
-            p = os.path.join(checkout, file)
-            if os.path.isfile(p):
+            try:
+                p = _safe_checkout_path(checkout, file)
+            except ValueError:
+                p = ""
+            if p and os.path.isfile(p):
                 ctx = open(p, encoding="utf-8", errors="ignore").read()
         lines.append(f"\n**🔴 {file}**")
         lines.append(f"- 问题：{issue[:200]}")
