@@ -1026,6 +1026,23 @@ def _safe_checkout_path(checkout, file):
     return target
 
 
+# Checkout-scoped cross-process lock (R17): auto-edit (改码) and its confirm run
+# against a SHARED `{repo}-review` checkout that multiple topics may reuse. The
+# per-topic lock serializes only the SAME topic; two topics editing the same repo
+# can still clobber each other's working tree. This lock is keyed by the repo
+# name (not topic), so all auto-edit/confirm for one repo are serialized across
+# processes, while different repos stay parallel. Scope is ONE execution (we
+# must NOT hold it across the user's @确认 wait).
+def _checkout_lock(repo_name, lock_dir=None):
+    """Return a context manager holding a cross-process flock for a repo's review
+    checkout. repo_name is the repo basename (lock key). Must only be held during
+    a single edit/confirm mutation, never across the user-confirm wait."""
+    import hashlib
+    lock_dir = lock_dir or os.environ.get("CHECKOUT_LOCK_DIR") or pipeline_state.DEFAULT_LOCK_DIR()
+    key = hashlib.sha1((repo_name or "?").encode("utf-8")).hexdigest()[:16]
+    return pipeline_state.topic_lock_context(lock_dir, f"checkout_{key}")
+
+
 def _ensure_checkout(topic, workspace):
     """Clone (or reuse) the topic's review branch to a deterministic checkout dir in
     workspace. Returns (checkout_dir, err) or (None, err). Authenticates via the
@@ -1352,28 +1369,31 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     checkout, err = _ensure_checkout(topic, ws)
     if err:
         return [], [], branch, None, err, ""
-    # _ensure_checkout already reset the reused tree to origin/{src} (fetch + reset + clean),
-    # so the fix branch below is carved from the latest remote HEAD, not a stale/foreign one.
-    # Work on the new fix branch (create locally if absent) — never touch review_branch.
-    _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
-            capture_output=True, text=True, timeout=60)
-    # Baseline SHA: the commit this edit set will be built on. Confirm re-checks this
-    # before push (R1) so we never commit onto a drifted tree.
-    _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
-                     capture_output=True, text=True, timeout=30)
-    checkout_sha = (_sha_r.stdout or "").strip()
-    crit = [f for f in (all_findings or [])
-            if (f.get("severity") or "").lower() in ("critical", "high")]
-    show = crit or (all_findings or [])[:3]
-    ok_diffs, failed = [], []
-    for f in show[:3]:
-        file = f.get("file") or f.get("path") or ""
-        issue = f.get("issue") or ""
-        _file, diff, ok, e = _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model)
-        if ok and diff:
-            ok_diffs.append({"file": _file, "diff": diff})
-        else:
-            failed.append((file, e or "edit failed"))
+    # R17: serialize edits on this repo's shared checkout across processes.
+    repo_name = os.path.basename(checkout).removesuffix("-review")
+    with _checkout_lock(repo_name):
+        # _ensure_checkout already reset the reused tree to origin/{src} (fetch + reset +
+        # clean), so the fix branch below is carved from the latest remote HEAD, not a
+        # stale/foreign one. Work on the new fix branch (never touch review_branch).
+        _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
+                capture_output=True, text=True, timeout=60)
+        # Baseline SHA: the commit this edit set will be built on. Confirm re-checks this
+        # before push (R1) so we never commit onto a drifted tree.
+        _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                         capture_output=True, text=True, timeout=30)
+        checkout_sha = (_sha_r.stdout or "").strip()
+        crit = [f for f in (all_findings or [])
+                if (f.get("severity") or "").lower() in ("critical", "high")]
+        show = crit or (all_findings or [])[:3]
+        ok_diffs, failed = [], []
+        for f in show[:3]:
+            file = f.get("file") or f.get("path") or ""
+            issue = f.get("issue") or ""
+            _file, diff, ok, e = _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model)
+            if ok and diff:
+                ok_diffs.append({"file": _file, "diff": diff})
+            else:
+                failed.append((file, e or "edit failed"))
     return ok_diffs, failed, branch, checkout, None, checkout_sha
 
 
@@ -1440,64 +1460,69 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             capture_output=True, text=True, timeout=30, env=_git_env)
     _sp.run(["git", "-C", checkout, "config", "user.name", "codereview-agent"],
             capture_output=True, text=True, timeout=30, env=_git_env)
-    _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
-            capture_output=True, text=True, timeout=60, env=_git_env)
-    # R1 guard: refuse to push a stale edit set. We recorded the base commit at
-    # edit time (checkout_sha); if the reused/shared checkout was reset by another
-    # tick (re_review / another topic / cleanup) since, HEAD no longer equals that
-    # base, so replaying the stored diffs could apply them onto a drifted base.
-    # A missing baseline (legacy pending) is also refused (fail-safe).
-    expected_sha = (pending or {}).get("checkout_sha") or ""
-    if expected_sha:
-        _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
-                         capture_output=True, text=True, timeout=30, env=_git_env)
-        cur = (_sha_r.stdout or "").strip()
-        if not cur or cur != expected_sha:
+    # R17: serialize this repo's shared-checkout mutations (checkout -B / R1
+    # guard / add / commit / replay / push) across processes so two topics editing
+    # the same repo cannot clobber each other's working tree.
+    repo_name = os.path.basename(checkout).removesuffix("-review")
+    with _checkout_lock(repo_name):
+        _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
+                capture_output=True, text=True, timeout=60, env=_git_env)
+        # R1 guard: refuse to push a stale edit set. We recorded the base commit at
+        # edit time (checkout_sha); if the reused/shared checkout was reset by another
+        # tick (re_review / another topic / cleanup) since, HEAD no longer equals that
+        # base, so replaying the stored diffs could apply them onto a drifted base.
+        # A missing baseline (legacy pending) is also refused (fail-safe).
+        expected_sha = (pending or {}).get("checkout_sha") or ""
+        if expected_sha:
+            _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=30, env=_git_env)
+            cur = (_sha_r.stdout or "").strip()
+            if not cur or cur != expected_sha:
+                pipeline_state.set_pending_patch(state_file, key, None)
+                _update_card_text(app_id, app_secret, render,
+                                  "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期改码提交到错误基线，已取消本次提交。请重新回复 `改码`。")
+                return 0
+        else:
+            # Legacy staged edit without a recorded baseline: safest to refuse.
             pipeline_state.set_pending_patch(state_file, key, None)
             _update_card_text(app_id, app_secret, render,
-                              "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期改码提交到错误基线，已取消本次提交。请重新回复 `改码`。")
+                              "⛔ 缺少改码基线记录（旧版本暂存的改码），已取消。请重新回复 `改码`。")
             return 0
-    else:
-        # Legacy staged edit without a recorded baseline: safest to refuse.
-        pipeline_state.set_pending_patch(state_file, key, None)
-        _update_card_text(app_id, app_secret, render,
-                          "⛔ 缺少改码基线记录（旧版本暂存的改码），已取消。请重新回复 `改码`。")
-        return 0
-    _sp.run(["git", "-C", checkout, "add", "-A"],
-            capture_output=True, text=True, timeout=60, env=_git_env)
-    _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                      capture_output=True, text=True, timeout=60, env=_git_env)
-    if _commit.returncode != 0:
-        _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
-        if "nothing to commit" in _commit_out:
-            # tree is clean relative to HEAD on the fix branch -> replay stored diffs
-            import tempfile
-            for d in files:
-                diff = d.get("diff") or ""
-                if not diff:
-                    continue
-                with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
-                    _f.write(diff)
-                    _pf = _f.name
-                _ap = _sp.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
-                              timeout=60, env=_git_env)
-                try:
-                    os.unlink(_pf)
-                except OSError:
-                    pass
-            _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
-            _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                              capture_output=True, text=True, timeout=60, env=_git_env)
-    if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
-        _update_card_text(app_id, app_secret, render,
-                          f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
-        return 0
-    push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
-                   capture_output=True, text=True, timeout=180, env=_git_env)
-    if push.returncode != 0:
-        _update_card_text(app_id, app_secret, render,
-                          f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
-        return 0
+        _sp.run(["git", "-C", checkout, "add", "-A"],
+                capture_output=True, text=True, timeout=60, env=_git_env)
+        _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                          capture_output=True, text=True, timeout=60, env=_git_env)
+        if _commit.returncode != 0:
+            _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
+            if "nothing to commit" in _commit_out:
+                # tree is clean relative to HEAD on the fix branch -> replay stored diffs
+                import tempfile
+                for d in files:
+                    diff = d.get("diff") or ""
+                    if not diff:
+                        continue
+                    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                        _f.write(diff)
+                        _pf = _f.name
+                    _ap = _sp.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
+                                  timeout=60, env=_git_env)
+                    try:
+                        os.unlink(_pf)
+                    except OSError:
+                        pass
+                _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
+                _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                                  capture_output=True, text=True, timeout=60, env=_git_env)
+        if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
+            _update_card_text(app_id, app_secret, render,
+                              f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
+            return 0
+        push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
+                       capture_output=True, text=True, timeout=180, env=_git_env)
+        if push.returncode != 0:
+            _update_card_text(app_id, app_secret, render,
+                              f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
+            return 0
     # Auto-create / detect the fix-branch MR and report its real url.
     mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
     if mriid:
@@ -2114,63 +2139,66 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         # Unshallow the depth-2 clone so the push won't be rejected by the server.
         _sp2.run(["git", "-C", checkout, "fetch", "--unshallow", "origin"],
                  capture_output=True, text=True, timeout=600, env=_git_env)
-        _sp2.run(["git", "-C", checkout, "checkout", "-B", branch],
-                 capture_output=True, text=True, timeout=60, env=_git_env)
-        # R1 guard: refuse to push a stale edit set (see _cmd_confirm_agent_edit).
-        expected_sha = (pp or {}).get("checkout_sha") or ""
-        if expected_sha:
-            _sha_r = _sp2.run(["git", "-C", checkout, "rev-parse", "HEAD"],
-                              capture_output=True, text=True, timeout=30, env=_git_env)
-            cur = (_sha_r.stdout or "").strip()
-            if not cur or cur != expected_sha:
+        # R17: serialize this repo's shared-checkout mutations across processes.
+        repo_name = os.path.basename(checkout).removesuffix("-review")
+        with _checkout_lock(repo_name):
+            _sp2.run(["git", "-C", checkout, "checkout", "-B", branch],
+                     capture_output=True, text=True, timeout=60, env=_git_env)
+            # R1 guard: refuse to push a stale edit set (see _cmd_confirm_agent_edit).
+            expected_sha = (pp or {}).get("checkout_sha") or ""
+            if expected_sha:
+                _sha_r = _sp2.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, timeout=30, env=_git_env)
+                cur = (_sha_r.stdout or "").strip()
+                if not cur or cur != expected_sha:
+                    pipeline_state.set_pending_patch(state_file, key, None)
+                    pipeline_state.clear_pending(state_file, key)
+                    _update_card_text(app_id, app_secret, render,
+                                      "⛔ 工作树已被其他操作重置（基线 SHA 变化），已取消本次提交。请重新回复 `改码`。")
+                    return False, "agent_edit_confirm: checkout drifted from baseline"
+            else:
                 pipeline_state.set_pending_patch(state_file, key, None)
                 pipeline_state.clear_pending(state_file, key)
                 _update_card_text(app_id, app_secret, render,
-                                  "⛔ 工作树已被其他操作重置（基线 SHA 变化），已取消本次提交。请重新回复 `改码`。")
-                return False, "agent_edit_confirm: checkout drifted from baseline"
-        else:
-            pipeline_state.set_pending_patch(state_file, key, None)
-            pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render,
-                              "⛔ 缺少改码基线记录（旧版本暂存），已取消。请重新回复 `改码`。")
-            return False, "agent_edit_confirm: missing baseline SHA"
-        _sp2.run(["git", "-C", checkout, "add", "-A"],
-                 capture_output=True, text=True, timeout=60, env=_git_env)
-        _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                           capture_output=True, text=True, timeout=60, env=_git_env)
-        if _commit.returncode != 0:
-            _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
-            if "nothing to commit" in _commit_out:
-                # replay the staged diffs into the (possibly reset) tree
-                import tempfile as _tf
-                for d in files:
-                    diff = d.get("diff") or ""
-                    if not diff:
-                        continue
-                    with _tf.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
-                        _f.write(diff)
-                        _pf = _f.name
-                    _sp2.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
-                             timeout=60, env=_git_env)
-                    try:
-                        os.unlink(_pf)
-                    except OSError:
-                        pass
-                _sp2.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
-                _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                                   capture_output=True, text=True, timeout=60, env=_git_env)
-        if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
-            pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render,
-                              f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
-            return False, f"agent_edit_confirm: commit failed"
-        push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
-                        capture_output=True, text=True, timeout=300, env=_git_env)
-        if push.returncode != 0:
-            pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render,
-                              f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
-            return False, f"agent_edit_confirm: push failed"
+                                  "⛔ 缺少改码基线记录（旧版本暂存），已取消。请重新回复 `改码`。")
+                return False, "agent_edit_confirm: missing baseline SHA"
+            _sp2.run(["git", "-C", checkout, "add", "-A"],
+                     capture_output=True, text=True, timeout=60, env=_git_env)
+            _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                               capture_output=True, text=True, timeout=60, env=_git_env)
+            if _commit.returncode != 0:
+                _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
+                if "nothing to commit" in _commit_out:
+                    # replay the staged diffs into the (possibly reset) tree
+                    import tempfile as _tf
+                    for d in files:
+                        diff = d.get("diff") or ""
+                        if not diff:
+                            continue
+                        with _tf.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                            _f.write(diff)
+                            _pf = _f.name
+                        _sp2.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
+                                 timeout=60, env=_git_env)
+                        try:
+                            os.unlink(_pf)
+                        except OSError:
+                            pass
+                    _sp2.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
+                    _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                                       capture_output=True, text=True, timeout=60, env=_git_env)
+            if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
+                pipeline_state.clear_pending(state_file, key)
+                _update_card_text(app_id, app_secret, render,
+                                  f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
+                return False, f"agent_edit_confirm: commit failed"
+            push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
+                            capture_output=True, text=True, timeout=300, env=_git_env)
+            if push.returncode != 0:
+                pipeline_state.clear_pending(state_file, key)
+                _update_card_text(app_id, app_secret, render,
+                                  f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
+                return False, f"agent_edit_confirm: push failed"
         _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
         if _mriid:
             pipeline_state.record_fix_mr(state_file, key, _mriid)  # R2 ownership ledger
