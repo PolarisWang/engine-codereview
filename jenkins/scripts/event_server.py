@@ -370,11 +370,39 @@ def _p2_message_payload(data):
 
 
 import threading
+from collections import deque
 
 # per-topic serial lock (defense-in-depth layer 5): same topic's interact handled one at a time.
 _T_LOCKS = {}
 _T_LOCKS_GUARD = threading.Lock()
 LOCK_TIMEOUT = 120  # seconds
+
+# ── Dedup (方案 B): Feishu redelivers an EVENT if the ack is slow; a repeated
+# msg_id must not spawn a second interact (duplicate cards in chat_history).
+# Bounded in-memory set of recently-seen message ids. Reset on process restart is
+# acceptable (retries beyond a restart are caught by nothing, but the ack fix in
+# _route (方案 A) makes slow-ack redelivery the exception, not the norm).
+_DEDUP_MAX = 200
+_SEEN_MSG_IDS = deque(maxlen=_DEDUP_MAX)
+_SEEN_GUARD = threading.Lock()
+
+
+def _claim_msg_id(msg_id):
+    """Return True (and record) if this msg_id is NEW; False if it was already
+    seen recently (dedup — do not process again). """
+    if not msg_id:
+        return True  # no id -> cannot dedup; process
+    with _SEEN_GUARD:
+        if msg_id in _SEEN_MSG_IDS:
+            return False
+        _SEEN_MSG_IDS.append(msg_id)
+        return True
+
+
+# Bound concurrent backend interact workers (方案 A): a flood of replies spawns
+# one background thread each; cap it so we don't exhaust threads/resources.
+MAX_INTERACT_WORKERS = 16
+_SPAWN_SEM = threading.BoundedSemaphore(MAX_INTERACT_WORKERS)
 
 
 def _topic_lock(topic_key):
@@ -405,6 +433,37 @@ def _resolve_topic_key(state_file, parent_id):
         return None
 
 
+def _spawn_interact(topic_key, reply_text, reply_msg_id, sender_id):
+    """Run an interact for a reply in a BACKGROUND thread (方案 A).
+
+    The ws message handler must return quickly so the lark SDK can ack Feishu
+    before its timeout; if we run the (blocking, up-to-1800s) interact inline,
+    Feishu retries the same EVENT -> duplicate cards in chat_history. We instead
+    enqueue the interact here and return immediately; the per-topic lock is taken
+    inside the worker so same-topic replies stay serialized and the handler never
+    blocks. A semaphore bounds concurrent workers to avoid thread exhaustion if
+    the group floods.
+    """
+    _SPAWN_SEM.acquire()
+    def _work():
+        try:
+            lock = _topic_lock(topic_key)
+            acquired = lock.acquire(timeout=LOCK_TIMEOUT)
+            try:
+                if not acquired:
+                    print(f"[event] topic {topic_key} busy, skip reply {reply_msg_id}", file=sys.stderr)
+                    return
+                base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
+                _run_orchestrate(["interact", "--key", topic_key, "--reply", reply_text[:500],
+                                  "--reply-msg-id", reply_msg_id, "--sender-id", sender_id] + base)
+            finally:
+                if acquired:
+                    lock.release()
+        finally:
+            _SPAWN_SEM.release()
+    threading.Thread(target=_work, daemon=True).start()
+
+
 def _route(msg_id, parent_id, text, sender_id=""):
     """Shared single-link routing.
 
@@ -415,7 +474,7 @@ def _route(msg_id, parent_id, text, sender_id=""):
       duplication) and lets the event server act purely as the message/interact hub.
     - Reply / @bot on an existing topic: route to interact (only needs FEISHU +
       ANTHROPIC env, which the event server has). Same-topic replies are
-      serialized via a per-topic lock.
+      serialized via a per-topic lock, taken in the background worker.
     """
     if not parent_id:
         if _is_jira_topic(text):
@@ -425,22 +484,16 @@ def _route(msg_id, parent_id, text, sender_id=""):
             print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
         print(f"[event] REPLY {msg_id} to parent {parent_id}: {text[:80]} sender={sender_id}", flush=True)
+        # 方案 B: Feishu redelivers a slow/unacked EVENT as the SAME msg_id. Dedup
+        # here so a retry can't spawn a second interact.
+        if not _claim_msg_id(msg_id):
+            print(f"[event] DEDUP SKIP {msg_id} (already processed)", flush=True)
+            return
         # The parent may be the review result CARD (render_msg_id) rather than the
         # topic starter; resolve it to the real topic key so interact() finds the
         # topic. Without this, a reply on the card silently no-ops.
         topic_key = _resolve_topic_key(_state_file(), parent_id) or parent_id
-        lock = _topic_lock(topic_key)
-        acquired = lock.acquire(timeout=LOCK_TIMEOUT)
-        try:
-            if not acquired:
-                print(f"[event] topic {topic_key} busy, skip this reply", file=sys.stderr)
-                return
-            base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
-            _run_orchestrate(["interact", "--key", topic_key, "--reply", text[:500],
-                              "--reply-msg-id", msg_id, "--sender-id", sender_id] + base)
-        finally:
-            if acquired:
-                lock.release()
+        _spawn_interact(topic_key, text, msg_id, sender_id)
 
 
 class CardAwareClient:
