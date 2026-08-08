@@ -2594,6 +2594,27 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     _finalize(key, note, render_id, [], state_file, app_id, app_secret)
 
 
+def _branch_is_bot_created(proj, branch, tok):
+    """True if a GitLab branch exists AND its HEAD commit is authored by the bot
+    (commit message contains '[codereview-agent]' or author name 'codereview-agent').
+    Used to safely release orphan fix branches (pushed but MR- was never created)
+    at close time — never deletes a branch we didn't create. A missing branch or any
+    API error returns False (won't attempt delete of something unknown)."""
+    import urllib.request, urllib.parse, json as _json
+    try:
+        u = (f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
+             f"{urllib.parse.quote(branch, safe='')}")
+        r = urllib.request.Request(u, headers={"PRIVATE-TOKEN": tok})
+        with urllib.request.urlopen(r, timeout=20) as resp:
+            d = _json.loads(resp.read())
+        c = d.get("commit") or {}
+        author = (c.get("author_name") or "")
+        msg = (c.get("title") or "") + " " + (c.get("message") or "")
+        return ("codereview-agent" in author.lower()) or ("[codereview-agent]" in msg)
+    except Exception:
+        return False  # branch missing / API error -> do not delete
+
+
 def _close_topic_resources(topic):
     """Release all remote resources owned by THIS topic's fix branch:
       1) close every OPEN fix-branch MR this bot created for the topic (R2), and
@@ -2649,10 +2670,13 @@ def _close_topic_resources(topic):
             notes.append(f"关闭 {closed} 个 OPEN MR")
     except Exception:
         pass
-    # 2) delete the fix branch ONLY if we own it (a bot-created MR for this topic,
-    #    or a bot-authored fix commit on the branch). Never delete a stranger's
-    #    branch just because it shares the {src}-fix-{task} name.
-    if closed > 0 or owned_iids:
+    # 2) delete the fix branch.
+    # 归属(A 方案放宽): 除了"关了 MR / owned_iids 台账", 也允许删除"孤儿 fix 分支"——
+    #   即该分支存在且 HEAD 是 bot 提交([codereview-agent])。这解决"确认失败后 push 出去的
+    #   分支没有 MR、close 时因 closed==0 且 fix_iids=[] 而不删"的泄漏。配合 #22 per-topic
+    #   hash 唯一分支名, 只删本话题的分支, 不会误删他人。
+    should_delete = (closed > 0) or bool(owned_iids) or _branch_is_bot_created(proj, new_branch, tok)
+    if should_delete:
         try:
             req = urllib.request.Request(
                 f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"

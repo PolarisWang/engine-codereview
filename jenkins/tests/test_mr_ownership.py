@@ -116,3 +116,36 @@ def test_no_owned_mr_never_deletes_branch(monkeypatch):
     # owned_iids empty and closed==0 => branch delete is skipped.
     assert calls["delete"] == []
     assert calls["close"] == []
+
+
+# --- A 方案: 孤儿 fix 分支释放(无 MR 也曾删, 仅 bot 创建) ---
+
+def test_branch_is_bot_created_true_when_bot_commit(monkeypatch):
+    import urllib.request
+    from orchestrate import _branch_is_bot_created
+    class _Resp:
+        def read(self): return b'{"commit":{"author_name":"codereview-agent","title":"[codereview-agent] auto-fix"}}'
+        def __enter__(self): return self
+        def __exit__(self,*a): return False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    assert _branch_is_bot_created("p", "b", "tok") is True
+
+
+def test_branch_is_bot_created_false_when_foreign(monkeypatch):
+    import urllib.request
+    from orchestrate import _branch_is_bot_created
+    class _Resp:
+        def read(self): return b'{"commit":{"author_name":"zhang-san","title":"something else"}}'
+        def __enter__(self): return self
+        def __exit__(self,*a): return False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    assert _branch_is_bot_created("p", "b", "tok") is False
+
+
+def test_branch_is_bot_created_false_when_missing(monkeypatch):
+    import urllib.request, urllib.error
+    from orchestrate import _branch_is_bot_created
+    def _raise(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "", None, None)
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+    assert _branch_is_bot_created("p", "b", "tok") is False
