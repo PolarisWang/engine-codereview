@@ -769,8 +769,9 @@ def interact(args):
                                            patch={"actor": actor})
                 pipeline_state.append_approval(state_file, key, actor, "push_fix_branch",
                                                pending.get("branch", ""), "ok", "@确认改码 enqueued")
-                _proc_reply(key, topic, "⏳ 已记录确认，Jenkins 将推送修复分支 `{0}` 并自动建 MR。".format(
-                                      pending.get("branch", ""), render_id, state_file, app_id, app_secret))
+                _proc_reply(key, topic,
+                            "⏳ 已记录确认，Jenkins 将推送修复分支 `{0}` 并自动建 MR。".format(pending.get("branch", "")),
+                            render_id, state_file, app_id, app_secret, intent="确认并推送修复分支、创建修复 MR")
                 return 0
             if is_rollback:
                 pipeline_state.set_pending_patch(state_file, key, None)
