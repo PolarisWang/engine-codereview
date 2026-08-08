@@ -2640,6 +2640,7 @@ def _close_topic_resources(topic):
     owned_iids = set(int(x) for x in (topic.get("fix_mr_iids") or []) if str(x).isdigit())
     notes = []
     closed = 0
+    owned_branches = set()   # actual source branches of MRs we own/close
     try:
         # 1) close this fix branch's OPEN MRs — only ones WE own (by iid) or, for
         #    legacy topics, a same-branch MR whose title/desc references our jira.
@@ -2657,6 +2658,10 @@ def _close_topic_resources(topic):
             )
             if not owned:
                 continue
+            # record the branch this owned MR actually lives on (may differ from
+            # _fix_branch for older MRs — we must delete the real one, not a guess).
+            if m.get("source_branch"):
+                owned_branches.add(m["source_branch"])
             try:
                 data = _json.dumps({"state_event": "close"}).encode()
                 req = urllib.request.Request(
@@ -2670,27 +2675,34 @@ def _close_topic_resources(topic):
             notes.append(f"关闭 {closed} 个 OPEN MR")
     except Exception:
         pass
-    # 2) delete the fix branch.
-    # 归属(A 方案放宽): 除了"关了 MR / owned_iids 台账", 也允许删除"孤儿 fix 分支"——
-    #   即该分支存在且 HEAD 是 bot 提交([codereview-agent])。这解决"确认失败后 push 出去的
-    #   分支没有 MR、close 时因 closed==0 且 fix_iids=[] 而不删"的泄漏。配合 #22 per-topic
-    #   hash 唯一分支名, 只删本话题的分支, 不会误删他人。
-    should_delete = (closed > 0) or bool(owned_iids) or _branch_is_bot_created(proj, new_branch, tok)
-    if should_delete:
-        try:
-            req = urllib.request.Request(
-                f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
-                f"{urllib.parse.quote(new_branch, safe='')}",
-                method="DELETE", headers={"PRIVATE-TOKEN": tok})
-            urllib.request.urlopen(req, timeout=20)
-            notes.append(f"删除分支 {new_branch}")
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                pass  # branch already gone; fine
-            else:
-                notes.append(f"删分支失败 HTTP {e.code}")
-        except Exception:
-            notes.append("删分支失败(网络)")
+    # 2) delete the fix branch(es).
+    # Candidates: (a) the computed fix branch (per-topic) if it's bot-created or owned,
+    #    and (b) the ACTUAL source branches of the MRs we own/closed — for older MRs the
+    #    real branch may differ from _fix_branch, so we must delete THAT one, not a guess.
+    candidates = set(owned_branches)
+    if new_branch:
+        candidates.add(new_branch)
+    deleted = 0
+    for br in candidates:
+        if not br:
+            continue
+        # Only delete if we own it (bot-created branch OR an MR we closed lives on it).
+        if br in owned_branches or _branch_is_bot_created(proj, br, tok):
+            try:
+                req = urllib.request.Request(
+                    f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
+                    f"{urllib.parse.quote(br, safe='')}",
+                    method="DELETE", headers={"PRIVATE-TOKEN": tok})
+                urllib.request.urlopen(req, timeout=20)
+                notes.append(f"删除分支 {br}")
+                deleted += 1
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    pass  # already gone
+                else:
+                    notes.append(f"删分支失败 HTTP {e.code} ({br})")
+            except Exception:
+                notes.append(f"删分支失败(网络) ({br})")
     return "（已释放：{}）".format("、".join(notes)) if notes else ""
 
 
