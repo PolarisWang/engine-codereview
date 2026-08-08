@@ -85,7 +85,7 @@ for k in ps.list_topic_keys(state_path):
 
 print(f"[cleanup] retained={ret}d dry={'yes' if dry else 'no'} archived={rec['archived']} result_files_released={rec['results']}")
 PY
-docker exec "$CONTAINER" bash -c "cd $SCRIPTS_DIR && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$SCRIPTS_DIR python3 /tmp/cleanup_ps.py $RETENTION $WS $([ $DRY = 1 ] && echo 0 || echo 1) $STATE_CONT"
+docker exec "$CONTAINER" bash -c "cd $SCRIPTS_DIR && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$SCRIPTS_DIR python3 /tmp/cleanup_ps.py $RETENTION $WS $DRY $STATE_CONT"
 RC=$?
 if [ "$RC" != "0" ]; then
   echo "[cleanup] ERR: archival pass failed rc=$RC" >&2
@@ -135,7 +135,7 @@ for entry in os.listdir(ws):
         except Exception:
             age = 0
         if not referenced and age > ret * 86400:
-            if not sys.argv[4] == "0":
+            if not sys.argv[4] == "1":
                 shutil.rmtree(p, ignore_errors=True)
             rec["checkout_released"] += 1
 
@@ -145,13 +145,13 @@ if os.path.isdir(cache_dir):
         if not fn.endswith(".json"):
             continue
         if not any(kt in fn for kt in keep_topics):
-            if not sys.argv[4] == "0":
+            if not sys.argv[4] == "1":
                 try: os.remove(os.path.join(cache_dir, fn))
                 except OSError: pass
             rec["cache_released"] += 1
 
-print(f"[cleanup] checkout_released={rec['checkout_released']} review_cache_released={rec['cache_released']} dry={'yes' if sys.argv[4]=='0' else 'no'}")
+print(f"[cleanup] checkout_released={rec['checkout_released']} review_cache_released={rec['cache_released']} dry={'yes' if sys.argv[4]=='1' else 'no'}")
 PY
-docker exec "$CONTAINER" bash -c "cd $SCRIPTS_DIR && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$SCRIPTS_DIR python3 /tmp/cleanup_cache.py $RETENTION $WS $STATE_CONT $([ $DRY = 1 ] && echo 0 || echo 1)"
+docker exec "$CONTAINER" bash -c "cd $SCRIPTS_DIR && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$SCRIPTS_DIR python3 /tmp/cleanup_cache.py $RETENTION $WS $STATE_CONT $DRY"
 
 echo "==== cleanup done ===="
