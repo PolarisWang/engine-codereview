@@ -1,0 +1,16 @@
+# monitor/grafana/provisioning/alerting/contactpoints.yml
+# Alerts funnel to the Feishu group via the scrum webhook. The webhook URL is
+# injected as $(FEISHU_WEBHOOK_URL) (set in compose env / .env, never committed).
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: feishu-group
+    receivers:
+      - uid: cr-feishu-webhook
+        type: webhook
+        settings:
+          url: ${FEISHU_WEBHOOK_URL}
+          httpMethod: POST
+          # Feishu custom-bot webhook accepts the message as {"msg_type":"text","content":{"text":...}}
+          # We send the Alertmanager/Grafana payload; wrap if needed. Basic text works.
+        disableResolveMessage: false

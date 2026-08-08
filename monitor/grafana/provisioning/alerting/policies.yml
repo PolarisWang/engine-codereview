@@ -1,0 +1,10 @@
+# monitor/grafana/provisioning/alerting/policies.yml
+# Route all alerts to the feishu-group contact point.
+apiVersion: 1
+policies:
+  - orgId: 1
+    receiver: feishu-group
+    group_by: ['grafana_folder', 'alertname']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h

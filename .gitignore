@@ -41,3 +41,10 @@ review-workspace/
 /tmp/feishu_*
 /tmp/codereview*
 .deps-pytest/
+
+# Monitoring runtime data (not part of the repo)
+monitor/victoria/data/
+monitor/grafana/data/
+monitor/node-exporter/textfile/*.prom
+monitor/node-exporter/textfile/*.err.log
+monitor/grafana/data/
