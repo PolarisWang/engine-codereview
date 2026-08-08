@@ -1628,7 +1628,9 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             _proc_reply(key, topic, f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}", render, state_file, app_id, app_secret)
             return 0
     # Auto-create / detect the fix-branch MR and report its real url.
-    mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+    # 加固: 传实际 push 的分支(branch), 与 push 严格一致, 杜绝分支来源不一致。
+    _assert_branch_consistent(branch, _fix_branch(topic), key)
+    mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True, branch=branch)
     if mriid:
         # Record ownership (R2): we created/attributed this fix MR; close-time will
         # match by iid, never by bare branch name, so a same-named MR owned by
@@ -2311,7 +2313,9 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                 pipeline_state.clear_pending(state_file, key)
                 _proc_reply(key, topic, f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}", render, state_file, app_id, app_secret)
                 return False, f"agent_edit_confirm: push failed"
-        _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+        # 加固: 传实际 push 的分支(branch)建 MR, 与 push 严格一致。
+        _assert_branch_consistent(branch, _fix_branch(topic), key)
+        _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True, branch=branch)
         if _mriid:
             pipeline_state.record_fix_mr(state_file, key, _mriid)  # R2 ownership ledger
         for f in files:
@@ -2608,7 +2612,8 @@ def _close_topic_resources(topic):
     tok = _env("GITLAB_TOKEN")
     if not pp or not tok:
         return ""
-    new_branch = _new_branch_name(topic)
+    # 加固3: 关闭删除用的也是同一个修复分支(staged 优先), 与 push/建 MR 一致。
+    new_branch = _fix_branch(topic)
     jira = topic.get("jira_key") or ""
     proj = urllib.parse.quote(pp, safe="")
     owned_iids = set(int(x) for x in (topic.get("fix_mr_iids") or []) if str(x).isdigit())
@@ -2716,6 +2721,33 @@ def _new_branch_name(topic):
     return f"{src}-fix{suffix}" if src else f"fix{suffix}"
 
 
+def _fix_branch(topic, prefer_staged=True):
+    """统一"本次修复分支"入口 —— 单一来源，杜绝各环节分支不一致。
+
+    优先级:
+      1. topic.pending_patch.branch (改码 staged 时持久化的真实分支)
+      2. _new_branch_name(topic)   (推导兜底)
+    所有需要"修复分支"的地方(push/建MR/关闭删除/MR单)都走这里，保证 push、建 MR、
+    关闭删除用完全相同的分支，不会被命名规则变化或重新推导搞错。
+    """
+    if prefer_staged:
+        staged = (topic.get("pending_patch") or {}).get("branch") or ""
+        if staged:
+            return staged
+    return _new_branch_name(topic)
+
+
+def _assert_branch_consistent(pushed_branch, mr_branch, key):
+    """加固4: 防静默的心智保障——push 的分支必须与建 MR 的分支完全一致。
+    若不一致，打印醒目错误日志(理论上被加固1/2/3排除，但这是最后一道网)。
+    不 raise(避免中断确认），但确保运维看得到并排查。"""
+    if pushed_branch and mr_branch and pushed_branch != mr_branch:
+        print(f"[CRITICAL] branch mismatch: pushed={pushed_branch!r} vs mr={mr_branch!r} "
+              f"topic={key} — MR 可能建错分支!", file=sys.stderr)
+        return True
+    return False
+
+
 def _project_path(topic):
     mr_url = topic.get("mr_url") or ""
     if "merge_requests" in mr_url:
@@ -2725,8 +2757,14 @@ def _project_path(topic):
     return ""
 
 
-def _create_or_get_mr(topic, all_findings, create_if_missing=False):
+def _create_or_get_mr(topic, all_findings, create_if_missing=False, branch=None):
     """检测/创建 fix 分支的修复 MR（根治后的幂等实现）。
+
+    `branch`: 可显式指定本次要检测/创建 MR 的修复分支。优先顺序：
+        branch(显式，confirm 传入实际 push 的分支) > topic.pending_patch.branch(改码 staged 的分支)
+        > _new_branch_name(topic)(推导兜底)。
+    这样确认链路(push)与建 MR 永远用同一分支，避免新旧命名规则不一致导致
+    compare 空 / MR 建不出。
 
     修复的根因问题：
       - detect 用 state=all&per_page=50 会被项目大量 closed MR 淹没/截断，漏掉真正的
@@ -2741,7 +2779,9 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
     tok = _env("GITLAB_TOKEN")
     if not pp or not tok:
         return None, None, "", "no project path or token"
-    new_branch = _new_branch_name(topic)
+    # 分支单源: 显式 > staged > 推导
+    staged = (topic.get("pending_patch") or {}).get("branch") or ""
+    new_branch = branch or staged or _new_branch_name(topic)
     proj = urllib.parse.quote(pp, safe="")
 
     def _get(url):
@@ -2826,7 +2866,8 @@ def _generate_mr_card(topic, all_findings, workspace, key, state_file=""):
     评审 MR（原始）与本次修复 MR（新分支）。检测/创建新 MR 后填真实新 URL。"""
     jira = topic.get("jira_key") or key
     branch = topic.get("review_branch") or ""
-    new_branch = _new_branch_name(topic)
+    # 加固3: MR单也读同一修复分支入口(staged 优先), 与 push/建 MR/关闭一致。
+    new_branch = _fix_branch(topic)
     # MR单 is READ-ONLY: detect/reuse an existing fix-branch MR, but never CREATE one
     # here (only the 改码确认 path may create). This keeps a stray `MR单` from
     # creating an unintended MR.

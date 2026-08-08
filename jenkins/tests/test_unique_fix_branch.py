@@ -38,3 +38,34 @@ def test_branch_has_per_topic_suffix():
 def test_missing_message_id_falls_back():
     t = _topic("feature/X", "EV-1", "")
     assert _new_branch_name(t) == "feature/X-fix-EV-1"
+
+
+# --- 加固: _fix_branch 单源(staged 优先) + 一致性 ---
+
+def _fxtopic(branch_staged=None, msg="om_ZZ", review="feature/R-1", jira="J-1"):
+    t = {"review_branch": review, "jira_key": jira, "message_id": msg}
+    if branch_staged:
+        t["pending_patch"] = {"branch": branch_staged}
+    return t
+
+
+def test_fix_branch_uses_staged_when_present():
+    from orchestrate import _fix_branch
+    t = _fxtopic(branch_staged="staged/fix-abc")
+    assert _fix_branch(t) == "staged/fix-abc"
+
+
+def test_fix_branch_falls_back_to_new_branch_without_staged():
+    from orchestrate import _fix_branch
+    t = _fxtopic(branch_staged=None)
+    assert _fix_branch(t) == _new_branch_name(t)
+
+
+def test_assert_branch_consistent_ok_when_equal():
+    from orchestrate import _assert_branch_consistent
+    assert _assert_branch_consistent("a/b", "a/b", "k") is False
+
+
+def test_assert_branch_consistent_flags_mismatch():
+    from orchestrate import _assert_branch_consistent
+    assert _assert_branch_consistent("a/b", "c/d", "k") is True
