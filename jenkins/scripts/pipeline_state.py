@@ -470,6 +470,12 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         "closed_by": "",            # actor or "auto"
         "closed_at": "",            # ISO
         "closed_reason": "",        # human/auto note
+        # Ownership ledger for bot-created fix-branch MRs (R2): the *iid*s this bot
+        # actually created for this topic's fix branch. _close_topic_resources /
+        # _create_or_get_mr match against these (authoritative), not just the
+        # concatenated branch name, so a same-named MR owned by someone else is
+        # never closed/its branch never deleted.
+        "fix_mr_iids": [],
     }
 
 
@@ -897,6 +903,22 @@ def topic_lock_context(lock_dir, key):
 
 def DEFAULT_LOCK_DIR():
     return "/var/lib/report-server/daily/cr-locks"
+
+
+def record_fix_mr(path, key, mr_iid):
+    """Record that this bot created (or definitively attributed) a fix-branch MR
+    with the given GitLab iid for this topic (R2). Used as the authoritative
+    ownership check when closing fix MRS / deleting the fix branch, so we never
+    touch a same-named MR that belongs to someone else. Idempotent."""
+    topic = _load_topic(path, key)
+    if topic is None:
+        return None
+    iids = topic.setdefault("fix_mr_iids", [])
+    if isinstance(iids, list) and mr_iid not in iids:
+        iids.append(mr_iid)
+    topic["updated_at"] = _now_iso()
+    _save_topic(path, key, topic)
+    return topic
 
 
 def record_applied_patch(path, key, patch):
