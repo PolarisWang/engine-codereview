@@ -41,6 +41,11 @@ import pipeline_state
 import feishu_notifier
 from pipeline_state import log_line
 
+# Central runtime configuration (lifecycle / concurrency / LLM / workspace).
+from config import (IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS,
+                    DEFAULT_WORKSPACE, CHECKOUT_RESET_ON_REUSE, EDIT_MODEL,
+                    AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN)
+
 # Scripts dir (this file's directory)
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", ".."))
@@ -49,7 +54,8 @@ REPO_ROOT = os.path.abspath(os.path.join(SCRIPTS_DIR, "..", ".."))
 # only see a CONSISTENT workspace so a topic's checkout + result files are shared.
 # The persistent volume /var/lib/report-server/daily is bind-mounted into the agent
 # container at the same path, so it survives restarts and is reachable from Jenkins.
-_DEFAULT_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
+# Value centralized in config.py (DEFAULT_WORKSPACE); this is a compat alias.
+_DEFAULT_WORKSPACE = DEFAULT_WORKSPACE
 
 # ── Load credentials from the persistent env (cr-env) into the process ─────────
 # The interaction/executor process may carry an EMPTY GITLAB_TOKEN (key present but
@@ -173,6 +179,30 @@ def run(args):
         _log('CLOSED', 'SKIP', key, existing.get("jira_key", ""), '', '',
              f'closed (by {existing.get("closed_by","?")}): skip re-review')
         return 0
+
+    # Concurrency admission: cap how many independent review subprocesses run at
+    # once. Acquiring a slot is process-scoped (flock auto-released on exit); if
+    # the cap is reached, keep the topic pending for the next scan tick, post a
+    # queue notice, and do not start another review now.
+    was_queued = (existing or {}).get("queued") if existing is not None else False
+    qcard = (existing or {}).get("render_msg_id") if existing is not None else ""
+    if not _acquire_review_slot():
+        if qcard and app_id and app_secret:
+            _update_card_text(app_id, app_secret, qcard,
+                              "🤖 **正在排队...**\n" + _queue_notice(app_id, app_secret, qcard))
+        queue_pos = _queue_position(state_file, key)
+        pipeline_state.set_topic_fields(state_file, key, queued=True,
+                                        queued_at=_now_iso(), queued_position=queue_pos)
+        _log('SCANNED', 'QUEUED', key, (existing or {}).get("jira_key", ""), '', '',
+             f'concurrency cap {MAX_CONCURRENT_REVIEWS} reached; deferred')
+        return 0
+    if was_queued:
+        # A previously queued topic that now has a slot: clear the queue marker so a
+        # later review completion does not try to release it again, and tell the user
+        # their turn came up.
+        pipeline_state.set_topic_fields(state_file, key, queued=False, queued_position=None)
+        if qcard and app_id and app_secret:
+            _update_card_text(app_id, app_secret, qcard, "🤖 " + _started_notice())
 
     if mode == "manual":
         # Manual mode: key is the Jira URL.
@@ -518,8 +548,7 @@ AGENT_TOOLS = [
     },
 ]
 
-AGENT_MAX_ROUNDS = 6           # max tool-call rounds per user message
-AGENT_MAX_TOKEN = 1000         # max output tokens per agent LLM turn
+# Runtime limits centralized in config.py (AGENT_MAX_ROUNDS / AGENT_MAX_TOKEN).
 
 
 def _agent_llm(messages, system, api_key, base_url, model,
@@ -604,9 +633,10 @@ def interact(args):
                       render_id, [], state_file, app_id, app_secret)
             return 0
     else:
-        # Lazy auto-silence: DONE/FAILED with no new reply for N days -> auto close.
-        N_DAYS = 3
-        if topic.get("phase") in ("DONE", "FAILED"):
+        # Lazy auto-close: any non-fresh topic with no new reply for IDLE_CLOSE_DAYS.
+        # Runs on every scan of an idle topic so resources (fix-branch MR + branch +
+        # checkout via phase=CLOSED) are released without needing a manual `4 关闭`.
+        if topic.get("phase") not in ("DONE", "FAILED"):
             try:
                 import time as _time
                 upd = topic.get("updated_at") or ""
@@ -614,12 +644,19 @@ def interact(args):
                     ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
                     idle_days = (_time.time() - ts) / 86400.0
                 else:
-                    idle_days = N_DAYS + 1
+                    idle_days = IDLE_CLOSE_DAYS + 1
             except Exception:
                 idle_days = 0
-            if idle_days > N_DAYS:
+            if idle_days > IDLE_CLOSE_DAYS:
+                # Release fix-branch MRs + delete the fix branch (best-effort).
+                if AUTO_CLOSE_MR:
+                    try:
+                        _close_topic_resources(topic)
+                    except Exception as _e:
+                        print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
                 pipeline_state.close_topic(state_file, key, closed_by="auto",
-                                           reason="3天无新回复自动静默")
+                                           reason=f"{IDLE_CLOSE_DAYS}天无新回复自动关闭")
+                pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
                 _finalize(key, "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
                           render_id, [], state_file, app_id, app_secret)
                 return 0
@@ -1124,7 +1161,7 @@ def _auto_edit_preview(topic, all_findings, api_key, base_url, model, workspace=
     return file, d.stdout, None
 
 
-EDIT_MODEL = "deepseek-v4-flash[1m]"  # used via local claude -p CLI (reaches [1m] models that 503 on raw HTTP)
+# local `claude -p` CLI 用的模型。值集中配置在 config.py (EDIT_MODEL)。
 
 
 def _find_claude():
@@ -2049,6 +2086,90 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
     return False, f"unknown pending action: {action}"
 
 
+# ── Concurrency admission (flock slot lease) ─────────────────────────────────
+# Each topic's review runs as its OWN independent subprocess (separate clone,
+# separate result files) — the 6 "slots" below simply bound how many of those
+# review subprocesses may run at once. A slot is held by an exclusive flock on
+# one of MAX_CONCURRENT_REVIEWS lockfiles; the flock is released automatically
+# when the process exits (normal or crash), so we never leak a slot and never
+# need a finally to free it. Exceeding the cap keeps the topic pending and posts
+# a queue notice; the next scan tick retries and sends a "started" notice.
+_held_slot = {"file": None, "idx": -1}
+_now_iso = pipeline_state._now_iso  # local alias for timestamps
+
+
+def _queue_position(state_file, key):
+    """1-based position of this queued topic among all topics currently queued
+    (those with queued=True and not yet running). Returns an int; falls back to
+    a best-effort count if the state can't be read."""
+    try:
+        state = pipeline_state.load_state(state_file)
+        queued = [(k, t) for k, t in (state.get("topics") or {}).items()
+                  if t.get("queued") and not t.get("phase") in ("CLOSED", "DONE", "FAILED")]
+        queued.sort(key=lambda kv: kv[1].get("queued_at") or "")
+        for i, (k, _t) in enumerate(queued):
+            if k == key:
+                return i + 1
+        return len(queued) or 1
+    except Exception:
+        return 1
+
+
+def _acquire_review_slot():
+    """Try to lease one of MAX_CONCURRENT_REVIEWS slots. Returns True on success
+    (lease is process-scoped and auto-released on exit), False when all busy."""
+    global _held_slot
+    import fcntl
+    lock_dir = pipeline_state.DEFAULT_LOCK_DIR()
+    try:
+        os.makedirs(lock_dir, exist_ok=True)
+    except Exception:
+        pass
+    for i in range(MAX_CONCURRENT_REVIEWS):
+        try:
+            f = open(os.path.join(lock_dir, f"review_slot_{i}"), "a+")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                f.close()
+            except Exception:
+                pass
+            continue
+        _held_slot = {"file": f, "idx": i}
+        return True
+    return False
+
+
+def _release_review_slot():
+    """Explicitly release the slot (used by in-process drains; also safe to skip
+    because flock auto-frees on process exit)."""
+    global _held_slot
+    import fcntl
+    f = _held_slot.get("file")
+    if f is not None:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+    _held_slot = {"file": None, "idx": -1}
+
+
+def _queue_notice(app_id, app_secret, reply_msg_id):
+    """Return the Feishu 'queued' notice text for a topic that hit the concurrency cap."""
+    from config import MAX_CONCURRENT_REVIEWS as _M
+    return (f"⚠️ 并发 Review 已达上限（{_M} 个并行任务），本话题已进入排队。\n"
+            f"当前繁忙，稍后会按顺序自动开始审查，请勿重复触发。")
+
+
+def _started_notice():
+    return "↗️ 轮到本话题了，开始自动 Review..."
+
+
+
 def _run_review_subprocess(key, jira_url, workspace, state_file):
     """Run the full review pipeline for a topic in a subprocess (reviewer has the
     creds needed). Returns rc."""
@@ -2202,21 +2323,26 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
 
 
 def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
-    """指令 `4/关闭`: owner/admin 关闭话题。关闭时会一并关闭该话题创建的 OPEN MR。"""
+    """指令 `4/关闭`: owner/admin 关闭话题。关闭时会一并关闭该话题创建的 OPEN MR
+    （fix-branch）并删除 fix 分支，release 资源；原 review MR 不受影响。"""
     ok, why = _approve(key, topic, actor, "close_topic")
     if not ok:
         _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
         return
-    closed = _close_topic_created_mrs(topic)
+    closed = _close_topic_resources(topic)
     pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
+    pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
     note = f"🔒 本话题已关闭。{closed} 不处理。" if closed else "🔒 本话题已关闭，不再处理。"
     _update_card_text(app_id, app_secret, render_id, note)
 
 
-def _close_topic_created_mrs(topic):
-    """Find the topic's fix-branch MRs (source_branch == {src}-fix-{task}) that are still
-    OPEN and close them. Returns a human note ('' if none). Only closes MRs created for
-    THIS topic's fix branch; leaves the original review MR and unrelated MRs untouched."""
+def _close_topic_resources(topic):
+    """Release all remote resources owned by THIS topic's fix branch:
+      1) close every OPEN fix-branch MR (source_branch == {src}-fix-{task}), and
+      2) delete the fix branch itself (if it still exists).
+    Returns a human note ('' if nothing done). Only touches MRs created for THIS
+    topic's fix branch; leaves the original review MR (source == {src}) and any
+    unrelated MR/branch untouched."""
     import urllib.request, urllib.error, urllib.parse, json as _json
     pp = _project_path(topic)
     tok = _env("GITLAB_TOKEN")
@@ -2224,26 +2350,45 @@ def _close_topic_created_mrs(topic):
         return ""
     new_branch = _new_branch_name(topic)
     proj = urllib.parse.quote(pp, safe="")
+    notes = []
     try:
+        # 1) close this fix branch's OPEN MRs
         r = urllib.request.Request(
             f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests?state=opened&per_page=100",
             headers={"PRIVATE-TOKEN": tok})
         mrs = _json.loads(urllib.request.urlopen(r, timeout=20).read())
+        closed = 0
+        for m in mrs:
+            if m.get("source_branch") == new_branch:
+                try:
+                    data = _json.dumps({"state_event": "close"}).encode()
+                    req = urllib.request.Request(
+                        f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests/{m.get('iid')}",
+                        data=data, method="PUT", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
+                    urllib.request.urlopen(req, timeout=20)
+                    closed += 1
+                except Exception:
+                    pass
+        if closed:
+            notes.append(f"关闭 {closed} 个 OPEN MR")
     except Exception:
-        return ""
-    closed = 0
-    for m in mrs:
-        if m.get("source_branch") == new_branch:
-            try:
-                data = _json.dumps({"state_event": "close"}).encode()
-                req = urllib.request.Request(
-                    f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests/{m.get('iid')}",
-                    data=data, method="PUT", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=20)
-                closed += 1
-            except Exception:
-                pass
-    return f"（已关闭本轮创建的 {closed} 个 OPEN MR）" if closed else ""
+        pass
+    # 2) delete the fix branch (delete_source_branch is off by default on close).
+    try:
+        req = urllib.request.Request(
+            f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
+            f"{urllib.parse.quote(new_branch, safe='')}",
+            method="DELETE", headers={"PRIVATE-TOKEN": tok})
+        urllib.request.urlopen(req, timeout=20)
+        notes.append(f"删除分支 {new_branch}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            pass  # branch already gone; fine
+        else:
+            notes.append(f"删分支失败 HTTP {e.code}")
+    except Exception:
+        notes.append("删分支失败(网络)")
+    return "（已释放：{}）".format("、".join(notes)) if notes else ""
 
 
 def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
