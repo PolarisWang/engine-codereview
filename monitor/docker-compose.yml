@@ -28,7 +28,7 @@ services:
       - ./victoria/data:/victoria-data
       - ./victoria/promscrape.yml:/promscrape.yml
     ports:
-      - "127.0.0.1:8428:8428"          # 仅本机: 数据源接入, 不对外
+      - "0.0.0.0:8428:8428"          # 内网可访问(VictoriaMetrics API/查询)
     networks: [cr-mon]
 
   node-exporter:
@@ -59,10 +59,9 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=abcd@1234
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_SERVER_ROOT_URL=http://localhost:9300
+      - GF_SERVER_ROOT_URL=http://10.10.1.173:9300
     ports:
-      - "127.0.0.1:9300:9300"          # 仅本机/内网访问; 可改为 0.0.0.0:9300 供任何机器
-      # 若需"任何机器可访问", 把上行改成 "9300:9300" (不经反代) 并注意安全
+      - "0.0.0.0:9300:9300"          # 内网可访问(dashboard 登录页); 改为 127.0.0.1 则仅本机
     volumes:
       - ./grafana/data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
