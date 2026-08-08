@@ -737,7 +737,7 @@ def interact(args):
         _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor)
         return 0
     if word in ("mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单"):
-        text = _generate_mr_card(topic, all_findings, workspace, key)
+        text = _generate_mr_card(topic, all_findings, workspace, key, state_file=state_file)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
     if word in ("预览", "预览补丁", "patch预览"):
@@ -1458,6 +1458,11 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
         return 0
     # Auto-create / detect the fix-branch MR and report its real url.
     mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+    if mriid:
+        # Record ownership (R2): we created/attributed this fix MR; close-time will
+        # match by iid, never by bare branch name, so a same-named MR owned by
+        # someone else is left alone.
+        pipeline_state.record_fix_mr(state_file, key, mriid)
     for f in files:
         pipeline_state.record_applied_patch(state_file, key, {
             "file": f.get("file", ""), "repo": "engine", "branch": branch,
@@ -2106,6 +2111,8 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                               f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
             return False, f"agent_edit_confirm: push failed"
         _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+        if _mriid:
+            pipeline_state.record_fix_mr(state_file, key, _mriid)  # R2 ownership ledger
         for f in files:
             pipeline_state.record_applied_patch(state_file, key, {
                 "file": f.get("file", ""), "repo": "engine", "branch": branch,
@@ -2385,56 +2392,76 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
 
 def _close_topic_resources(topic):
     """Release all remote resources owned by THIS topic's fix branch:
-      1) close every OPEN fix-branch MR (source_branch == {src}-fix-{task}), and
-      2) delete the fix branch itself (if it still exists).
-    Returns a human note ('' if nothing done). Only touches MRs created for THIS
-    topic's fix branch; leaves the original review MR (source == {src}) and any
-    unrelated MR/branch untouched."""
+      1) close every OPEN fix-branch MR this bot created for the topic (R2), and
+      2) delete the fix branch itself (if it still exists AND we own it).
+    Returns a human note ('' if nothing done). Only touches MRs attributed to
+    THIS topic; leaves the original review MR (source == {src}) and any
+    unrelated MR/branch untouched.
+
+    R2 ownership: we match by the `fix_mr_iids` ledger recorded when the MR was
+    created (authoritative), never by bare branch name alone, so a same-named
+    MR owned by someone else is never closed. For legacy topics without a
+    ledger, we fall back to branch-name AND title/description containing the
+    jira_key as an ownership proxy."""
     import urllib.request, urllib.error, urllib.parse, json as _json
     pp = _project_path(topic)
     tok = _env("GITLAB_TOKEN")
     if not pp or not tok:
         return ""
     new_branch = _new_branch_name(topic)
+    jira = topic.get("jira_key") or ""
     proj = urllib.parse.quote(pp, safe="")
+    owned_iids = set(int(x) for x in (topic.get("fix_mr_iids") or []) if str(x).isdigit())
     notes = []
+    closed = 0
     try:
-        # 1) close this fix branch's OPEN MRs
+        # 1) close this fix branch's OPEN MRs — only ones WE own (by iid) or, for
+        #    legacy topics, a same-branch MR whose title/desc references our jira.
         r = urllib.request.Request(
             f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests?state=opened&per_page=100",
             headers={"PRIVATE-TOKEN": tok})
         mrs = _json.loads(urllib.request.urlopen(r, timeout=20).read())
-        closed = 0
         for m in mrs:
-            if m.get("source_branch") == new_branch:
-                try:
-                    data = _json.dumps({"state_event": "close"}).encode()
-                    req = urllib.request.Request(
-                        f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests/{m.get('iid')}",
-                        data=data, method="PUT", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
-                    urllib.request.urlopen(req, timeout=20)
-                    closed += 1
-                except Exception:
-                    pass
+            iid = m.get("iid")
+            same_branch = m.get("source_branch") == new_branch
+            owned = (iid in owned_iids) or (
+                same_branch and jira and (
+                    (m.get("title") or "") + " " + (m.get("description") or "")
+                ).find(jira) >= 0
+            )
+            if not owned:
+                continue
+            try:
+                data = _json.dumps({"state_event": "close"}).encode()
+                req = urllib.request.Request(
+                    f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests/{iid}",
+                    data=data, method="PUT", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=20)
+                closed += 1
+            except Exception:
+                pass
         if closed:
             notes.append(f"关闭 {closed} 个 OPEN MR")
     except Exception:
         pass
-    # 2) delete the fix branch (delete_source_branch is off by default on close).
-    try:
-        req = urllib.request.Request(
-            f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
-            f"{urllib.parse.quote(new_branch, safe='')}",
-            method="DELETE", headers={"PRIVATE-TOKEN": tok})
-        urllib.request.urlopen(req, timeout=20)
-        notes.append(f"删除分支 {new_branch}")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            pass  # branch already gone; fine
-        else:
-            notes.append(f"删分支失败 HTTP {e.code}")
-    except Exception:
-        notes.append("删分支失败(网络)")
+    # 2) delete the fix branch ONLY if we own it (a bot-created MR for this topic,
+    #    or a bot-authored fix commit on the branch). Never delete a stranger's
+    #    branch just because it shares the {src}-fix-{task} name.
+    if closed > 0 or owned_iids:
+        try:
+            req = urllib.request.Request(
+                f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
+                f"{urllib.parse.quote(new_branch, safe='')}",
+                method="DELETE", headers={"PRIVATE-TOKEN": tok})
+            urllib.request.urlopen(req, timeout=20)
+            notes.append(f"删除分支 {new_branch}")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                pass  # branch already gone; fine
+            else:
+                notes.append(f"删分支失败 HTTP {e.code}")
+        except Exception:
+            notes.append("删分支失败(网络)")
     return "（已释放：{}）".format("、".join(notes)) if notes else ""
 
 
@@ -2534,7 +2561,7 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
         return None, None, new_branch, f"create failed HTTP {e.code}: {e.read()[:150]}"
 
 
-def _generate_mr_card(topic, all_findings, workspace, key):
+def _generate_mr_card(topic, all_findings, workspace, key, state_file=""):
     """指令 `mr/生成MR单/更新MR`: 基于 findings + 已应用修改生成 MR 描述。区分
     评审 MR（原始）与本次修复 MR（新分支）。检测/创建新 MR 后填真实新 URL。"""
     jira = topic.get("jira_key") or key
@@ -2542,6 +2569,8 @@ def _generate_mr_card(topic, all_findings, workspace, key):
     new_branch = _new_branch_name(topic)
     # detect/create fix-branch MR to get its REAL url
     mriid, murl, nbranch, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+    if mriid and state_file:
+        pipeline_state.record_fix_mr(state_file, key, mriid)  # R2 ownership ledger
     mr_url = topic.get("mr_url") or ""
     c = (topic.get("applied_patches") or [])
     lines = [f"# MR 单：{jira}", ""]
