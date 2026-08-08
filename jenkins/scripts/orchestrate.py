@@ -1340,7 +1340,10 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     """Multi-file agent edit (closure #4): iterate over critical/high findings (up to 3)
     and fix each in the SAME working tree on the fix branch `{src}-fix-{task}`. Changes are
     cumulative (each later file is edited against the tree mutated by earlier fixes), so the
-    returned diffs form one coherent change set. Returns (ok_diffs, failed, branch, checkout, err)."""
+    returned diffs form one coherent change set. Returns (ok_diffs, failed, branch, checkout,
+    err, checkout_sha). checkout_sha is the fix-branch base commit at edit time (R1): the
+    confirm step checks the tree is still on this SHA before pushing, so a reused/reset
+    checkout can't silently replay stale diffs onto a drifted base."""
     import subprocess as _sp
     ws = workspace or _DEFAULT_WORKSPACE
     src = topic.get("review_branch") or ""
@@ -1348,12 +1351,17 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     branch = f"{src}-fix-{task}" if src else f"fix-{task}"
     checkout, err = _ensure_checkout(topic, ws)
     if err:
-        return [], [], branch, None, err
+        return [], [], branch, None, err, ""
     # _ensure_checkout already reset the reused tree to origin/{src} (fetch + reset + clean),
     # so the fix branch below is carved from the latest remote HEAD, not a stale/foreign one.
     # Work on the new fix branch (create locally if absent) — never touch review_branch.
     _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
             capture_output=True, text=True, timeout=60)
+    # Baseline SHA: the commit this edit set will be built on. Confirm re-checks this
+    # before push (R1) so we never commit onto a drifted tree.
+    _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                     capture_output=True, text=True, timeout=30)
+    checkout_sha = (_sha_r.stdout or "").strip()
     crit = [f for f in (all_findings or [])
             if (f.get("severity") or "").lower() in ("critical", "high")]
     show = crit or (all_findings or [])[:3]
@@ -1366,7 +1374,7 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
             ok_diffs.append({"file": _file, "diff": diff})
         else:
             failed.append((file, e or "edit failed"))
-    return ok_diffs, failed, branch, checkout, None
+    return ok_diffs, failed, branch, checkout, None, checkout_sha
 
 
 def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
@@ -1434,6 +1442,27 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             capture_output=True, text=True, timeout=30, env=_git_env)
     _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
             capture_output=True, text=True, timeout=60, env=_git_env)
+    # R1 guard: refuse to push a stale edit set. We recorded the base commit at
+    # edit time (checkout_sha); if the reused/shared checkout was reset by another
+    # tick (re_review / another topic / cleanup) since, HEAD no longer equals that
+    # base, so replaying the stored diffs could apply them onto a drifted base.
+    # A missing baseline (legacy pending) is also refused (fail-safe).
+    expected_sha = (pending or {}).get("checkout_sha") or ""
+    if expected_sha:
+        _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                         capture_output=True, text=True, timeout=30, env=_git_env)
+        cur = (_sha_r.stdout or "").strip()
+        if not cur or cur != expected_sha:
+            pipeline_state.set_pending_patch(state_file, key, None)
+            _update_card_text(app_id, app_secret, render,
+                              "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期改码提交到错误基线，已取消本次提交。请重新回复 `改码`。")
+            return 0
+    else:
+        # Legacy staged edit without a recorded baseline: safest to refuse.
+        pipeline_state.set_pending_patch(state_file, key, None)
+        _update_card_text(app_id, app_secret, render,
+                          "⛔ 缺少改码基线记录（旧版本暂存的改码），已取消。请重新回复 `改码`。")
+        return 0
     _sp.run(["git", "-C", checkout, "add", "-A"],
             capture_output=True, text=True, timeout=60, env=_git_env)
     _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
@@ -2014,7 +2043,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
         base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
         try:
-            ok_diffs, failed, branch, _co, err = _agent_edit_all(
+            ok_diffs, failed, branch, _co, err, checkout_sha = _agent_edit_all(
                 topic, all_findings, api_key, base_url, workspace)
         except Exception as e:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
@@ -2037,6 +2066,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             "file": "all", "repo": "engine", "target": "agent_edit",
             "state": "staged_agent_edit", "branch": branch,
             "diff": "", "files": ok_diffs, "created_at": "now",
+            "checkout_sha": checkout_sha,   # R1 base-commit guard for confirm
         })
         pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "ok",
                                        f"staged {len(ok_diffs)} files")
@@ -2086,6 +2116,24 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                  capture_output=True, text=True, timeout=600, env=_git_env)
         _sp2.run(["git", "-C", checkout, "checkout", "-B", branch],
                  capture_output=True, text=True, timeout=60, env=_git_env)
+        # R1 guard: refuse to push a stale edit set (see _cmd_confirm_agent_edit).
+        expected_sha = (pp or {}).get("checkout_sha") or ""
+        if expected_sha:
+            _sha_r = _sp2.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30, env=_git_env)
+            cur = (_sha_r.stdout or "").strip()
+            if not cur or cur != expected_sha:
+                pipeline_state.set_pending_patch(state_file, key, None)
+                pipeline_state.clear_pending(state_file, key)
+                _update_card_text(app_id, app_secret, render,
+                                  "⛔ 工作树已被其他操作重置（基线 SHA 变化），已取消本次提交。请重新回复 `改码`。")
+                return False, "agent_edit_confirm: checkout drifted from baseline"
+        else:
+            pipeline_state.set_pending_patch(state_file, key, None)
+            pipeline_state.clear_pending(state_file, key)
+            _update_card_text(app_id, app_secret, render,
+                              "⛔ 缺少改码基线记录（旧版本暂存），已取消。请重新回复 `改码`。")
+            return False, "agent_edit_confirm: missing baseline SHA"
         _sp2.run(["git", "-C", checkout, "add", "-A"],
                  capture_output=True, text=True, timeout=60, env=_git_env)
         _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
