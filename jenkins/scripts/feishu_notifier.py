@@ -451,9 +451,13 @@ def render_full_findings_text(issue_key, project, review_branch, base_branch, ji
     def _find(res):
         return ((res or {}).get("review") or {}).get("findings") or []
     allf = _find(engine_result) + _find(game_result)
-    # 按 repo 标注来源(engine/game), 便于区分
-    engg = {(id(f), f): 'engine' for f in _find(engine_result)}
-    gamg = {(id(f), f): 'game' for f in _find(game_result)}
+    # repo 来源: 用 (file, issue 前40) 作为稳定 key, 判定该 finding 属于 engine/game。
+    # (不能用 dict 作 set key —— unhashable)
+    eng_keys = {(f.get("file") or "", (f.get("issue") or "")[:40]) for f in _find(engine_result)}
+    gam_keys = {(f.get("file") or "", (f.get("issue") or "")[:40]) for f in _find(game_result)}
+    def _repo_of(f):
+        k = (f.get("file") or "", (f.get("issue") or "")[:40])
+        return "engine" if k in eng_keys else ("game" if k in gam_keys else "?")
 
     ec = ((engine_result or {}).get("review") or {}).get("severity_counts") or {}
     gc = ((game_result or {}).get("review") or {}).get("severity_counts") or {}
@@ -474,7 +478,7 @@ def render_full_findings_text(issue_key, project, review_branch, base_branch, ji
     for f in allf_sorted:
         key = _sev_l(f)
         grp = "critical" if key == 0 else ("warning" if key == 1 else "suggestion")
-        repo = 'engine' if (id(f), f) in engg else ('game' if (id(f), f) in gamg else '?')
+        repo = _repo_of(f)
         file = f.get("file") or f.get("path") or "?"
         issue = (f.get("issue") or "").strip()
         groups[grp].append(f"{_sev_mark(f.get('severity'))} `{file}` [{repo}]\n  {issue}\n {f.get('suggestion') or ''}\n")
