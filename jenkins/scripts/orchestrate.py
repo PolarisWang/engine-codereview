@@ -501,6 +501,13 @@ def _build_status_text(topic):
 # tool (apply_patch / push_changes) is NOT executed by the Agent — it stages a
 # pending_patch and waits for explicit user confirmation (@ok / @confirm push).
 
+# 方案C (C4-1): agent loop is strictly READ-ONLY Q&A. It ONLY exposes read-only
+# tools — it can never re-run reviews, propose patches (write), or close topics.
+# All write operations (改码/确认/推送/重审/关闭/建MR) go through the FIXED command
+# router (2/4/改码/确认/MR单...), which calls the _cmd_* / _create_or_get_mr
+# functions directly — those do NOT depend on the agent loop choosing a tool. This
+# removes the "agent claims it will push/close" hallucination at the root: the LLM
+# has no write tool and no capability to act.
 AGENT_TOOLS = [
     {
         "name": "get_status",
@@ -514,40 +521,17 @@ AGENT_TOOLS = [
     },
     {
         "name": "generate_patch_preview",
-        "description": "Generate a unified-diff patch preview that fixes a specific finding. Specify the finding's file (or 'all' for critical findings).",
+        "description": "Generate a text-only patch PREVIEW that fixes a specific finding (read-only; does NOT stage or apply anything). Specify the finding's file (or 'all' for critical findings).",
         "input_schema": {"type": "object",
                          "properties": {"target": {"type": "string",
                                                    "description": "file path to fix, or 'all' for critical findings"}},
                          "required": ["target"]},
     },
     {
-        "name": "re_review",
-        "description": "Re-run the code review for this topic (reuses diff-hash cache if unchanged).",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
         "name": "answer",
-        "description": "Answer the user's question about this review/topic.",
+        "description": "Answer the user's question about this review/topic. Input can be a question or '请补充说明'. This tool does NOT perform any write/push operation.",
         "input_schema": {"type": "object",
                          "properties": {"question": {"type": "string"}}, "required": ["question"]},
-    },
-    {
-        # Side-effect (write) — staged, NOT auto-executed. Requires @ok then @confirm push.
-        "name": "apply_patch",
-        "description": "PROPOSE a patch to fix one or more findings. This writes to the local review checkout ONLY after the user replies @ok, and pushes to the review branch ONLY after @confirm push. Never execute automatically.",
-        "input_schema": {"type": "object",
-                         "properties": {"target": {"type": "string",
-                                                   "description": "file (or 'all') to fix"}},
-                         "required": ["target"]},
-    },
-    {
-        # Side-effect (terminal): closes the topic; only owner/admin may trigger.
-        "name": "close_topic",
-        "description": "Close this topic (terminate its lifecycle). After closing, the bot ignores further replies and the topic is skipped by scans. Only the topic owner OR an admin may take this action.",
-        "input_schema": {"type": "object",
-                         "properties": {"reason": {"type": "string",
-                                                   "description": "optional reason for closing"}},
-                         "required": []},
     },
 ]
 
@@ -582,18 +566,28 @@ def _agent_llm(messages, system, api_key, base_url, model,
 
 
 def _agent_system(topic, api_key):
-    """Build the agent system prompt with topic context (read-only)."""
+    """Build the agent system prompt with topic context (READ-ONLY).
+
+    方案C: the agent loop is strictly a Q&A assistant. It MUST NOT and CANNOT
+    perform any write/push/close/edit operation — it has no such tools and must
+    never claim to. Write operations are only reachable via the fixed command
+    router (改码/确认/关闭/重审/MR单). This prevents the "agent claims it will
+    push/merge but does nothing" hallucination."""
     return (
-        "You are a code-review assistant operating in a Feishu topic. The user's "
-        "message is @-addressed to you. You may call tools to gather info or propose "
-        "fixes. Rules:\n"
-        "- Call side-effect-free tools (get_status/get_findings/generate_patch_preview/"
-        "re_review/answer) freely; use their results to continue.\n"
-        "- To change code, use apply_patch, which only PROPOSES — it is NOT executed "
-        "automatically; the user must confirm with @ok, then @confirm push for remote.\n"
-        "- close_topic closes this topic; ONLY the topic owner or an admin may trigger it, "
-        "and the system will reject it otherwise.\n"
-        "- Reply in Chinese, concise. When done, give a plain-text final answer.\n"
+        "You are a READ-ONLY code-review Q&A assistant in a Feishu topic. The user's "
+        "message is @-addressed to you.\n"
+        "You can ONLY call the read-only tools: get_status / get_findings / "
+        "generate_patch_preview / answer.\n"
+        "HARD RULE: You have NO write, push, merge, close, or edit ability — never "
+        "claim you pushed, merged, applied, closed, or started anything. If the user "
+        "asks you to actually change code / push / create an MR / close the topic, "
+        "DO NOT attempt it and do NOT pretend to. Instead answer the analysis you can, "
+        "then tell the user to use the exact fixed command that can do it:\n"
+        "  - 改码 / @确认提交并建mr : auto-fix the code and push a fix branch + create an MR\n"
+        "  - 关闭 / 4 关闭         : close the topic\n"
+        "  - 2 重审 / MR单 / 指引 : re-review / MR description / precise fix guidance\n"
+        "- Reply in Chinese, concise, grounded in the findings. When done, give a "
+        "plain-text final answer. Never emit a [tool_use] placeholder.\n"
         f"- Topic context: {topic.get('jira_key','')} ({topic.get('project','')}), "
         f"branch {topic.get('review_branch','')} -> {topic.get('base_branch','')}."
     )
@@ -661,6 +655,28 @@ def _strip_mention(text):
         return s[1:].strip()  # drop the '@' before the keyword, keep the rest
     # a genuine mention placeholder (bot id / user id / bot's display name) -> strip
     return s[m2.end():].strip()
+
+
+# 方案C (C4-3): operation-intent words. If a reply that fell through the FIXED
+# command router contains any of these, the user is almost certainly trying to make
+# the bot DO something (push/merge/close/apply) rather than ask a review question.
+# We intercept BEFORE the agent loop so the write-capable intent never reaches the
+# read-only assistant, and we guide the user to the exact fixed command instead.
+# Phrases (not single chars) keep false-positives low (e.g. "逻辑该不该改" won't trigger).
+_OPERATION_WORDS = [
+    "确认", "push", "推送", "提交", "合并", "merge", "关闭", "改码", "自动修复",
+    "重审", "重新审查", "生成mr", "建mr", "更新mr", "应用", "apply", "commit", "建立mr",
+]
+
+
+def _looks_like_operation(text):
+    """True if the (already @-stripped) reply probably requests a write/operation,
+    so we can keep it out of the read-only agent loop."""
+    s = (text or "").lower()
+    for w in _OPERATION_WORDS:
+        if w in s:
+            return True
+    return False
 
 
 def interact(args):
@@ -811,6 +827,20 @@ def interact(args):
         return 0
     if word in ("状态", "/状态", "status"):
         _finalize(key, _build_status_text(topic), render_id, [], state_file, app_id, app_secret)
+        return 0
+
+    # ── 方案C (C4-3): operation-intent interception ────────────────────────
+    # Nothing above matched a fixed command. If the message still looks like the
+    # user is asking us to DO something (push/merge/close/改码/确认...), do NOT send
+    # it to the read-only agent loop (which would hallucinate "I'll push" without
+    # doing it). Guide them to the exact fixed command instead.
+    if _looks_like_operation(_strip_mention(low)):
+        hint = ("🤖 **仅审查答疑**——我不会执行推送/合并/关闭/改码等操作，请用精确命令：\n"
+                "  - `改码` + 之后 `@确认提交并建mr`：自动改码并推送修复分支、创建 MR\n"
+                "  - `关闭` 或 `4`：关闭话题\n"
+                "  - `MR单` / `指引` / `2`：MR 描述 / 修改指引 / 重新审查\n"
+                "  - 若只是想问关于 review 的问题，直接提问即可（我会解答）。")
+        _finalize(key, hint, render_id, [], state_file, app_id, app_secret)
         return 0
 
     # ── Agent loop ──────────────────────────────────────────────────────────
