@@ -52,6 +52,32 @@ def _q(cmd, timeout=15):
         return 1, ""
 
 
+def _read_state():
+    """Return the authoritative pipeline-state dict. The real state lives INSIDE the
+    bot container at /root/.codereview-pipeline-state.json (the container's /root is
+    NOT a host bind — the host /root/.codereview-... is a different/older file). We
+    read it via `docker exec` (deploy host has docker) for correctness; fall back to
+    the local STATE_FILE_HOST only if exec fails or the file differs. Returns {} on
+    total failure so callers don't crash."""
+    import json as _json
+    # Prefer container-authoritative state.
+    rc, out = _q(
+        "docker exec chaos-agent-cr python3 -c "
+        "\"import json,sys;print(json.dumps(json.load(open('/root/.codereview-pipeline-state.json'))))\"",
+        timeout=10)
+    if rc == 0 and out.startswith("{"):
+        try:
+            return _json.loads(out)
+        except Exception:
+            pass
+    # Fallback to local file.
+    try:
+        with open(STATE_FILE_HOST, encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
 def _tonum(v, default=0):
     try:
         return float(v)
@@ -90,7 +116,7 @@ def collect_topic_state():
     _t("cr_pending_actions", "Topics with an unconsumed pending queue action")
     _t("cr_failed_exhausted", "Topics that exhausted auto-retries (need human)")
     try:
-        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        d = _read_state()
         topics = d.get("topics", {})
         # v1 single-file layout: topics is a dict {key: record}
         phases = {}
@@ -226,7 +252,7 @@ def collect_topic_resources(cache):
     _t("cr_topic_result_size_bytes",
        "This topic's review result file size (bytes)", )
     try:
-        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        d = _read_state()
         topics = d.get("topics", {})
         sizes = cache.get("sizes", {})
         for k, t in topics.items():
@@ -276,7 +302,7 @@ def collect_topic_detail():
     _t("cr_topic_age_seconds", "Seconds since topic creation (open-duration)")
     _t("cr_review_duration_seconds", "Review engine duration between started_at and finished_at")
     try:
-        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        d = _read_state()
         now = time.time()
         for k, t in d.get("topics", {}).items():
             topic_id = (k or "")[:44]
@@ -304,7 +330,7 @@ def collect_action_counters():
     happened (cumulative; Grafana can rate()/increase() over time)."""
     _t("cr_actions_total", "Cumulative guarded actions per topic (from approval_log)")
     try:
-        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        d = _read_state()
         for k, t in d.get("topics", {}).items():
             topic_id = (k or "")[:44]
             for e in (t.get("approval_log") or []):
@@ -387,7 +413,7 @@ def collect_review_failed():
     Grafana can rate() to show error trend."""
     _t("cr_review_failed_total", "Cumulative failed review attempts per topic")
     try:
-        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        d = _read_state()
         for k, t in d.get("topics", {}).items():
             topic_id = (k or "")[:44]
             rc = int(t.get("retry_count") or 0)
