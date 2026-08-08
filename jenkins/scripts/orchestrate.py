@@ -971,6 +971,17 @@ def _ensure_checkout(topic, workspace):
     dest = os.path.join(workspace, f"{repo_name}-review")
     tok = _env("GITLAB_TOKEN")
     if os.path.isdir(os.path.join(dest, ".git")):
+        # Reuse the tree but force-align it to the latest remote HEAD and drop any
+        # residual working changes/untracked files left by an earlier topic or a
+        # previous fix attempt. Without this, the reusable checkout silently
+        # carries a stale SHA (and stale haves) — which caused oversized push packs
+        # (HTTP 413) and foreign/corrupt file states to leak across reviews.
+        _sp.run(["git", "-C", dest, "fetch", "--quiet", "origin", src],
+                capture_output=True, text=True, timeout=300)
+        _sp.run(["git", "-C", dest, "reset", "--hard", f"origin/{src}"],
+                capture_output=True, text=True, timeout=60)
+        _sp.run(["git", "-C", dest, "clean", "-fdx"],
+                capture_output=True, text=True, timeout=60)
         return dest, None
     if not tok:
         return None, "no GITLAB_TOKEN for checkout"
@@ -1253,13 +1264,8 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     checkout, err = _ensure_checkout(topic, ws)
     if err:
         return [], [], branch, None, err
-    # Refresh the review branch so the fix branch is based on the latest remote
-    # HEAD (not a stale/foreign HEAD left by an earlier topic sharing this tree).
-    if src:
-        _sp.run(["git", "-C", checkout, "fetch", "origin", src],
-                capture_output=True, text=True, timeout=300)
-        _sp.run(["git", "-C", checkout, "reset", "--hard", f"origin/{src}"],
-                capture_output=True, text=True, timeout=60)
+    # _ensure_checkout already reset the reused tree to origin/{src} (fetch + reset + clean),
+    # so the fix branch below is carved from the latest remote HEAD, not a stale/foreign one.
     # Work on the new fix branch (create locally if absent) — never touch review_branch.
     _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
             capture_output=True, text=True, timeout=60)
@@ -1758,17 +1764,30 @@ def _ensure_shared_checkout(topic, repo, workspace):
     if not url:
         return None, f"no repo_url recorded for '{repo}'"
     checkout, name = _resolve_repo_checkout(workspace, topic, repo)
+    # If present, reuse it but force-align to the latest remote HEAD of the topic's
+    # review branch, and drop any working-tree residue (stale fix patches, foreign
+    # branch switches, leftover build artifacts) from a prior topic sharing this tree.
+    # This is the same "never trust a reused checkout" rule as _ensure_checkout.
+    if os.path.isdir(os.path.join(checkout or "", ".git")):
+        src = topic.get("review_branch") or ""
+        if src:
+            _sp.run(["git", "-C", checkout, "fetch", "--quiet", "origin", src],
+                    capture_output=True, text=True, timeout=300)
+            _sp.run(["git", "-C", checkout, "reset", "--hard", f"origin/{src}"],
+                    capture_output=True, text=True, timeout=60)
+            _sp.run(["git", "-C", checkout, "clean", "-fdx"],
+                    capture_output=True, text=True, timeout=60)
+        return checkout, None
     # If not present, clone it (executor may need credentials via git env).
-    if not os.path.isdir(os.path.join(checkout or "", ".git")):
-        try:
-            rc, out, err = _run_py("code_reviewer.py", [
-                "--repo", url, "--branch", topic.get("review_branch") or "",
-                "--base-branch", topic.get("base_branch") or "", "--dry",
-                "--workspace", workspace, "--output", os.path.join(workspace, f"dry_{repo}.json")])
-            if rc != 0:
-                return None, f"checkout prep failed: {err[:150]}"
-        except Exception as e:
-            return None, f"checkout prep error: {e}"
+    try:
+        rc, out, err = _run_py("code_reviewer.py", [
+            "--repo", url, "--branch", topic.get("review_branch") or "",
+            "--base-branch", topic.get("base_branch") or "", "--dry",
+            "--workspace", workspace, "--output", os.path.join(workspace, f"dry_{repo}.json")])
+        if rc != 0:
+            return None, f"checkout prep failed: {err[:150]}"
+    except Exception as e:
+        return None, f"checkout prep error: {e}"
     return checkout, None
 
 
