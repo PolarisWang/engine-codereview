@@ -2668,9 +2668,25 @@ def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
 
 
 def _new_branch_name(topic):
+    """Per-topic-unique fix branch name (root-cause fix for cross-topic pollution).
+
+    Previously `{src}-fix-{task}` — SAME for every topic sharing the same Jira, so
+    different topics pushed commits to the SAME GitLab fix branch, advancing its
+    HEAD and making R1's checkout_sha drift (confirm would silently reject: "checkout
+    drifted"). Now append a stable short hash of the topic's message_id, so each
+    topic gets an INDEPENDENT fix branch. Deterministic across calls for one topic
+    (same hash), and all callers (_create_or_get_mr / _agent_edit_all / MR单 / close)
+    use this one function so they stay consistent."""
     src = topic.get("review_branch") or ""
     task = topic.get("jira_key") or "task"
-    return f"{src}-fix-{task}" if src else f"fix-{task}"
+    uid = topic.get("message_id") or ""
+    if uid:
+        import hashlib
+        short = hashlib.sha1(uid.encode("utf-8")).hexdigest()[:8]
+    else:
+        short = ""
+    suffix = f"-{task}-{short}" if short else f"-{task}"
+    return f"{src}-fix{suffix}" if src else f"fix{suffix}"
 
 
 def _project_path(topic):
