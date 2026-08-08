@@ -94,6 +94,30 @@
       "targets": [{"expr": "cr_proc_reviewers", "refId": "A"}],
       "fieldConfig": {"defaults": {}},
       "options": {}
+    },
+    {
+      "id": 107,
+      "title": "逐话题资源占用 (本地路径 + 大小)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 10},
+      "datasource": {"type": "prometheus", "uid": ""},
+      "targets": [
+        {"expr": "cr_topic_checkout_size_bytes", "refId": "checkout", "legendFormat": "{{topic}}" },
+        {"expr": "cr_topic_review_size_bytes", "refId": "review", "legendFormat": "{{topic}}" },
+        {"expr": "cr_topic_result_size_bytes", "refId": "result", "legendFormat": "{{topic}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {"filterable": false},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "text"}]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Topic"}, "properties": [{"id": "custom.width", "value": 200}]},
+          {"matcher": {"id": "byName", "options": "Repo"}, "properties": [{"id": "displayName"}]}
+        ]
+      },
+      "options": {"showHeader": true}
     }
   ],
   "schemaVersion": 39

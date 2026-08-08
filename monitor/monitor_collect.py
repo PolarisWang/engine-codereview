@@ -31,7 +31,10 @@ STATE_FILE = os.environ.get("PIPELINE_STATE_FILE", "/root/.codereview-pipeline-s
 WORKSPACE = os.environ.get("CR_WORKSPACE", "/var/lib/report-server/daily/cr-workspace")
 LOCK_DIR = os.environ.get("CR_LOCK_DIR", "/var/lib/report-server/daily/cr-locks")
 OUT_DIR = os.environ.get("TEXTFILE_DIR", "/home/debian/agent/engine-codereview/monitor/node-exporter/textfile")
-STATE_FILE_HOST = "/root/.codereview-pipeline-state.json"
+# The pipeline state file is what collect_topic_state / collect_topic_resources
+# read. Read from env so a test can inject a synthetic state; defaults to the
+# bot's production state file (host bind of the container's daily volume).
+STATE_FILE_HOST = os.environ.get("CR_STATE_FILE", "/root/.codereview-pipeline-state.json")
 
 # The state file is inside the bot's container in production; the collector may
 # run on the host where it is exposed via the bind mount of /var/lib/report-server/
@@ -182,6 +185,64 @@ def collect_workspace_sizes(cache):
         print(f"[monitor] collect_workspace_sizes err: {e}", file=sys.stderr)
 
 
+def _repo_name_from_topic(topic):
+    """Derive the repo basename (== workspace checkout dir name) from a topic's
+    mr_url project path last segment, matching the app's _ensure_checkout naming."""
+    mr = topic.get("mr_url") or ""
+    if "/-/merge_requests/" in mr:
+        # .../<group>/<sub>/<repo>/-/merge_requests/<iid>
+        proj = mr.split("/-/merge_requests/")[0] or ""
+        base = proj.rstrip("/").split("/")[-1]
+        if base:
+            return base
+    # fallback: try to infer from review_branch prefix is unreliable; leave empty.
+    return ""
+
+
+def collect_topic_resources(cache):
+    """Per-OPEN-topic resource detail: for each non-CLOSED topic, emit its repo's
+    shared checkout size + the -review (改码) dir size + its own result-file size.
+    Reuses the cached du sizes so this is cheap; result-file size is computed live
+    (tiny files). This powers the "逐话题资源明细表" Grafana table."""
+    _t("cr_topic_checkout_size_bytes",
+       "Shared checkout dir size (bytes) attributed to an OPEN topic's repo", )
+    _t("cr_topic_review_size_bytes",
+       "改码 -review dir size (bytes) attributed to an OPEN topic's repo", )
+    _t("cr_topic_result_size_bytes",
+       "This topic's review result file size (bytes)", )
+    try:
+        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        topics = d.get("topics", {})
+        sizes = cache.get("sizes", {})
+        for k, t in topics.items():
+            if t.get("phase") == "CLOSED":
+                continue
+            topic_id = (k or "")[:44]
+            repo = _repo_name_from_topic(t)
+            if not repo:
+                continue
+            # shared checkout dir (repo name) + 改码 -review dir
+            checkout_n = repo
+            review_n = repo + "-review"
+            g("cr_topic_checkout_size_bytes", sizes.get(checkout_n, 0),
+              {"topic": topic_id, "repo": repo, "path": checkout_n})
+            g("cr_topic_review_size_bytes", sizes.get(review_n, 0),
+              {"topic": topic_id, "repo": repo, "path": review_n})
+            # this topic's result file(s): result_<key>_<engine|game>.json live under
+            # WORKSPACE root (not per-repo). Size them live (small), cached by key.
+            for repofile in ("engine", "game"):
+                p = os.path.join(WORKSPACE, f"result_{k}_{repofile}.json")
+                try:
+                    sz = os.path.getsize(p) if os.path.isfile(p) else 0
+                except OSError:
+                    sz = 0
+                if sz:  # only emit if the file exists (size>0)
+                    g("cr_topic_result_size_bytes", sz,
+                      {"topic": topic_id, "repo": repo, "kind": repofile})
+    except Exception as e:
+        print(f"[monitor] collect_topic_resources err: {e}", file=sys.stderr)
+
+
 def collect_gitlab_probe():
     """Best-effort GitLab reachability probe (0/1); sets integration health."""
     _t("cr_gitlab_reachable", "GitLab API reachable (1) or not (0)")
@@ -201,6 +262,7 @@ def main():
     collect_processes()
     collect_locks()
     collect_workspace_sizes(cache)
+    collect_topic_resources(cache)   # ② 逐话题资源明细
     collect_gitlab_probe()
     body = "\n".join(M) + "\n"
     # atomic write
