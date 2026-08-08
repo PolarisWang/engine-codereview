@@ -1,0 +1,100 @@
+# monitor/grafana/provisioning/alerting/rules.yml
+# Grafana alerting rules (evaluated against VictoriaMetrics). Fires to the
+# feishu-group contact point via the notification policy in policies.yml.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: codereview-service
+    folder: Codereview-Alerts
+    interval: 1m
+    rules:
+      - uid: cr-alert-bot-down
+        title: CR bot is down
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: P4169E866C3094E38
+            queryType: prometheus
+            relativeTimeRange: {from: 60, to: 0}   # at data-element level
+            model:
+              expr: 'cr_proc_bot'
+              instant: true
+              format: table
+              intervalMs: 1000
+              maxDataPoints: 100
+              refId: A
+              datasource:
+                type: prometheus
+                uid: P4169E866C3094E38
+          - refId: C
+            datasourceUid: __expr__
+            type: threshold
+            relativeTimeRange: {from: 60, to: 0}
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions:
+                - evaluator: {params: [0.5], type: lt}
+                  operator: {type: and}
+                  query: A
+      - uid: cr-alert-watchdog-down
+        title: CR watchdog is down (next bot crash is permanent)
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: P4169E866C3094E38
+            queryType: prometheus
+            relativeTimeRange: {from: 60, to: 0}
+            model:
+              expr: 'cr_proc_watchdog'
+              instant: true
+              format: table
+              intervalMs: 1000
+              maxDataPoints: 100
+              refId: A
+              datasource:
+                type: prometheus
+                uid: P4169E866C3094E38
+          - refId: C
+            datasourceUid: __expr__
+            type: threshold
+            relativeTimeRange: {from: 60, to: 0}
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions:
+                - evaluator: {params: [0.5], type: lt}
+                  operator: {type: and}
+                  query: A
+      - uid: cr-alert-gitlab-down
+        title: GitLab unreachable from monitor
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: P4169E866C3094E38
+            queryType: prometheus
+            relativeTimeRange: {from: 60, to: 0}
+            model:
+              expr: 'cr_gitlab_reachable'
+              instant: true
+              format: table
+              intervalMs: 1000
+              maxDataPoints: 100
+              refId: A
+              datasource:
+                type: prometheus
+                uid: P4169E866C3094E38
+          - refId: C
+            datasourceUid: __expr__
+            type: threshold
+            relativeTimeRange: {from: 60, to: 0}
+            model:
+              type: threshold
+              expression: A
+              refId: C
+              conditions:
+                - evaluator: {params: [0.5], type: lt}
+                  operator: {type: and}
+                  query: A

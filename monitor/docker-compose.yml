@@ -60,6 +60,9 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=abcd@1234
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://10.10.1.173:9300
+      # Feishu alerting webhook (scrum group custom-bot). Passed from the host env;
+      # the provisioning alerting/contactpoints.yml interpolates ${FEISHU_WEBHOOK_URL}.
+      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
     ports:
       - "0.0.0.0:9300:9300"          # 内网可访问(dashboard 登录页); 改为 127.0.0.1 则仅本机
     volumes:
