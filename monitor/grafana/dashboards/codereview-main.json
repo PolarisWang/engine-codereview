@@ -118,6 +118,29 @@
         ]
       },
       "options": {"showHeader": true}
+    },
+    {
+      "id": 108,
+      "title": "趋势: Bot 心跳 / Reviewers 并发 (time)",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 18},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}, "thresholds": {"mode": "absolute", "steps": [{"color": "green"}]}}},
+      "targets": [
+        {"expr": "cr_proc_bot", "refId": "A", "legendFormat": "bot"},
+        {"expr": "cr_proc_reviewers", "refId": "B", "legendFormat": "reviewers"}
+      ]
+    },
+    {
+      "id": 109,
+      "title": "趋势: Open Topics / Pending / Concurrency (time)",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 18},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}, "thresholds": {"mode": "absolute", "steps": [{"color": "green"}]}}},
+      "targets": [
+        {"expr": "cr_open_topics_total", "refId": "A", "legendFormat": "open_topics"},
+        {"expr": "cr_pending_actions", "refId": "B", "legendFormat": "pending"},
+        {"expr": "cr_review_slots_held", "refId": "C", "legendFormat": "slots_held"}
+      ]
     }
   ],
   "schemaVersion": 39
