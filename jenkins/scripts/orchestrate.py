@@ -599,6 +599,28 @@ def _agent_system(topic, api_key):
     )
 
 
+def _should_auto_close(topic, now_ts=None):
+    """R7: whether a topic is due for lazy auto-close (idle > IDLE_CLOSE_DAYS and
+    not already CLOSED). Applies to ANY non-CLOSED phase — including DONE/FAILED —
+    so finished reviews that stay ignored release their fix MR/branch. Extracted
+    from interact() for testability. `now_ts` is injectable (seconds) for tests."""
+    if not topic:
+        return False
+    if topic.get("phase") == "CLOSED":
+        return False
+    try:
+        import time as _time
+        upd = topic.get("updated_at") or ""
+        if upd:
+            ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
+            idle_days = ((now_ts if now_ts is not None else _time.time()) - ts) / 86400.0
+        else:
+            idle_days = IDLE_CLOSE_DAYS + 1
+    except Exception:
+        idle_days = 0
+    return idle_days > IDLE_CLOSE_DAYS
+
+
 def interact(args):
     """
     Multi-turn agent handler for a reply / @bot in a topic thread.
@@ -639,30 +661,21 @@ def interact(args):
         # Lazy auto-close: any non-fresh topic with no new reply for IDLE_CLOSE_DAYS.
         # Runs on every scan of an idle topic so resources (fix-branch MR + branch +
         # checkout via phase=CLOSED) are released without needing a manual `4 关闭`.
-        if topic.get("phase") not in ("DONE", "FAILED"):
-            try:
-                import time as _time
-                upd = topic.get("updated_at") or ""
-                if upd:
-                    ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
-                    idle_days = (_time.time() - ts) / 86400.0
-                else:
-                    idle_days = IDLE_CLOSE_DAYS + 1
-            except Exception:
-                idle_days = 0
-            if idle_days > IDLE_CLOSE_DAYS:
-                # Release fix-branch MRs + delete the fix branch (best-effort).
-                if AUTO_CLOSE_MR:
-                    try:
-                        _close_topic_resources(topic)
-                    except Exception as _e:
-                        print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
-                pipeline_state.close_topic(state_file, key, closed_by="auto",
-                                           reason=f"{IDLE_CLOSE_DAYS}天无新回复自动关闭")
-                pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
-                _finalize(key, "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
-                          render_id, [], state_file, app_id, app_secret)
-                return 0
+        # R7: applies to DONE/FAILED too, not just in-progress topics — a finished
+        # review that stays ignored for IDLE_CLOSE_DAYS releases its fix MR/branch.
+        if _should_auto_close(topic):
+            # Release fix-branch MRs + delete the fix branch (best-effort).
+            if AUTO_CLOSE_MR:
+                try:
+                    _close_topic_resources(topic)
+                except Exception as _e:
+                    print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
+            pipeline_state.close_topic(state_file, key, closed_by="auto",
+                                       reason=f"{IDLE_CLOSE_DAYS}天无新回复自动关闭")
+            pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
+            _finalize(key, "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
+                      render_id, [], state_file, app_id, app_secret)
+            return 0
 
     eng_findings, gam_findings, findings_status = _load_findings(workspace, key)
     all_findings = (eng_findings or []) + (gam_findings or [])
