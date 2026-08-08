@@ -2840,11 +2840,14 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False, branch=None)
     if not create_if_missing:
         return None, None, new_branch, "no MR for fix branch yet"
 
-    # 2) Only create if the fix branch actually has changes vs target — never create an
-    #    empty/meaningless MR. Resolve target robustly.
-    target = topic.get("base_branch") or ""
+    # 2) Only create if the fix branch actually has changes vs the merge target — never
+    #    create an empty/meaningless MR. The fix branch is cut from the ORIGINAL review
+    #    branch (review_branch), and the fix MR must merge back INTO review_branch
+    #    (not the original MR's target/master) — the fix corrects the code on the review
+    #    branch, and the dev later merges review_branch to master themselves.
+    target = topic.get("review_branch") or topic.get("base_branch") or ""
     if not target:
-        # fallback: the review branch's likely base (up to last '/'), else master.
+        # fallback: the review branch's likely base (up to last '/'), else review_branch.
         rb = topic.get("review_branch") or ""
         target = (rb.rsplit("/", 1)[0] if "/" in rb else "") or "master"
     try:
