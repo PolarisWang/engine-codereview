@@ -405,9 +405,12 @@ def _extract_msg_id(stdout, rc):
 
 
 def _send_reply(app_id, app_secret, reply_msg_id, text):
-    _run_py("feishu_notifier.py", [
+    rc, out, err = _run_py("feishu_notifier.py", [
         "update-reply", "--app-id", app_id, "--app-secret", app_secret,
         "--message-id", reply_msg_id, "--message-base64", _b64_str(text)])
+    if rc != 0:
+        print(f"[send_reply] update-reply failed rc={rc} msg_id={reply_msg_id} err={err[:200]}",
+              file=sys.stderr)
 
 
 def _update_card_text(app_id, app_secret, card_msg_id, text, topic_key="", actions=""):
@@ -1542,9 +1545,12 @@ def _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret):
         _log("CHAT", "SKIP", key, "", "", "", "no feishu creds; reply skipped")
         return
     chat_id = _env("FEISHU_CHAT_ID")
-    _run_py("feishu_notifier.py", [
+    rc, out, err = _run_py("feishu_notifier.py", [
         "reply-message", "--app-id", app_id, "--app-secret", app_secret,
         "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(answer)])
+    if rc != 0:
+        print(f"[finalize] reply-message failed rc={rc} key={key} err={err[:200]} out={out[:120]}",
+              file=sys.stderr)
 
 
 # ── Guarded side-effect executors (design-3): local apply + remote push + rollback ──
@@ -2324,7 +2330,9 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
 
 def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     """指令 `4/关闭`: owner/admin 关闭话题。关闭时会一并关闭该话题创建的 OPEN MR
-    （fix-branch）并删除 fix 分支，release 资源；原 review MR 不受影响。"""
+    （fix-branch）并删除 fix 分支，release 资源；原 review MR 不受影响。
+    成功后发一条新的群回复（reply-message）让用户明确看到"已关闭"——PATCH 改卡
+    不会推新消息，用户可能看不到。"""
     ok, why = _approve(key, topic, actor, "close_topic")
     if not ok:
         _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
@@ -2333,7 +2341,11 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
     pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
     note = f"🔒 本话题已关闭。{closed} 不处理。" if closed else "🔒 本话题已关闭，不再处理。"
+    # 1) keep the review card in sync
     _update_card_text(app_id, app_secret, render_id, note)
+    # 2) ALSO post a NEW thread reply so the close is visible in the group (PATCH
+    #    does not create a message). _finalize appends chat history + reply-message.
+    _finalize(key, note, render_id, [], state_file, app_id, app_secret)
 
 
 def _close_topic_resources(topic):
