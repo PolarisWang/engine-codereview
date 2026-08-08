@@ -40,3 +40,4 @@ review-workspace/
 # Temp files from builds
 /tmp/feishu_*
 /tmp/codereview*
+.deps-pytest/
