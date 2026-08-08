@@ -141,7 +141,107 @@
         {"expr": "cr_pending_actions", "refId": "B", "legendFormat": "pending"},
         {"expr": "cr_review_slots_held", "refId": "C", "legendFormat": "slots_held"}
       ]
+    },
+    {
+      "id": 200,
+      "title": "Host: CPU / Mem / Load",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 24},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "percentunit"}},
+      "targets": [
+        {"expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", "refId": "CPU", "legendFormat": "CPU"},
+        {"expr": "node_memory_Active_bytes / node_memory_MemTotal_bytes", "refId": "MEM", "legendFormat": "Mem"},
+        {"expr": "node_load1", "refId": "LOAD", "legendFormat": "Load1"}
+      ],
+      "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 201,
+      "title": "Host: Disk Usage (GB)",
+      "type": "timeseries",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 24},
+      "fieldConfig": {"defaults": {"unit": "decgbytes"}},
+      "targets": [
+        {"expr": "cr_disk_usage_bytes / 1e9", "refId": "A", "legendFormat": "daily-volume"}
+      ]
+    },
+    {
+      "id": 202,
+      "title": "Bot Heartbeat Freshness (s)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 28},
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 300}, {"color": "red", "value": 900}]}}},
+      "targets": [{"expr": "cr_bot_last_log_age_seconds", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 203,
+      "title": "Failed Reviews (total, per topic)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 28},
+      "targets": [{"expr": "sum(cr_review_failed_total)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 204,
+      "title": "Actions (改码/确认/关闭/重审) total",
+      "type": "timeseries",
+      "gridPos": {"h": 5, "w": 8, "x": 12, "y": 28},
+      "targets": [{"expr": "sum by (action) (cr_actions_total)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "fillOpacity": 40}}}
+    },
+    {
+      "id": 205,
+      "title": "Review Duration (s) / Changed Files per Topic",
+      "type": "timeseries",
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 32},
+      "targets": [
+        {"expr": "cr_review_duration_seconds", "refId": "DUR", "legendFormat": "dur {{topic}}"},
+        {"expr": "cr_topic_changed_files", "refId": "FILES", "legendFormat": "files {{topic}}"}
+      ]
+    },
+    {
+      "id": 206,
+      "title": "Topic Age (s) — oldest topics drift right",
+      "type": "barchart",
+      "gridPos": {"h": 5, "w": 8, "x": 8, "y": 32},
+      "targets": [{"expr": "cr_topic_age_seconds", "refId": "A", "legendFormat": "{{topic}}"}]
+    },
+    {
+      "id": 207,
+      "title": "Findings by Severity per Topic",
+      "type": "table",
+      "gridPos": {"h": 5, "w": 8, "x": 16, "y": 32},
+      "targets": [{"expr": "sum by (topic, sev) (cr_topic_severity_total)", "refId": "A", "legendFormat": "{{topic}}={{sev}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"filterable": false}, "thresholds": {"mode": "absolute", "steps": [{"color": "text"}]}}},
+      "options": {"showHeader": true}
     }
   ],
+  "templating": {
+    "list": [
+      {
+        "name": "topic",
+        "label": "Topic",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": ""},
+        "query": {"query": "label_values(cr_topic_severity_total, topic)", "refId": "A"},
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "phase",
+        "label": "Phase",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": ""},
+        "query": {"query": "label_values(cr_topic_by_phase, phase)", "refId": "A"},
+        "sort": 1,
+        "includeAll": true,
+        "refresh": 2
+      }
+    ]
+  },
   "schemaVersion": 39
 }
