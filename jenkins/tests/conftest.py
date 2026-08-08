@@ -46,3 +46,14 @@ def workspace(tmp_path):
 def lock_dir(tmp_path):
     """Return an ISOLATED lock dir (ignored if not needed)."""
     return tmp_path / "locks"
+
+
+@pytest.fixture
+def co_fix(tmp_path):
+    """A real checkout dir for path-safety tests (R9): a checkout with subdirs
+    so join/repath and symlink traversal are exercised for real."""
+    co = tmp_path / "checkout"
+    co.mkdir(exist_ok=True)
+    (co / "src").mkdir(exist_ok=True)
+    (co / "sub").mkdir(exist_ok=True)
+    return co
