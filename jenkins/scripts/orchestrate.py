@@ -740,11 +740,24 @@ def interact(args):
 
     # ── Confirmation gating (user replies to a staged action) ───────────────
     low = reply_text.lower()
+    import re as _re3
+    # Normalize away @, spaces, commas, full-width punctuation so "确认 提交并建mr",
+    # "确认，提交" etc. collapse for reliable confirmation matching — the old
+    # exact whole-string match rejected natural inputs with spaces (falling into
+    # the agent loop with a confusing reply).
+    low_norm = _re3.sub(r'[@\s，,。.、：:]+', '', low)
+    # 确认 means: strip a leading @-mention first relative to confirmation intent.
+    confirm_intent = _re3.search(r'(确认|confirm|push|提交|合并|应用)', low_norm)
     pending = topic.get("pending_patch") or {}
-    is_ok = low in ("@ok", "ok", "好的", "执行", "确认")
-    is_confirm_push = low in ("@confirm push", "确认push", "@push", "推")
-    is_confirm_edit = low in ("@确认", "确认提交", "确认并建mr", "git提交") or \
-        any(t in low for t in ("@确认", "确认提交", "确认并建mr", "git提交"))
+    is_ok = ("确认" in low_norm and len(low_norm) <= 6) or low in ("@ok", "ok", "好的", "执行", "确认")
+    # push-confirm intent: contains push/推送 with 确认/confirm (or exact push words)
+    is_confirm_push = ("push" in low_norm and confirm_intent) or low in ("@confirm push", "确认push", "@push", "推") \
+                      or ("推送" in low and any(k in low for k in ("确认", "confirm")))
+    # edit-confirm intent: contains 确认 + 提交/建mr (any grouping, spaces ok)
+    is_confirm_edit = (("确认" in low_norm) and
+                       any(k in low_norm for k in ("提交", "建mr", "提交并建"))) \
+                      or low in ("@确认", "确认提交", "确认并建mr", "git提交") \
+                      or any(t in low for t in ("@确认", "确认提交", "确认并建mr", "git提交"))
     is_rollback = low in ("@撤销", "@revert", "撤销", "回退") or any(t in low for t in ("@撤销", "@revert"))
 
     if pending:
