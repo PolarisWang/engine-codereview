@@ -1,0 +1,100 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "title": "CodeReview Server — Real-time Resource Panorama",
+  "uid": "cr-monitor-main",
+  "version": 1,
+  "tags": ["codereview", "ops"],
+  "timezone": "browser",
+  "time": {"from": "now-15m", "to": "now"},
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 100,
+      "title": "Bot / Watchdog",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": ""},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute", "steps": [
+              {"color": "green", "value": 1}, {"color": "red", "value": 0.5}
+            ]
+          },
+          "mappings": [
+            {"type": "value", "options": {"1": {"text": "UP", "color": "green"}, "0": {"text": "DOWN", "color": "red"}}}
+          ]
+        }
+      },
+      "targets": [
+        {"expr": "cr_proc_bot", "refId": "A"},
+        {"expr": "cr_proc_watchdog", "refId": "B"}
+      ],
+      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 101,
+      "title": "Open Topics & Pending",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 10}]}}},
+      "targets": [
+        {"expr": "cr_open_topics_total", "refId": "A"},
+        {"expr": "cr_pending_actions", "refId": "B"}
+      ],
+      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 102,
+      "title": "Concurrency / Locks",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "targets": [
+        {"expr": "cr_review_slots_held", "refId": "A"},
+        {"expr": "cr_locks_total", "refId": "B"}
+      ],
+      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 103,
+      "title": "GitLab Reachable",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"1": {"text": "OK", "color": "green"}, "0": {"text": "DOWN", "color": "red"}}}], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": 1}, {"color": "red", "value": 0.5}]}}},
+      "targets": [{"expr": "cr_gitlab_reachable", "refId": "A"}],
+      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 104,
+      "title": "Topic Phase Distribution",
+      "type": "piechart",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 4},
+      "targets": [{"expr": "sum by (phase) (cr_topic_by_phase)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"mappings": []}},
+      "options": {"displayLabels": ["name", "value"], "reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+    },
+    {
+      "id": 105,
+      "title": "Checkout / Workspace Size (GB)",
+      "type": "barchart",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 4},
+      "targets": [{"expr": "cr_checkout_size_bytes / 1e9", "refId": "A", "legendFormat": "{{path}}"}],
+      "fieldConfig": {"defaults": {"unit": "deciGbytes", "noValue": "0"}},
+      "options": {"orientation": "auto"}
+    },
+    {
+      "id": 106,
+      "title": "Reviews In Flight (proc)",
+      "type": "graph",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 4},
+      "targets": [{"expr": "cr_proc_reviewers", "refId": "A"}],
+      "fieldConfig": {"defaults": {}},
+      "options": {}
+    }
+  ],
+  "schemaVersion": 39
+}

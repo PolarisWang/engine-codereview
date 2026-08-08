@@ -1,0 +1,77 @@
+# monitor/docker-compose.yml
+# CodeReview server monitoring stack (route③): VictoriaMetrics + Grafana + node-exporter.
+# Bring up:  docker compose -f monitor/docker-compose.yml up -d
+#
+# 目的: 实时看服务器对 engine-review 派生的全部资源(主机+进程+锁+checkout+topic+集成)。
+# 组件:
+#   victoriametrics :8428     时序库 (PromQL 兼容, retention <30d)
+#   grafana         :9300     dashboard / /api (无公网, 绑内网; 管理员 abcd@1234)
+#   node-exporter   :9100     host 进程/僵尸/磁盘 + textfile_collector(自定义业务指标)
+#
+# 采集: 宿主机 cron/host 每5s跑 monitor_collect.py -> 写 ./node-exporter/textfile/*.prom
+#       -> node-exporter 自动暴露 :9100/metrics(含 textfile), VictoriaMetrics 抓取。
+# 访问: 本机  http://localhost:9300  (或任意可达该机内网的机器 http://<host>:9300)
+
+services:
+  victoria:
+    image: victoriametrics/victoria-metrics:latest
+    container_name: cr-monitor-victoria
+    restart: always
+    command:
+      - -retentionPeriod=30d
+      - -storageDataPath=/victoria-data
+      - -httpListenAddr=:8428
+      - -promscrape.config=/promscrape.yml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./victoria/data:/victoria-data
+      - ./victoria/promscrape.yml:/promscrape.yml
+    ports:
+      - "127.0.0.1:8428:8428"          # 仅本机: 数据源接入, 不对外
+    networks: [cr-mon]
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: cr-monitor-node-exporter
+    restart: always
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.textfile.directory=/textfile
+      - --collector.filesystem.mount-points-exclude=^/sys|^/proc|^/host/.*
+    pid: "host"            # 共享宿主 PID 命名空间, 才能看到 bot/僵尸
+    network_mode: "host"   # host 网络, 让宿主机 :9100 直接暴露
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+      - ./node-exporter/textfile:/textfile:ro
+    # 不需要 ports (host 网络直接 9100)
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cr-monitor-grafana
+    restart: always
+    environment:
+      - GF_SERVER_HTTP_PORT=9300
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=abcd@1234
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:9300
+    ports:
+      - "127.0.0.1:9300:9300"          # 仅本机/内网访问; 可改为 0.0.0.0:9300 供任何机器
+      # 若需"任何机器可访问", 把上行改成 "9300:9300" (不经反代) 并注意安全
+    volumes:
+      - ./grafana/data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - victoria
+      - node-exporter
+    networks: [cr-mon]
+
+networks:
+  cr-mon:
+    driver: bridge

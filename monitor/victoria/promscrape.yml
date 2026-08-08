@@ -1,0 +1,10 @@
+# monitor/victoria/promscrape.yml
+# VictoriaMetrics scrape targets. node-exporter is on host network (binds :9100 on
+# the host); VM reaches it via host.docker.internal (host-gateway).
+scrape_configs:
+  - job_name: codereview-hosts
+    static_configs:
+      - targets: ["host.docker.internal:9100"]   # node-exporter: host proc/sys + textfile metrics
+    scrape_interval: 10s
+
+  # 未来扩展: 监控服务自身 /health 或 collector 自暴露接口, 在同一块追加 target 即可
