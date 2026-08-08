@@ -273,6 +273,7 @@ def run(args):
         existing_card = (topic or {}).get("render_msg_id") if topic is not None else None
         if existing_card:
             # Reuse the card already tied to this topic: update it in place.
+            # (review 进度卡复用,非命令反馈,故 PATCH 保留而非新起卡)
             _update_card_text(app_id, app_secret, existing_card,
                               "🤖 **正在 Review（重试）...**\n重新拉取代码并进行 AI 审查，请稍候...")
             reply_msg_id = existing_card
@@ -768,13 +769,12 @@ def interact(args):
                                            patch={"actor": actor})
                 pipeline_state.append_approval(state_file, key, actor, "push_fix_branch",
                                                pending.get("branch", ""), "ok", "@确认改码 enqueued")
-                _update_card_text(app_id, app_secret, render_id,
-                                  "⏳ 已记录确认，Jenkins 将推送修复分支 `{0}` 并自动建 MR。".format(
-                                      pending.get("branch", "")))
+                _proc_reply(key, topic, "⏳ 已记录确认，Jenkins 将推送修复分支 `{0}` 并自动建 MR。".format(
+                                      pending.get("branch", ""), render_id, state_file, app_id, app_secret))
                 return 0
             if is_rollback:
                 pipeline_state.set_pending_patch(state_file, key, None)
-                _update_card_text(app_id, app_secret, render_id, "↩️ 已取消本次自动改码（未推送、未建MR）。")
+                _proc_reply(key, topic, "↩️ 已取消本次自动改码（未推送、未建MR）。", render_id, state_file, app_id, app_secret)
                 return 0
         else:
             if is_ok:
@@ -1489,17 +1489,20 @@ def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
     Approval happens here (enqueue side); the executor does not re-gate owner."""
     ok, why = _approve(key, topic, actor, "auto_edit")
     if not ok:
-        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret,
+                    intent="自动改码", prefix="🛑")
         return 0
     if not _find_claude():
-        _update_card_text(app_id, app_secret, render_id,
-                          "⚠️ 无法执行自动改码：未在本机找到 claude CLI（自动改码需 `claude` 可执行）。")
+        _proc_reply(key, topic,
+                    "⚠️ 无法执行自动改码：未在本机找到 claude CLI（自动改码需 `claude` 可执行）。",
+                    render_id, state_file, app_id, app_secret, intent="自动改码")
         return 0
     pipeline_state.set_pending(state_file, key, "agent_edit", patch={"actor": actor})
     pipeline_state.append_approval(state_file, key, actor, "auto_edit", "", "ok", "@改码 enqueued")
-    _update_card_text(app_id, app_secret, render_id,
-                      "⏳ 已记录自动改码，Jenkins 将稍后调用 AI 修改代码并展示 diff 待你确认。\n"
-                      "（结果可能延迟到下一轮扫描；完成后回复 `@确认 提交并建mr` 推送并建 MR，`@撤销` 取消。）")
+    _proc_reply(key, topic,
+                "⏳ 已记录自动改码，Jenkins 将稍后调用 AI 修改代码并展示 diff 待你确认。\n"
+                "（结果可能延迟到下一轮扫描；完成后回复 `@确认 提交并建mr` 推送并建 MR，`@撤销` 取消。）",
+                render_id, state_file, app_id, app_secret, intent="自动改码（改码→staged→待确认）")
     return 0
 
 
@@ -1510,26 +1513,31 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
     render = topic.get("render_msg_id") or ""
     pending = (topic.get("pending_patch") or {})
     if pending.get("state") != "staged_agent_edit":
-        _update_card_text(app_id, app_secret, render,
-                          "⛔ 当前没有待确认的自动改码。请先回复 `改码` 生成修改。")
+        _proc_reply(key, topic,
+                    "⛔ 当前没有待确认的自动改码。请先回复 `改码` 生成修改。",
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     files = pending.get("files") or []
     branch = pending.get("branch") or ""
     if not files or not branch:
         pipeline_state.set_pending_patch(state_file, key, None)
-        _update_card_text(app_id, app_secret, render, "⛔ 待确认改码内容缺失，已取消。")
+        _proc_reply(key, topic, "⛔ 待确认改码内容缺失，已取消。",
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     # Guard: never push to a protected branch.
     if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
-        _update_card_text(app_id, app_secret, render, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。")
+        _proc_reply(key, topic, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。",
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     ok, why = _approve(key, topic, actor, "push_fix_branch", branch=branch)
     if not ok:
-        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}",
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     checkout, err = _ensure_checkout(topic, workspace)
     if err:
-        _update_card_text(app_id, app_secret, render, f"⛔ checkout 失败：{err}")
+        _proc_reply(key, topic, f"⛔ checkout 失败：{err}",
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     # Ensure we're on the fix branch and the diffs are applied. The staged edits were
     # written to the shared checkout's working tree by _cmd_auto_edit; if a later
@@ -1562,14 +1570,12 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             cur = (_sha_r.stdout or "").strip()
             if not cur or cur != expected_sha:
                 pipeline_state.set_pending_patch(state_file, key, None)
-                _update_card_text(app_id, app_secret, render,
-                                  "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期改码提交到错误基线，已取消本次提交。请重新回复 `改码`。")
+                _proc_reply(key, topic, "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期改码提交到错误基线，已取消本次提交。请重新回复 `改码`。", render, state_file, app_id, app_secret)
                 return 0
         else:
             # Legacy staged edit without a recorded baseline: safest to refuse.
             pipeline_state.set_pending_patch(state_file, key, None)
-            _update_card_text(app_id, app_secret, render,
-                              "⛔ 缺少改码基线记录（旧版本暂存的改码），已取消。请重新回复 `改码`。")
+            _proc_reply(key, topic, "⛔ 缺少改码基线记录（旧版本暂存的改码），已取消。请重新回复 `改码`。", render, state_file, app_id, app_secret)
             return 0
         _sp.run(["git", "-C", checkout, "add", "-A"],
                 capture_output=True, text=True, timeout=60, env=_git_env)
@@ -1597,14 +1603,12 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
                 _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
                                   capture_output=True, text=True, timeout=60, env=_git_env)
         if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
-            _update_card_text(app_id, app_secret, render,
-                              f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
+            _proc_reply(key, topic, f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}", render, state_file, app_id, app_secret)
             return 0
         push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                        capture_output=True, text=True, timeout=180, env=_git_env)
         if push.returncode != 0:
-            _update_card_text(app_id, app_secret, render,
-                              f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
+            _proc_reply(key, topic, f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}", render, state_file, app_id, app_secret)
             return 0
     # Auto-create / detect the fix-branch MR and report its real url.
     mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
@@ -1741,6 +1745,20 @@ def _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret):
     if rc != 0:
         print(f"[finalize] reply-message failed rc={rc} key={key} err={err[:200]} out={out[:120]}",
               file=sys.stderr)
+
+
+def _proc_reply(key, topic, text, render_id, state_file, app_id, app_secret,
+                intent="", prefix="🤖"):
+    """方案C 过程通道: 每次交互 NEW 一张卡（reply-message），并声明"我将做什么"，
+    不覆盖之前的卡片（结果卡 PATCH 保留给 review summary / CI）。
+
+    intent 为动作说明（如 '确认并推送修复分支、创建修复 MR'）；会在文案前渲染成
+    '{prefix} 准备执行：{intent}'。每次都新发一条（走 reply-message + 记 chat），
+    让用户看到"准备 → 执行中 → 结果"的完整过程，而非卡片被反复覆盖。
+    """
+    if intent:
+        text = f"{prefix} **准备执行：{intent}**\n\n{text}"
+    _finalize(key, text, render_id, [], state_file, app_id, app_secret)
 
 
 # ── Guarded side-effect executors (design-3): local apply + remote push + rollback ──
@@ -1922,11 +1940,11 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor=
     ok, why = _approve(key, topic, actor, "apply_local")
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "apply_local", "", "denied", why)
-        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render, state_file, app_id, app_secret)
         return 0
     pending = topic.get("pending_patch") or {}
     if not pending:
-        _update_card_text(app_id, app_secret, render, "ℹ️ 没有待应用的补丁，无需操作。")
+        _proc_reply(key, topic, "ℹ️ 没有待应用的补丁，无需操作。", render, state_file, app_id, app_secret)
         return 0
     # Record intent; the Jenkins executor applies it to the shared checkout.
     pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file", ""), "ok", "@ok enqueued")
@@ -1934,9 +1952,10 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor=
         "file": pending.get("file", ""), "repo": pending.get("repo", "engine"), "diff": pending.get("diff", ""),
     })
     pipeline_state.set_pending_patch(state_file, key, None)  # now owned by the executor
-    _update_card_text(app_id, app_secret, render,
-                      "⏳ 已记录应用请求，Jenkins 将把补丁应用到共享 checkout。\n"
-                      "完成后会更新本帖。如需推送远程，届时再回复 `@confirm push`。")
+    _proc_reply(key, topic,
+                "⏳ 已记录应用请求，Jenkins 将把补丁应用到共享 checkout。\n"
+                "完成后会更新本帖。如需推送远程，届时再回复 `@confirm push`。",
+                render, state_file, app_id, app_secret, intent="应用补丁到共享 checkout")
     return 0
 
 
@@ -1949,12 +1968,11 @@ def _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor="
     ok, why = _approve(key, topic, actor, "push_remote", branch=branch)
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "denied", why)
-        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render, state_file, app_id, app_secret)
         return 0
     pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "ok", "@confirm push enqueued")
     pipeline_state.set_pending(state_file, key, "push")
-    _update_card_text(app_id, app_secret, render,
-                      "⏳ 已记录推送请求，Jenkins 将把已应用的改动推到远程分支 `{branch}`。".format(branch=branch))
+    _proc_reply(key, topic, "⏳ 已记录推送请求，Jenkins 将把已应用的改动推到远程分支 `{branch}`。".format(branch=branch), render, state_file, app_id, app_secret)
     return 0
 
 
@@ -1965,12 +1983,11 @@ def _rollback(key, topic, workspace, state_file, app_id, app_secret, actor=""):
     ok, why = _approve(key, topic, actor, "rollback")
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "rollback", "", "denied", why)
-        _update_card_text(app_id, app_secret, render, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render, state_file, app_id, app_secret)
         return 0
     pipeline_state.set_pending(state_file, key, "rollback")
     pipeline_state.append_approval(state_file, key, actor, "rollback", "", "ok", "@撤销 enqueued")
-    _update_card_text(app_id, app_secret, render,
-                      "⏳ 已记录回退请求，Jenkins 将回退最近一次应用的补丁。")
+    _proc_reply(key, topic, "⏳ 已记录回退请求，Jenkins 将回退最近一次应用的补丁。", render, state_file, app_id, app_secret)
     return 0
 
 
@@ -2156,19 +2173,18 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         except Exception as e:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
             pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render, f"⛔ 自动改码执行异常：{str(e)[:200]}")
+            _proc_reply(key, topic, f"⛔ 自动改码执行异常：{str(e)[:200]}", render, state_file, app_id, app_secret)
             return False, f"agent_edit error: {e}"
         if err:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail", err)
             pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render, f"⛔ 自动改码准备失败：{err}")
+            _proc_reply(key, topic, f"⛔ 自动改码准备失败：{err}", render, state_file, app_id, app_secret)
             return False, f"agent_edit checkout: {err}"
         if not ok_diffs:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail",
                                            "no fixed finding")
             pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render,
-                              "⚠️ 自动改码未生成任何可用 diff（可改用 `指引` 看人工修改方案）。")
+            _proc_reply(key, topic, "⚠️ 自动改码未生成任何可用 diff（可改用 `指引` 看人工修改方案）。", render, state_file, app_id, app_secret)
             return False, "agent_edit: no usable diff"
         pipeline_state.set_pending_patch(state_file, key, {
             "file": "all", "repo": "engine", "target": "agent_edit",
@@ -2202,18 +2218,18 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         if pp.get("state") != "staged_agent_edit" or not files or not branch:
             pipeline_state.set_pending_patch(state_file, key, None)
             pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render, "⛔ 没有待确认的自动改码内容，已取消。")
+            _proc_reply(key, topic, "⛔ 没有待确认的自动改码内容，已取消。", render, state_file, app_id, app_secret)
             return False, "agent_edit_confirm: no staged change set"
         if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
             pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。")
+            _proc_reply(key, topic, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。", render, state_file, app_id, app_secret)
             return False, f"agent_edit_confirm: protected branch {branch}"
         import subprocess as _sp2
         _git_env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0")
         checkout, err = _ensure_checkout(topic, workspace)
         if err:
             pipeline_state.clear_pending(state_file, key)
-            _update_card_text(app_id, app_secret, render, f"⛔ checkout 失败：{err}")
+            _proc_reply(key, topic, f"⛔ checkout 失败：{err}", render, state_file, app_id, app_secret)
             return False, f"agent_edit_confirm: {err}"
         _sp2.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
                  capture_output=True, text=True, timeout=30, env=_git_env)
@@ -2236,14 +2252,12 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                 if not cur or cur != expected_sha:
                     pipeline_state.set_pending_patch(state_file, key, None)
                     pipeline_state.clear_pending(state_file, key)
-                    _update_card_text(app_id, app_secret, render,
-                                      "⛔ 工作树已被其他操作重置（基线 SHA 变化），已取消本次提交。请重新回复 `改码`。")
+                    _proc_reply(key, topic, "⛔ 工作树已被其他操作重置（基线 SHA 变化），已取消本次提交。请重新回复 `改码`。", render, state_file, app_id, app_secret)
                     return False, "agent_edit_confirm: checkout drifted from baseline"
             else:
                 pipeline_state.set_pending_patch(state_file, key, None)
                 pipeline_state.clear_pending(state_file, key)
-                _update_card_text(app_id, app_secret, render,
-                                  "⛔ 缺少改码基线记录（旧版本暂存），已取消。请重新回复 `改码`。")
+                _proc_reply(key, topic, "⛔ 缺少改码基线记录（旧版本暂存），已取消。请重新回复 `改码`。", render, state_file, app_id, app_secret)
                 return False, "agent_edit_confirm: missing baseline SHA"
             _sp2.run(["git", "-C", checkout, "add", "-A"],
                      capture_output=True, text=True, timeout=60, env=_git_env)
@@ -2272,15 +2286,13 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                                        capture_output=True, text=True, timeout=60, env=_git_env)
             if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
                 pipeline_state.clear_pending(state_file, key)
-                _update_card_text(app_id, app_secret, render,
-                                  f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}")
+                _proc_reply(key, topic, f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}", render, state_file, app_id, app_secret)
                 return False, f"agent_edit_confirm: commit failed"
             push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                             capture_output=True, text=True, timeout=300, env=_git_env)
             if push.returncode != 0:
                 pipeline_state.clear_pending(state_file, key)
-                _update_card_text(app_id, app_secret, render,
-                                  f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}")
+                _proc_reply(key, topic, f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}", render, state_file, app_id, app_secret)
                 return False, f"agent_edit_confirm: push failed"
         _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
         if _mriid:
@@ -2535,11 +2547,10 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
     """指令 `2/重新审查`: owner/admin 校验后入队 re_review（Jenkins 执行）。"""
     ok, why = _approve(key, topic, actor, "re_review")
     if not ok:
-        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret)
         return
     pipeline_state.set_pending(state_file, key, "re_review")
-    _update_card_text(app_id, app_secret, render_id,
-                      "⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查。")
+    _proc_reply(key, topic, "⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查。", render_id, state_file, app_id, app_secret)
 
 
 def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
@@ -2549,7 +2560,7 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     不会推新消息，用户可能看不到。"""
     ok, why = _approve(key, topic, actor, "close_topic")
     if not ok:
-        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret)
         return
     closed = _close_topic_resources(topic)
     pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
@@ -2642,28 +2653,27 @@ def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
     """指令 `1/补丁`: 生成修复补丁方案（基于 findings 的建议，供确认后应用）。"""
     ok, why = _approve(key, topic, actor, "apply_patch")
     if not ok:
-        _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
+        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret)
         return 0
     # 流程②: never let a suggestion patch (1/补丁) overwrite an in-progress 改码
     # change set (staged_agent_edit). Otherwise a stray `补丁` reply kills the real
     # auto-edit waiting for confirmation.
     cur_pp = topic.get("pending_patch") or {}
     if cur_pp.get("state") == "staged_agent_edit":
-        _update_card_text(app_id, app_secret, render_id,
-                          "⛔ 已有待确认的自动改码（3 个文件 staged）。请先回 `确认提交并建mr` 推送，或用 `指引` 看人工方案；本 `补丁` 未覆盖现有改码。")
+        _proc_reply(key, topic, "⛔ 已有待确认的自动改码（3 个文件 staged）。请先回 `确认提交并建mr` 推送，或用 `指引` 看人工方案；本 `补丁` 未覆盖现有改码。", render_id, state_file, app_id, app_secret)
         return 0
     patch = _build_patch_target(all_findings, "all")
     if not all_findings or not (patch.get("diff") or "").strip():
-        _update_card_text(app_id, app_secret, render_id,
-                          "ℹ️ 当前没有可生成补丁的 findings，或 `@ok` 后再应用。")
+        _proc_reply(key, topic, "ℹ️ 当前没有可生成补丁的 findings，或 `@ok` 后再应用。", render_id, state_file, app_id, app_secret)
         return 0
     pipeline_state.set_pending_patch(state_file, key, {
         "file": "all", "target": "all", "repo": "engine", "diff": patch.get("diff", ""),
         "created_at": "now",
     })
-    _update_card_text(app_id, app_secret, render_id,
-                      "✏️ 已生成修复补丁方案（基于 findings 建议，未应用）。\n"
-                      "回复 `@ok` 让 Jenkins 应用，`@confirm push` 推送，`@撤销` 取消。")
+    _proc_reply(key, topic,
+                "✏️ 已生成修复补丁方案（基于 findings 建议，未应用）。\n"
+                "回复 `@ok` 让 Jenkins 应用，`@confirm push` 推送，`@撤销` 取消。",
+                render_id, state_file, app_id, app_secret, intent="生成修复补丁方案")
     return 0
 
 
