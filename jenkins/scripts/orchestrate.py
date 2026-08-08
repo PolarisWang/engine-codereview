@@ -1625,7 +1625,7 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             f"- 推送分支：`{branch}`\n"
             f"- 本次修复 MR：{murl if murl else '（创建失败：' + mrnote + '）'}\n"
             f"- 原评审 MR：{topic.get('mr_url') or ''}\n\n"
-            f"> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
+            f"> 已推送到 `{branch}`，修复 MR 见上（机器人只创建 MR，不合并代码；请到 GitLab 自行 review 后决定）。`4` 可关闭话题（会连同关闭本轮 fix 分支的 OPEN MR）。")
     _finalize(key, text, render, [], state_file, app_id, app_secret)
     return 0
 
@@ -2644,6 +2644,14 @@ def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
     if not ok:
         _update_card_text(app_id, app_secret, render_id, f"⛔ {why}")
         return 0
+    # 流程②: never let a suggestion patch (1/补丁) overwrite an in-progress 改码
+    # change set (staged_agent_edit). Otherwise a stray `补丁` reply kills the real
+    # auto-edit waiting for confirmation.
+    cur_pp = topic.get("pending_patch") or {}
+    if cur_pp.get("state") == "staged_agent_edit":
+        _update_card_text(app_id, app_secret, render_id,
+                          "⛔ 已有待确认的自动改码（3 个文件 staged）。请先回 `确认提交并建mr` 推送，或用 `指引` 看人工方案；本 `补丁` 未覆盖现有改码。")
+        return 0
     patch = _build_patch_target(all_findings, "all")
     if not all_findings or not (patch.get("diff") or "").strip():
         _update_card_text(app_id, app_secret, render_id,
@@ -2765,7 +2773,7 @@ def _generate_mr_card(topic, all_findings, workspace, key, state_file=""):
     lines.append("")
     lines.append(f"**已应用补丁**：{len(c)} 个。" if c else "**已应用补丁**：无。")
     lines.append("")
-    lines.append("> 本次修复 MR 为机器人通过 GitLab API 创建/检测得到；请人工核对后合并。")
+    lines.append("> 本次修复 MR 为机器人通过 GitLab API 创建/检测得到；机器人不合并代码，请到 GitLab 自行 review 后决定。")
     return "\n".join(lines)
 
 
