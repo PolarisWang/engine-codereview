@@ -47,6 +47,21 @@ else
     fi
 fi
 
+# 2b. If code changed, FORCE the bot to reload: kill any running event-server so
+#     the watchdog relaunches it from the now-current checkout. Without this, the
+#     watchdog keeps a live bot on the OLD code — apply.sh would "deploy" but the
+#     running bot silently keeps the previous behavior. Guard on RESTART_BOT=1 so
+#     a plain startup.sh (container-restart recovery) remains idempotent/no-op for
+#     an already-running bot.
+if [ "${RESTART_BOT:-0}" = "1" ]; then
+    echo "[startup] code changed -> forcing bot restart"
+    for bpid in $(pgrep -f "python3 -B ${SCRIPTS_DIR}/event_server.py --mode ws" 2>/dev/null); do
+        echo "[startup] killing stale bot pid=$bpid"
+        kill "$bpid" 2>/dev/null || true
+    done
+    sleep 2
+fi
+
 # 3. Give the watchdog a moment to (re)launch the bot, then verify.
 echo "[startup] waiting for the watchdog to ensure the bot is running..."
 for i in 1 2 3 4 5 6; do

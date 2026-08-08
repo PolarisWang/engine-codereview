@@ -77,7 +77,9 @@ rsync -a "$REPO_DIR_DEV/deploy/" "$DEST/deploy/" 2>/dev/null || cp -a "$REPO_DIR
 # 4. Restart the service chain: only if code changed, or --force.
 if [ "$BEFORE" != "$AFTER" ] || [ "$FORCE" = "1" ]; then
     echo ">> restarting event-server chain via startup.sh (container path: $STARTUP_CONT)"
-    docker exec "$CONTAINER" bash "$STARTUP_CONT"
+    # RESTART_BOT=1 forces the running bot to reload the new code (the watchdog
+    # only relaunches on crash; without this a live bot keeps the OLD code).
+    docker exec "$CONTAINER" env RESTART_BOT=1 bash "$STARTUP_CONT"
 else
     echo ">> no change (HEAD = $AFTER); skipping restart (use --force to force)."
 fi
