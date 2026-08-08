@@ -384,6 +384,27 @@ def _topic_lock(topic_key):
         return _T_LOCKS[topic_key]
 
 
+def _resolve_topic_key(state_file, parent_id):
+    """Map a reply's parent_message_id to the topic's real key.
+
+    Users naturally reply to the review RESULT CARD (a thread reply whose
+    message_id == topic.render_msg_id), not to the topic starter. In that case
+    parent_id is the card's id, which is NOT a valid topic key — hitting
+    interact --key <card_id> silently no-ops because the topic is never found.
+    This resolves such ids to the owning topic's key (message_id), or returns
+    None when e.g. parent_id already is a valid key or references nothing known."""
+    try:
+        import pipeline_state as _ps
+        topics = _ps.list_topics(state_file)
+        for t in topics:
+            if t.get("render_msg_id") == parent_id or t.get("message_id") == parent_id:
+                return t.get("message_id") or t.get("render_msg_id")
+        return None
+    except Exception as e:
+        print(f"[event] _resolve_topic_key err: {e}", file=sys.stderr)
+        return None
+
+
 def _route(msg_id, parent_id, text, sender_id=""):
     """Shared single-link routing.
 
@@ -404,14 +425,18 @@ def _route(msg_id, parent_id, text, sender_id=""):
             print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
         print(f"[event] REPLY {msg_id} to parent {parent_id}: {text[:80]} sender={sender_id}", flush=True)
-        lock = _topic_lock(parent_id)
+        # The parent may be the review result CARD (render_msg_id) rather than the
+        # topic starter; resolve it to the real topic key so interact() finds the
+        # topic. Without this, a reply on the card silently no-ops.
+        topic_key = _resolve_topic_key(_state_file(), parent_id) or parent_id
+        lock = _topic_lock(topic_key)
         acquired = lock.acquire(timeout=LOCK_TIMEOUT)
         try:
             if not acquired:
-                print(f"[event] topic {parent_id} busy, skip this reply", file=sys.stderr)
+                print(f"[event] topic {topic_key} busy, skip this reply", file=sys.stderr)
                 return
             base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
-            _run_orchestrate(["interact", "--key", parent_id, "--reply", text[:500],
+            _run_orchestrate(["interact", "--key", topic_key, "--reply", text[:500],
                               "--reply-msg-id", msg_id, "--sender-id", sender_id] + base)
         finally:
             if acquired:
