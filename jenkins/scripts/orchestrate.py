@@ -2683,7 +2683,15 @@ def _project_path(topic):
 
 
 def _create_or_get_mr(topic, all_findings, create_if_missing=False):
-    """Detect an MR whose source_branch == the fix's new branch; optionally create it.
+    """检测/创建 fix 分支的修复 MR（根治后的幂等实现）。
+
+    修复的根因问题：
+      - detect 用 state=all&per_page=50 会被项目大量 closed MR 淹没/截断，漏掉真正的
+        open MR -> 走创建 -> 撞 409 （"已存在同源分支 MR"）。现改为 state=opened + 精确
+        source_branch 过滤，几乎必中。
+      - 创建遇 409 无兜底 -> 直接报失败。现改为 409 时重新查询该分支 open MR 并复用。
+      - _get 网络失败被静默当"无 MR" -> 误创建。现区分"查询失败(raise)"与"确实无MR"。
+      - target 用 base_branch or 'master'，脆弱。现优先 base_branch，否则从 review 分支推导。
     Returns (mr_iid, mr_web_url, source_branch, note)."""
     import urllib.request, urllib.error, urllib.parse, json as _json
     pp = _project_path(topic)
@@ -2692,38 +2700,58 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
         return None, None, "", "no project path or token"
     new_branch = _new_branch_name(topic)
     proj = urllib.parse.quote(pp, safe="")
+
     def _get(url):
+        # Raises on transport/protocol error (caller decides); never silently returns [].
         r = urllib.request.Request(url, headers={"PRIVATE-TOKEN": tok})
-        return _json.loads(urllib.request.urlopen(r, timeout=20).read())
-    # 1) detect existing MR on the fix branch
-    try:
-        mrs = _get(f"https://gitlab.booming-inc.com/api/v4/projects/{proj}"
-                   f"/merge_requests?state=all&per_page=50")
-    except Exception:
-        mrs = []
-    for m in mrs:
-        # Only treat an OPENED MR as "the current MR". A closed/merged MR on this
-        # branch is stale (e.g. a prior empty MR) — do not surface it as yours.
-        if m.get("source_branch") == new_branch and (m.get("state") or "").lower() == "opened":
-            return m.get("iid"), m.get("web_url", ""), new_branch, "detected existing"
+        with urllib.request.urlopen(r, timeout=20) as resp:
+            return _json.loads(resp.read())
+
+    def _find_open_mr_on_branch():
+        """精确按 source_branch 查该项目 open MR；返回 (iid, web_url, branch) 或 None."""
+        try:
+            q = urllib.parse.quote(new_branch, safe='')
+            mrs = _get(f"https://gitlab.booming-inc.com/api/v4/projects/{proj}"
+                       f"/merge_requests?state=opened&per_page=100&source_branch={q}")
+        except Exception:
+            # Query failed (not "no MR"). Let callers retry/re-raise rather than treat as missing.
+            return "QUERY_ERROR"
+        for m in (mrs or []):
+            if (m.get("source_branch") or "").lower() == new_branch.lower():
+                return (m.get("iid"), m.get("web_url", ""), new_branch)
+        return None
+
+    # 1) detect existing OPEN MR on the fix branch (authoritative, pagination-safe).
+    found = _find_open_mr_on_branch()
+    if found is not None:
+        if found == "QUERY_ERROR":
+            print(f"[mr] query existing fix MR failed for {new_branch}; retry later", file=sys.stderr)
+            return None, None, new_branch, "查询已存在 MR 失败(网络)，请稍后再试"
+        iid, url, _ = found
+        return iid, url, new_branch, "detected existing"
+
     if not create_if_missing:
         return None, None, new_branch, "no MR for fix branch yet"
+
     # 2) Only create if the fix branch actually has changes vs target — never create an
-    #    empty/meaningless MR (a real defect we hit: an MR with 0 diffs and wrong intent).
-    target = topic.get("base_branch") or "master"
+    #    empty/meaningless MR. Resolve target robustly.
+    target = topic.get("base_branch") or ""
+    if not target:
+        # fallback: the review branch's likely base (up to last '/'), else master.
+        rb = topic.get("review_branch") or ""
+        target = (rb.rsplit("/", 1)[0] if "/" in rb else "") or "master"
     try:
         cmp = _get(f"https://gitlab.booming-inc.com/api/v4/projects/{proj}"
                    f"/repository/compare?from={urllib.parse.quote(target, safe='')}"
                    f"&to={urllib.parse.quote(new_branch, safe='')}")
-        diffs = cmp.get("diffs") or []
+        diffs = (cmp or {}).get("diffs") or []
     except Exception:
         diffs = []
     if not diffs:
         return None, None, new_branch, "fix 分支相对 " + target + " 无改动，先推送修复再更新MR"
+
     # 3) create
     title = f"Fix {topic.get('jira_key') or topic.get('message_id') or ''}: code review fixes"
-    # NOTE: must not call _generate_mr_card here (it calls back into _create_or_get_mr
-    # -> infinite recursion). Build a simple description instead.
     desc_lines = [f"Code review fix for {topic.get('jira_key') or topic.get('message_id') or ''}"]
     crit = [f for f in (all_findings or []) if (f.get('severity') or '').lower() in ('critical', 'high')]
     for f in (crit or (all_findings or []))[:5]:
@@ -2735,10 +2763,19 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False):
         r = urllib.request.Request(
             f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests",
             data=payload, method="POST", headers={"PRIVATE-TOKEN": tok, "Content-Type": "application/json"})
-        m = _json.loads(urllib.request.urlopen(r, timeout=30).read())
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            m = _json.loads(resp.read())
         return m.get("iid"), m.get("web_url", ""), new_branch, "created"
     except urllib.error.HTTPError as e:
+        # 409 = "Another open merge request already exists for this source branch".
+        # Root-cause fix: re-query and REUSE that existing open MR instead of failing.
+        if e.code == 409:
+            found2 = _find_open_mr_on_branch()
+            if found2 and found2 != "QUERY_ERROR":
+                iid, url, _ = found2
+                return iid, url, new_branch, "reused existing (409)"
         return None, None, new_branch, f"create failed HTTP {e.code}: {e.read()[:150]}"
+
 
 
 def _generate_mr_card(topic, all_findings, workspace, key, state_file=""):
@@ -2747,8 +2784,10 @@ def _generate_mr_card(topic, all_findings, workspace, key, state_file=""):
     jira = topic.get("jira_key") or key
     branch = topic.get("review_branch") or ""
     new_branch = _new_branch_name(topic)
-    # detect/create fix-branch MR to get its REAL url
-    mriid, murl, nbranch, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True)
+    # MR单 is READ-ONLY: detect/reuse an existing fix-branch MR, but never CREATE one
+    # here (only the 改码确认 path may create). This keeps a stray `MR单` from
+    # creating an unintended MR.
+    mriid, murl, nbranch, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=False)
     if mriid and state_file:
         pipeline_state.record_fix_mr(state_file, key, mriid)  # R2 ownership ledger
     mr_url = topic.get("mr_url") or ""
