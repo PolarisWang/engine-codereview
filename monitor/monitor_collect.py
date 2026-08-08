@@ -243,6 +243,124 @@ def collect_topic_resources(cache):
         print(f"[monitor] collect_topic_resources err: {e}", file=sys.stderr)
 
 
+def _iso2epoch(s):
+    """Best-effort parse of our ISO local timestamp (no tz) -> epoch float; 0 on fail."""
+    try:
+        import time as _t
+        return _t.mktime(_t.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+
+
+def collect_topic_detail():
+    """C: per-topic business detail — severity counts, changed files, review
+    duration (started->finished), age since created. Emits labelled series so
+    Grafana can filter by topic / phase."""
+    _t("cr_topic_severity_total", "Total findings per topic by severity (critical/warning/suggestion)")
+    _t("cr_topic_changed_files", "Changed files per topic (from review result)")
+    _t("cr_topic_age_seconds", "Seconds since topic creation (open-duration)")
+    _t("cr_review_duration_seconds", "Review engine duration between started_at and finished_at")
+    try:
+        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        now = time.time()
+        for k, t in d.get("topics", {}).items():
+            topic_id = (k or "")[:44]
+            eng = (t.get("repos") or {}).get("engine", {})
+            ph = t.get("phase", "")
+            sev = eng.get("severity_counts") or {}
+            g("cr_topic_severity_total", sev.get("critical", 0), {"topic": topic_id, "sev": "critical", "phase": ph})
+            g("cr_topic_severity_total", sev.get("warning", 0), {"topic": topic_id, "sev": "warning", "phase": ph})
+            g("cr_topic_severity_total", sev.get("suggestion", 0), {"topic": topic_id, "sev": "suggestion", "phase": ph})
+            g("cr_topic_changed_files", eng.get("changed_files", 0), {"topic": topic_id, "phase": ph})
+            created = _iso2epoch(t.get("created_at") or "")
+            if created:
+                g("cr_topic_age_seconds", now - created, {"topic": topic_id, "phase": ph})
+            s0 = eng.get("started_at") or ""
+            f0 = eng.get("finished_at") or ""
+            if s0 and f0:
+                g("cr_review_duration_seconds", _iso2epoch(f0) - _iso2epoch(s0),
+                  {"topic": topic_id, "phase": ph})
+    except Exception as e:
+        print(f"[monitor] collect_topic_detail err: {e}", file=sys.stderr)
+
+
+def collect_action_counters():
+    """C: server-activity counters from approval_log — how many 改码/确认/关闭/重审
+    happened (cumulative; Grafana can rate()/increase() over time)."""
+    _t("cr_actions_total", "Cumulative guarded actions per topic (from approval_log)")
+    try:
+        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        for k, t in d.get("topics", {}).items():
+            topic_id = (k or "")[:44]
+            for e in (t.get("approval_log") or []):
+                action = e.get("action") or "?"
+                result = e.get("result") or "?"
+                # emit 1 per action so sum() gives cumulative count; labels allow filtering
+                g("cr_actions_total", 1, {"topic": topic_id, "action": action, "result": result})
+    except Exception as e:
+        print(f"[monitor] collect_action_counters err: {e}", file=sys.stderr)
+
+
+def collect_heartbeat_freshness():
+    """C: bot heartbeat 'freshness' — age of the newest event-server log. If the bot
+    is healthy it writes logs periodically; when alive but silent too long, this grows
+    and signals a possible hang (complement to the process-presence probe)."""
+    _t("cr_bot_last_log_age_seconds", "Age (s) of the newest event-server log file")
+    try:
+        # locate the newest ev-server-*.log inside the container (host sees it via bind?)
+        # Fall back to scanning the shared workspace dir for recent logs.
+        best = None
+        for base in ("/var/lib/report-server/daily/cr-workspace", "/tmp"):
+            try:
+                if not os.path.isdir(base):
+                    continue
+                for name in os.listdir(base):
+                    if "ev-server-" in name or name.endswith(".log"):
+                        p = os.path.join(base, name)
+                        try:
+                            m = os.path.getmtime(p)
+                        except OSError:
+                            continue
+                        if best is None or m > best[1]:
+                            best = (p, m)
+            except Exception:
+                continue
+        if best:
+            g("cr_bot_last_log_age_seconds", time.time() - best[1])
+        else:
+            g("cr_bot_last_log_age_seconds", -1)
+    except Exception as e:
+        print(f"[monitor] collect_heartbeat_freshness err: {e}", file=sys.stderr)
+
+
+def collect_disk_usage():
+    """C: dedicated disk usage for the persistent daily volume (where checkouts live)."""
+    _t("cr_disk_usage_bytes", "Disk usage (bytes) of a monitored path")
+    _t("cr_disk_total_bytes", "Disk total (bytes) of a monitored path (fs quota)")
+    for path, mnt in (("/var/lib/report-server/daily", "daily"),):
+        if not os.path.isdir(path):
+            continue
+        rc, out = _q(f"du -s -B1 '{path}' 2>/dev/null", timeout=30)
+        used = _tonum(out.split()[0]) if out else 0
+        g("cr_disk_usage_bytes", used, {"path": path, "mount": mnt})
+        # fs total via node-exporter is elsewhere; here we just mark usage. We
+        # set total to 0 (unknown) and let the dashboard derive from node fs.
+
+
+def collect_review_failed():
+    """C: per-topic review failure counter — emits 1 for each failed review attempt so
+    Grafana can rate() to show error trend."""
+    _t("cr_review_failed_total", "Cumulative failed review attempts per topic")
+    try:
+        d = json.load(open(STATE_FILE_HOST, encoding="utf-8"))
+        for k, t in d.get("topics", {}).items():
+            topic_id = (k or "")[:44]
+            rc = int(t.get("retry_count") or 0)
+            if t.get("phase") == "FAILED" and rc > 0:
+                g("cr_review_failed_total", rc, {"topic": topic_id})
+    except Exception as e:
+        print(f"[monitor] collect_review_failed err: {e}", file=sys.stderr)
+
 def collect_gitlab_probe():
     """Best-effort GitLab reachability probe (0/1); sets integration health."""
     _t("cr_gitlab_reachable", "GitLab API reachable (1) or not (0)")
@@ -263,6 +381,11 @@ def main():
     collect_locks()
     collect_workspace_sizes(cache)
     collect_topic_resources(cache)   # ② 逐话题资源明细
+    collect_topic_detail()           # C: severity/changed/age/duration 业务层
+    collect_action_counters()        # C: 改码/确认/关闭 审计动作计数
+    collect_heartbeat_freshness()    # C: bot 心跳新鲜度
+    collect_disk_usage()             # C: daily 卷磁盘占用
+    collect_review_failed()          # C: review 失败计数
     collect_gitlab_probe()
     body = "\n".join(M) + "\n"
     # atomic write
