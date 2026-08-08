@@ -50,3 +50,13 @@ def test_mention_placeholder_vs_keyword_boundary():
     # A real user id is stripped entirely; a command keyword is preserved.
     assert _strip_mention("@ou_55bca7b7dae982e96749bd84f57c21e8 指引") == "指引"
     assert _strip_mention("@_user_1 状态") == "状态"
+
+
+def test_auth_git_env_has_askpass(monkeypatch):
+    from orchestrate import _auth_git_env
+    monkeypatch.setattr("orchestrate._env", lambda k, d="": {"GITLAB_TOKEN": "tok-x", "GITLAB_USER": "ci"}.get(k, d))
+    env = _auth_git_env({"LC_ALL": "C"})
+    assert env.get("GIT_ASKPASS"), "must set GIT_ASKPASS via askpass"
+    assert env.get("CR_GITLAB_TOKEN") == "tok-x"
+    assert env.get("GIT_TERMINAL_PROMPT") == "0"
+    assert env.get("LC_ALL") == "C"

@@ -1126,6 +1126,22 @@ def _checkout_lock(repo_name, lock_dir=None):
     return pipeline_state.topic_lock_context(lock_dir, f"checkout_{key}")
 
 
+def _auth_git_env(extra=None):
+    """Build a git subprocess env that can AUTHENTICATE via git_askpass (GITLAB_TOKEN
+    delivered through env, never on argv/URL). Use for ANY git read/write that may
+    need to hit GitLab (commit/push/fetch), matching _ensure_checkout's clone auth.
+    Without this, a push with only GIT_TERMINAL_PROMPT=0 fails with "could not read
+    Username ... terminal prompts disabled"."""
+    import os as _os
+    askpass = _os.path.join(SCRIPTS_DIR, "git_askpass.sh")
+    env = dict(_os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=askpass,
+               CR_GITLAB_USER=_env("GITLAB_USER", "gitlab-ci-token"),
+               CR_GITLAB_TOKEN=_env("GITLAB_TOKEN"))
+    if isinstance(extra, dict):
+        env.update(extra)
+    return env
+
+
 def _ensure_checkout(topic, workspace):
     """Clone (or reuse) the topic's review branch to a deterministic checkout dir in
     workspace. Returns (checkout_dir, err) or (None, err). Authenticates via the
@@ -1544,7 +1560,7 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
     # process reset the tree (nothing-to-commit), re-apply the stored diffs. git's
     # "nothing to commit" message goes to STDOUT and is locale-dependent, so force
     # LC_ALL=C and match on output, not stderr.
-    _git_env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0")
+    _git_env = _auth_git_env({"LC_ALL": "C"})
     # Ensure a git identity exists in this checkout so `git commit` does not fail
     # with "Author identity unknown" on a fresh container without global git config.
     _sp.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
@@ -2225,7 +2241,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             _proc_reply(key, topic, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。", render, state_file, app_id, app_secret)
             return False, f"agent_edit_confirm: protected branch {branch}"
         import subprocess as _sp2
-        _git_env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0")
+        _git_env = _auth_git_env({"LC_ALL": "C"})
         checkout, err = _ensure_checkout(topic, workspace)
         if err:
             pipeline_state.clear_pending(state_file, key)
