@@ -1,221 +1,839 @@
 {
-  "annotations": {"list": []},
+  "annotations": {
+    "list": []
+  },
   "editable": true,
   "graphTooltip": 1,
   "id": null,
   "title": "CodeReview Server — Real-time Resource Panorama",
   "uid": "cr-monitor-main",
   "version": 1,
-  "tags": ["codereview", "ops"],
+  "tags": [
+    "codereview",
+    "ops"
+  ],
   "timezone": "browser",
-  "time": {"from": "now-15m", "to": "now"},
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
   "refresh": "10s",
   "panels": [
+    {
+      "id": 1000,
+      "title": "资源释放建议：关话题释放 独享 vs 共享",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": ""
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decbytes",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "custom": {
+            "displayMode": "list"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(cr_repo_resources{kind=\"releasable\"})",
+          "refId": "fast",
+          "legendFormat": "快速可释放(关OPEN话题即得,独享result)"
+        },
+        {
+          "expr": "sum(cr_repo_resources{kind=\"checkout\"})/1e9 + sum(cr_repo_resources{kind=\"review\"})/1e9",
+          "refId": "slow",
+          "legendFormat": "需cleanup释放(共享checkout+review,整项目关)"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 1001,
+      "title": "项目级资源 (按 repo) — 哪些项目的资源、由几个OPEN话题共享",
+      "type": "table",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": ""
+      },
+      "targets": [
+        {
+          "expr": "cr_repo_resources{kind=\"checkout\"}/1e9",
+          "refId": "checkout",
+          "legendFormat": "{{repo}}·checkout(GB)"
+        },
+        {
+          "expr": "cr_repo_resources{kind=\"review\"}/1e9",
+          "refId": "review",
+          "legendFormat": "{{repo}}·review(GB)"
+        },
+        {
+          "expr": "cr_repo_resources{kind=\"open_topics\"}",
+          "refId": "open",
+          "legendFormat": "{{repo}}·OPEN话题"
+        },
+        {
+          "expr": "cr_repo_resources{kind=\"releasable\"}",
+          "refId": "rel",
+          "legendFormat": "{{repo}}·可释放(独享)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "filterable": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
     {
       "id": 100,
       "title": "Bot / Watchdog",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
-      "datasource": {"type": "prometheus", "uid": ""},
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": ""
+      },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
-            "mode": "absolute", "steps": [
-              {"color": "green", "value": 1}, {"color": "red", "value": 0.5}
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
             ]
           },
           "mappings": [
-            {"type": "value", "options": {"1": {"text": "UP", "color": "green"}, "0": {"text": "DOWN", "color": "red"}}}
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                },
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                }
+              }
+            }
           ]
         }
       },
       "targets": [
-        {"expr": "cr_proc_bot", "refId": "A"},
-        {"expr": "cr_proc_watchdog", "refId": "B"}
+        {
+          "expr": "cr_proc_bot",
+          "refId": "A"
+        },
+        {
+          "expr": "cr_proc_watchdog",
+          "refId": "B"
+        }
       ],
-      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+      "options": {
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 101,
       "title": "Open Topics & Pending",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
-      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 10}]}}},
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
       "targets": [
-        {"expr": "cr_open_topics_total", "refId": "A"},
-        {"expr": "cr_pending_actions", "refId": "B"}
+        {
+          "expr": "cr_open_topics_total",
+          "refId": "A"
+        },
+        {
+          "expr": "cr_pending_actions",
+          "refId": "B"
+        }
       ],
-      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+      "options": {
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 102,
       "title": "Reviews In Flight / Lock Files",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 20
+      },
       "targets": [
-        {"expr": "cr_proc_reviewers", "refId": "A", "legendFormat": "in-flight"},
-        {"expr": "cr_locks_total", "refId": "B", "legendFormat": "lock-files"}
+        {
+          "expr": "cr_proc_reviewers",
+          "refId": "A",
+          "legendFormat": "in-flight"
+        },
+        {
+          "expr": "cr_locks_total",
+          "refId": "B",
+          "legendFormat": "lock-files"
+        }
       ],
-      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+      "options": {
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 103,
       "title": "GitLab Reachable",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
-      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"1": {"text": "OK", "color": "green"}, "0": {"text": "DOWN", "color": "red"}}}], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": 1}, {"color": "red", "value": 0.5}]}}},
-      "targets": [{"expr": "cr_gitlab_reachable", "refId": "A"}],
-      "options": {"orientation": "horizontal", "colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "OK",
+                  "color": "green"
+                },
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "cr_gitlab_reachable",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 104,
       "title": "Topic Phase Distribution",
       "type": "piechart",
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 4},
-      "targets": [{"expr": "sum by (phase) (cr_topic_by_phase)", "refId": "A"}],
-      "fieldConfig": {"defaults": {"mappings": []}},
-      "options": {"displayLabels": ["name", "value"], "reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase) (cr_topic_by_phase)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        }
+      },
+      "options": {
+        "displayLabels": [
+          "name",
+          "value"
+        ],
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      }
     },
     {
       "id": 105,
       "title": "Checkout / Workspace Size (GB)",
       "type": "barchart",
-      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 4},
-      "targets": [{"expr": "cr_checkout_size_bytes / 1e9", "refId": "A", "legendFormat": "{{path}}"}],
-      "fieldConfig": {"defaults": {"unit": "deciGbytes", "noValue": "0"}},
-      "options": {"orientation": "auto"}
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 26
+      },
+      "targets": [
+        {
+          "expr": "cr_checkout_size_bytes / 1e9",
+          "refId": "A",
+          "legendFormat": "{{path}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "deciGbytes",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "orientation": "auto"
+      }
     },
     {
       "id": 106,
       "title": "Reviews In Flight (proc)",
       "type": "graph",
-      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 4},
-      "targets": [{"expr": "cr_proc_reviewers", "refId": "A"}],
-      "fieldConfig": {"defaults": {}},
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 26
+      },
+      "targets": [
+        {
+          "expr": "cr_proc_reviewers",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {}
+      },
       "options": {}
     },
     {
       "id": 107,
-      "title": "逐话题资源占用 (本地路径 + 大小)",
+      "title": "逐话题独享资源 (关此话题即可释放: result文件+时长)",
       "type": "table",
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 10},
-      "datasource": {"type": "prometheus", "uid": ""},
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": ""
+      },
       "targets": [
-        {"expr": "cr_topic_checkout_size_bytes", "refId": "checkout", "legendFormat": "{{topic}}" },
-        {"expr": "cr_topic_review_size_bytes", "refId": "review", "legendFormat": "{{topic}}" },
-        {"expr": "cr_topic_result_size_bytes", "refId": "result", "legendFormat": "{{topic}}" }
+        {
+          "expr": "cr_topic_result_size_bytes",
+          "refId": "res",
+          "legendFormat": "{{topic}}·result"
+        },
+        {
+          "expr": "cr_topic_age_seconds/86400",
+          "refId": "age",
+          "legendFormat": "{{topic}}·age(d)"
+        },
+        {
+          "expr": "cr_topic_severity_total",
+          "refId": "sev",
+          "legendFormat": "{{topic}}·{{sev}}"
+        }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
-          "custom": {"filterable": false},
-          "thresholds": {"mode": "absolute", "steps": [{"color": "text"}]}
+          "unit": "short",
+          "custom": {
+            "filterable": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text"
+              }
+            ]
+          }
         },
-        "overrides": [
-          {"matcher": {"id": "byName", "options": "Topic"}, "properties": [{"id": "custom.width", "value": 200}]},
-          {"matcher": {"id": "byName", "options": "Repo"}, "properties": [{"id": "displayName"}]}
-        ]
+        "overrides": []
       },
-      "options": {"showHeader": true}
+      "options": {
+        "showHeader": true
+      }
     },
     {
       "id": 108,
       "title": "趋势: Bot 心跳 / Reviewers 并发 (time)",
       "type": "timeseries",
-      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 18},
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}, "thresholds": {"mode": "absolute", "steps": [{"color": "green"}]}}},
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        }
+      },
       "targets": [
-        {"expr": "cr_proc_bot", "refId": "A", "legendFormat": "bot"},
-        {"expr": "cr_proc_reviewers", "refId": "B", "legendFormat": "reviewers"}
+        {
+          "expr": "cr_proc_bot",
+          "refId": "A",
+          "legendFormat": "bot"
+        },
+        {
+          "expr": "cr_proc_reviewers",
+          "refId": "B",
+          "legendFormat": "reviewers"
+        }
       ]
     },
     {
       "id": 109,
       "title": "趋势: Open Topics / Pending / Concurrency (time)",
       "type": "timeseries",
-      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 18},
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}, "thresholds": {"mode": "absolute", "steps": [{"color": "green"}]}}},
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        }
+      },
       "targets": [
-        {"expr": "cr_open_topics_total", "refId": "A", "legendFormat": "open_topics"},
-        {"expr": "cr_pending_actions", "refId": "B", "legendFormat": "pending"},
-        {"expr": "cr_proc_reviewers", "refId": "C", "legendFormat": "reviews_in_flight"}
+        {
+          "expr": "cr_open_topics_total",
+          "refId": "A",
+          "legendFormat": "open_topics"
+        },
+        {
+          "expr": "cr_pending_actions",
+          "refId": "B",
+          "legendFormat": "pending"
+        },
+        {
+          "expr": "cr_proc_reviewers",
+          "refId": "C",
+          "legendFormat": "reviews_in_flight"
+        }
       ]
     },
     {
       "id": 200,
       "title": "宿主机 Host: CPU / Mem / Load (非容器)",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 24},
-      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "percentunit"}},
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "percentunit"
+        }
+      },
       "targets": [
-        {"expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", "refId": "CPU", "legendFormat": "CPU(宿主机)"},
-        {"expr": "node_memory_Active_bytes / node_memory_MemTotal_bytes", "refId": "MEM", "legendFormat": "Mem(宿主机)"},
-        {"expr": "node_load1", "refId": "LOAD", "legendFormat": "Load1(宿主机)"}
+        {
+          "expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))",
+          "refId": "CPU",
+          "legendFormat": "CPU(宿主机)"
+        },
+        {
+          "expr": "node_memory_Active_bytes / node_memory_MemTotal_bytes",
+          "refId": "MEM",
+          "legendFormat": "Mem(宿主机)"
+        },
+        {
+          "expr": "node_load1",
+          "refId": "LOAD",
+          "legendFormat": "Load1(宿主机)"
+        }
       ],
-      "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"]}}
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 201,
       "title": "Host: Disk Usage (GB)",
       "type": "timeseries",
-      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 24},
-      "fieldConfig": {"defaults": {"unit": "decgbytes"}},
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decgbytes"
+        }
+      },
       "targets": [
-        {"expr": "cr_disk_usage_bytes / 1e9", "refId": "A", "legendFormat": "daily-volume"}
+        {
+          "expr": "cr_disk_usage_bytes / 1e9",
+          "refId": "A",
+          "legendFormat": "daily-volume"
+        }
       ]
     },
     {
       "id": 202,
       "title": "Bot Heartbeat Freshness (s)",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 28},
-      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 300}, {"color": "red", "value": 900}]}}},
-      "targets": [{"expr": "cr_bot_last_log_age_seconds", "refId": "A"}],
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "red",
+                "value": 900
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "cr_bot_last_log_age_seconds",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 203,
       "title": "Failed Reviews (total, per topic)",
       "type": "stat",
-      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 28},
-      "targets": [{"expr": "sum(cr_review_failed_total)", "refId": "A"}],
-      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}},
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 42
+      },
+      "targets": [
+        {
+          "expr": "sum(cr_review_failed_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 204,
       "title": "Actions (改码/确认/关闭/重审) total",
       "type": "timeseries",
-      "gridPos": {"h": 5, "w": 8, "x": 12, "y": 28},
-      "targets": [{"expr": "sum by (action) (cr_actions_total)", "refId": "A"}],
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "fillOpacity": 40}}}
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 12,
+        "y": 42
+      },
+      "targets": [
+        {
+          "expr": "sum by (action) (cr_actions_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 40
+          }
+        }
+      }
     },
     {
       "id": 205,
       "title": "Review Duration (s, 0=缓存复用) / Changed Files per Topic",
       "type": "timeseries",
-      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 32},
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 47
+      },
       "targets": [
-        {"expr": "cr_review_duration_seconds", "refId": "DUR", "legendFormat": "dur {{topic}}"},
-        {"expr": "cr_topic_changed_files", "refId": "FILES", "legendFormat": "files {{topic}}"}
+        {
+          "expr": "cr_review_duration_seconds",
+          "refId": "DUR",
+          "legendFormat": "dur {{topic}}"
+        },
+        {
+          "expr": "cr_topic_changed_files",
+          "refId": "FILES",
+          "legendFormat": "files {{topic}}"
+        }
       ]
     },
     {
       "id": 206,
       "title": "Topic Age (s) — oldest topics drift right",
       "type": "barchart",
-      "gridPos": {"h": 5, "w": 8, "x": 8, "y": 32},
-      "targets": [{"expr": "cr_topic_age_seconds", "refId": "A", "legendFormat": "{{topic}}"}]
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 47
+      },
+      "targets": [
+        {
+          "expr": "cr_topic_age_seconds",
+          "refId": "A",
+          "legendFormat": "{{topic}}"
+        }
+      ]
     },
     {
       "id": 207,
       "title": "Findings by Severity per Topic",
       "type": "table",
-      "gridPos": {"h": 5, "w": 8, "x": 16, "y": 32},
-      "targets": [{"expr": "sum by (topic, sev) (cr_topic_severity_total)", "refId": "A", "legendFormat": "{{topic}}={{sev}}"}],
-      "fieldConfig": {"defaults": {"unit": "short", "custom": {"filterable": false}, "thresholds": {"mode": "absolute", "steps": [{"color": "text"}]}}},
-      "options": {"showHeader": true}
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 47
+      },
+      "targets": [
+        {
+          "expr": "sum by (topic, sev) (cr_topic_severity_total)",
+          "refId": "A",
+          "legendFormat": "{{topic}}={{sev}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "filterable": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text"
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "showHeader": true
+      }
     }
   ],
   "templating": {
@@ -224,8 +842,14 @@
         "name": "topic",
         "label": "Topic",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": ""},
-        "query": {"query": "label_values(cr_topic_severity_total, topic)", "refId": "A"},
+        "datasource": {
+          "type": "prometheus",
+          "uid": ""
+        },
+        "query": {
+          "query": "label_values(cr_topic_severity_total, topic)",
+          "refId": "A"
+        },
         "sort": 1,
         "includeAll": true,
         "multi": true,
@@ -235,8 +859,14 @@
         "name": "phase",
         "label": "Phase",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": ""},
-        "query": {"query": "label_values(cr_topic_by_phase, phase)", "refId": "A"},
+        "datasource": {
+          "type": "prometheus",
+          "uid": ""
+        },
+        "query": {
+          "query": "label_values(cr_topic_by_phase, phase)",
+          "refId": "A"
+        },
         "sort": 1,
         "includeAll": true,
         "refresh": 2

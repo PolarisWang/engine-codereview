@@ -422,6 +422,42 @@ def collect_review_failed():
     except Exception as e:
         print(f"[monitor] collect_review_failed err: {e}", file=sys.stderr)
 
+
+def collect_repo_resources(cache):
+    """方案C: per-repo resource relation — so the dashboard can answer "this repo
+    holds 7.88G shared checkout + 6.17G review, used by N OPEN topics; closing them
+    releases only the small per-topic result files (releasable), NOT the shared
+    checkout (which needs the whole repo's topics closed + a cleanup run)."""
+    _t("cr_repo_resources", "Per-repo resource by kind (checkout/review/open_topics/releasable)")
+    sizes = cache.get("sizes", {})       # {dirname: bytes} from du (coarse cache)
+    repo_open = {}                       # repo -> count of OPEN topics
+    repo_releasable = {}                 # repo -> sum of OPEN topics' result-file bytes
+    try:
+        d = _read_state()
+        for k, t in (d.get("topics") or {}).items():
+            if t.get("phase") == "CLOSED":
+                continue
+            repo = _repo_name_from_topic(t)
+            if not repo:
+                continue
+            repo_open[repo] = repo_open.get(repo, 0) + 1
+            for rf in ("engine", "game"):
+                p = os.path.join(WORKSPACE, f"result_{k}_{rf}.json")
+                try:
+                    if os.path.isfile(p):
+                        repo_releasable[repo] = repo_releasable.get(repo, 0) + os.path.getsize(p)
+                except OSError:
+                    pass
+    except Exception as e:
+        print(f"[monitor] collect_repo_resources agg err: {e}", file=sys.stderr)
+    # One series per repo per kind.
+    for repo, n in repo_open.items():
+        g("cr_repo_resources", sizes.get(repo, 0), {"repo": repo, "kind": "checkout"})
+        g("cr_repo_resources", sizes.get(repo + "-review", 0), {"repo": repo, "kind": "review"})
+        g("cr_repo_resources", n, {"repo": repo, "kind": "open_topics"})
+        g("cr_repo_resources", repo_releasable.get(repo, 0), {"repo": repo, "kind": "releasable"})
+
+
 def collect_gitlab_probe():
     """Best-effort GitLab reachability probe (0/1); sets integration health."""
     _t("cr_gitlab_reachable", "GitLab API reachable (1) or not (0)")
@@ -442,6 +478,7 @@ def main():
     collect_locks()
     collect_workspace_sizes(cache)
     collect_topic_resources(cache)   # ② 逐话题资源明细
+    collect_repo_resources(cache)    # 方案C: repo 维度资源 + OPEN 话题关联
     collect_topic_detail()           # C: severity/changed/age/duration 业务层
     collect_action_counters()        # C: 改码/确认/关闭 审计动作计数
     collect_heartbeat_freshness()    # C: bot 心跳新鲜度
