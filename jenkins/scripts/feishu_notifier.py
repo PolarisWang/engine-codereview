@@ -437,6 +437,62 @@ def build_summary_text(issue_key, project, review_branch, base_branch, jira_url,
     return summary
 
 
+def render_full_findings_text(issue_key, project, review_branch, base_branch, jira_url, mr_url,
+                              engine_result, game_result):
+    """Render the FULL review as plain-text messages (普通文字消息, 不折叠、不截断).
+
+    需求: review 内容非常重要，必须完整展示。返回一个 chunk 列表，每个 chunk 是一条
+    普通文字消息(按 severity 分组: 结论 → Critical → Warning → Suggestion)。
+    调用方用 reply-message 逐条发送。
+    """
+    def _sev_l(f):
+        s = (f.get("severity") or "").strip().lower()
+        return 0 if s in ("critical", "high", "error", "blocker") else (1 if s in ("warning", "warn", "minor") else 2)
+    def _find(res):
+        return ((res or {}).get("review") or {}).get("findings") or []
+    allf = _find(engine_result) + _find(game_result)
+    # 按 repo 标注来源(engine/game), 便于区分
+    engg = {(id(f), f): 'engine' for f in _find(engine_result)}
+    gamg = {(id(f), f): 'game' for f in _find(game_result)}
+
+    ec = ((engine_result or {}).get("review") or {}).get("severity_counts") or {}
+    gc = ((game_result or {}).get("review") or {}).get("severity_counts") or {}
+    total_c = (ec.get("critical") or 0) + (gc.get("critical") or 0)
+    total_w = (ec.get("warning") or 0) + (gc.get("warning") or 0)
+    total_i = (ec.get("suggestion") or 0) + (gc.get("suggestion") or 0)
+
+    header = f"**🔍 {issue_key}** · 审查结果："
+    if total_c: header += f"**{total_c} 个 Critical** / "
+    header += f"{total_w} 个 Warning / {total_i} 个 Suggestion"
+    if mr_url: header += f"\nMR：{mr_url}"
+    header += f"\n分支：`{review_branch}` → `{base_branch}`"
+    if jira_url: header += f"\n📎 {jira_url}"
+
+    # 排序: critical → warning → suggestion; 每条含 repo 来源。
+    allf_sorted = sorted(allf, key=_sev_l)
+    groups = {"critical": [], "warning": [], "suggestion": []}
+    for f in allf_sorted:
+        key = _sev_l(f)
+        grp = "critical" if key == 0 else ("warning" if key == 1 else "suggestion")
+        repo = 'engine' if (id(f), f) in engg else ('game' if (id(f), f) in gamg else '?')
+        file = f.get("file") or f.get("path") or "?"
+        issue = (f.get("issue") or "").strip()
+        groups[grp].append(f"{_sev_mark(f.get('severity'))} `{file}` [{repo}]\n  {issue}\n {f.get('suggestion') or ''}\n")
+
+    chunks = [header + "\n"]
+    label = {"critical": "🔴 **Critical 发现**", "warning": "🟡 **Warning 发现**", "suggestion": "ℹ️ **Suggestion 建议**"}
+    for grp in ("critical", "warning", "suggestion"):
+        items = groups[grp]
+        if not items:
+            continue
+        body = f"\n\n---\n{label[grp]}({len(items)})\n\n" + "\n".join(items)
+        chunks.append(body)
+    # 去掉空结论
+    if not allf:
+        chunks[0] += "\n✅ 未发现需要处理的代码问题。"
+    return chunks
+
+
 def cmd_render_summary(args):
     """Render the final review summary markdown from result JSON files."""
     engine = _parse_file(getattr(args, "engine_file", None))

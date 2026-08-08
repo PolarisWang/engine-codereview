@@ -358,27 +358,31 @@ def run(args):
     _log('REPO', 'DONE', key, issue_key, project, '', 'repo states recorded')
     _update_state_card(state_file, app_id, app_secret, key)
 
-    # 5. Render + send final summary.
+    # 5. Render + send final summary as PLAIN-TEXT messages (普通文字消息, 全量不折叠).
     pipeline_state.transition(state_file, key, to="NOTIFYING", status="RUNNING")
     _log('NOTIFY', 'RUNNING', key, issue_key, project, '', 'sending final summary')
-    summary = feishu_notifier.build_summary_text(
+    chunks = feishu_notifier.render_full_findings_text(
         issue_key, project, review_branch, base_branch, jira_url, mr_url,
         eng_res or {}, gam_res or {},
     )
-    # Append a text interaction hint so users know they can reply to this topic
-    # to select a fix / re-review / ask a follow-up (real-time event server routes it).
-    summary = _append_fix_options(summary, review_branch)
+    # 合并成一个完整 review 文本(普通文字消息可较长, 飞书不折叠); 若仍超长, 拆多段逐条发。
+    full_text = "\n\n".join(c for c in chunks if c).rstrip()
+    # 每条普通消息拆 <= ~3000 字符, 多段顺序发, 保证完整、不截断、覆盖之前结果。
+    segs = _split_text(full_text, 3000)
+    # 记录渲染后的完整 review(供 ci-poll 追加, 不覆盖 findings)
+    pipeline_state.set_topic_fields(state_file, key, review_summary=full_text)
     if reply_msg_id:
-        # Persist the rendered review summary so later card refreshes (e.g. ci-poll)
-        # can append CI status WITHOUT wiping the findings.
-        pipeline_state.set_topic_fields(state_file, key, review_summary=summary)
-        rc, _, err = _run_py("feishu_notifier.py", [
-            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", reply_msg_id, "--message-base64", _b64_str(summary)])
-        if rc != 0:
-            topic_after = pipeline_state.record_failure(state_file, key, f"update-reply failed: {err}")
+        rc_all = 0
+        for seg in segs:
+            rc, _, err = _run_py("feishu_notifier.py", [
+                "reply-message", "--app-id", app_id, "--app-secret", app_secret,
+                "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(seg)])
+            if rc != 0:
+                rc_all = rc
+                _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'reply-message failed: {err}')
+        if rc_all != 0:
+            topic_after = pipeline_state.record_failure(state_file, key, "reply-message failed")
             _alert_if_exhausted(state_file, topic_after, app_id, app_secret)
-            _log('NOTIFY', 'FAILED', key, issue_key, project, '', 'final update-reply failed')
             return 1
         pipeline_state.transition(state_file, key, to="DONE", status="SUCCESS")
         _log('DONE', 'SUCCESS', key, issue_key, project, '', 'review complete')
@@ -393,6 +397,32 @@ def run(args):
 def _b64_str(s):
     import base64
     return base64.b64encode(s.encode("utf-8")).decode("utf-8")
+
+
+def _split_text(text, max_chars=3000):
+    """Split long plain-text into ≤max_chars segments on line boundaries, so each
+    Feishu plain-text message is fully delivered without truncation (review 全量展示).
+    Preserves content; never drops or truncates findings."""
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    parts = []
+    lines = text.split("\n")
+    cur = ""
+    for line in lines:
+        if cur and len(cur) + len(line) + 1 > max_chars:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+        # handle a single over-long line (unlikely) by hard-cut
+        while len(cur) > max_chars:
+            parts.append(cur[:max_chars])
+            cur = cur[max_chars:]
+    if cur:
+        parts.append(cur)
+    return parts
 
 
 def _extract_msg_id(stdout, rc):
@@ -628,7 +658,7 @@ _COMMAND_FIRST_WORDS = {
     "mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单",
     "预览", "预览补丁", "patch预览",
     "指引", "修改指引", "怎么改",
-    "改码", "自动修改", "自动修复", "autofix", "改码并提交",
+    "改码", "自动修改", "自动修复", "autofix", "改码并提交", "优化", "自动优化", "优化代码",
     "应用并提交", "确认提交", "push并建mr",
     "状态", "/状态", "status",
 }
@@ -665,7 +695,7 @@ def _strip_mention(text):
 # read-only assistant, and we guide the user to the exact fixed command instead.
 # Phrases (not single chars) keep false-positives low (e.g. "逻辑该不该改" won't trigger).
 _OPERATION_WORDS = [
-    "确认", "push", "推送", "提交", "合并", "merge", "关闭", "改码", "自动修复",
+    "确认", "push", "推送", "提交", "合并", "merge", "关闭", "改码", "自动修复", "优化", "自动优化",
     "重审", "重新审查", "生成mr", "建mr", "更新mr", "应用", "apply", "commit", "建立mr",
 ]
 
@@ -831,6 +861,10 @@ def interact(args):
         text = _generate_fix_guidance(topic, all_findings, api_key, base_url, model, workspace)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
+    if word in ("优化", "自动优化", "优化代码", "优化并提交"):
+        # 全自动: 改码→自动 push→创建/更新 MR (无需手动确认)
+        return _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
+                             app_id, app_secret, actor)
     if word in ("改码", "自动修改", "自动修复", "autofix", "改码并提交"):
         return _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
                               app_id, app_secret, actor)
@@ -850,7 +884,7 @@ def interact(args):
     # doing it). Guide them to the exact fixed command instead.
     if _looks_like_operation(_strip_mention(low)):
         hint = ("🤖 **仅审查答疑**——我不会执行推送/合并/关闭/改码等操作，请用精确命令：\n"
-                "  - `改码` + 之后 `@确认提交并建mr`：自动改码并推送修复分支、创建 MR\n"
+                "  - `优化`：自动修复关键问题，推送修复分支并创建/更新 MR\n"
                 "  - `关闭` 或 `4`：关闭话题\n"
                 "  - `MR单` / `指引` / `2`：MR 描述 / 修改指引 / 重新审查\n"
                 "  - 若只是想问关于 review 的问题，直接提问即可（我会解答）。")
@@ -1520,6 +1554,33 @@ def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
                 "⏳ 已记录自动改码，Jenkins 将稍后调用 AI 修改代码并展示 diff 待你确认。\n"
                 "（结果可能延迟到下一轮扫描；完成后回复 `@确认 提交并建mr` 推送并建 MR，`@撤销` 取消。）",
                 render_id, state_file, app_id, app_secret, intent="自动改码（改码→staged→待确认）")
+    return 0
+
+
+def _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
+                  app_id, app_secret, actor=""):
+    """指令 `优化`: 全自动修复 —— 改码 staged 后自动 push + 创建/更新 MR，无需手动确认。
+    仅 owner 触发；用 close 托底清理。
+
+    与 `改码`(手动) 的区别: 设 topic.auto_confirm=True, consume 改码完成后自动入队
+    agent_edit_confirm(commit+push+建/更新MR)。"""
+    ok, why = _approve(key, topic, actor, "auto_edit")
+    if not ok:
+        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret,
+                    intent="优化（全自动修复并建 MR）", prefix="🛑")
+        return 0
+    if not _find_claude():
+        _proc_reply(key, topic,
+                    "⚠️ 无法执行优化：未在本机找到 claude CLI（自动修复需 `claude` 可执行）。",
+                    render_id, state_file, app_id, app_secret, intent="优化")
+        return 0
+    pipeline_state.set_topic_fields(state_file, key, auto_confirm=True)
+    pipeline_state.set_pending(state_file, key, "agent_edit", patch={"actor": actor})
+    pipeline_state.append_approval(state_file, key, actor, "auto_edit", "", "ok", "@优化 enqueued(auto)")
+    _proc_reply(key, topic,
+                "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。\n"
+                "（结果可能延迟到下一轮扫描；再次 `优化` 会更新已有 MR，无需单独重申。）",
+                render_id, state_file, app_id, app_secret, intent="优化：改码→自动推送→创建/更新MR")
     return 0
 
 
@@ -2214,6 +2275,16 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "ok",
                                        f"staged {len(ok_diffs)} files")
         pipeline_state.clear_pending(state_file, key)
+        # 优化 全自动: 若用户触发的是 `优化`(auto_confirm=True), 自动入队确认(commit+push+建/更新MR),
+        # 无需手动 `@确认`。否则(手动 `改码`)仍展示待确认。
+        if topic.get("auto_confirm"):
+            pipeline_state.set_topic_fields(state_file, key, auto_confirm=False)
+            pipeline_state.set_pending(state_file, key, "agent_edit_confirm",
+                                       patch={"actor": act, "branch": branch})
+            _proc_reply(key, topic,
+                        f"⏳ 已自动优化 {len(ok_diffs)} 个文件，正在推送修复分支并创建/更新 MR…",
+                        render, state_file, app_id, app_secret, intent="优化：改码→自动推送→创建/更新MR")
+            return True, f"agent_edit: staged {len(ok_diffs)} files; auto-confirm enqueued"
         lines = [f"## ⚠️ 自动改码完成，请确认\n",
                  f"将修复推送到**新分支** `{branch}`（不覆盖原始 `{topic.get('review_branch') or ''}`），"
                  f"确认后自动创建修复 MR。\n"]
