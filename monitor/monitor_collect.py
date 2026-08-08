@@ -142,18 +142,33 @@ def collect_processes():
 
 
 def collect_locks():
-    """cr-locks inventory: count files + whether review_slot_* are busy."""
+    """cr-locks inventory: count files + REAL review_slot_* flock occupancy."""
     _t("cr_locks_total", "Lock files present in cr-locks dir")
-    _t("cr_review_slots_held", "Review concurrency slots currently held (<= MAX_CONCURRENT_REVIEWS)")
+    _t("cr_review_slots_held", "Review concurrency slots currently flock-HELD (0..MAX), not file count")
+    import fcntl  # local to avoid top-level import clutter
     try:
         if os.path.isdir(LOCK_DIR):
             files = os.listdir(LOCK_DIR)
             g("cr_locks_total", len(files))
             slots = [f for f in files if f.startswith("review_slot_")]
-            # A slot is "held" if flock is locked. We approximate via whether it's
-            # currently written; precise flock-state is hard cross-process, so we
-            # count slots as held if a review subprocess is present elsewhere.
-            g("cr_review_slots_held", len(slots))
+            # Real occupancy: try to take a non-blocking shared flock on each slot
+            # file. If it fails (BlockingIOError) another process holds it => busy.
+            # This is the true concurrency in use, not a count of files on disk.
+            held = 0
+            for name in slots:
+                p = os.path.join(LOCK_DIR, name)
+                try:
+                    h = open(p, "a+")
+                    try:
+                        fcntl.flock(h.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(h.fileno(), fcntl.LOCK_UN)  # we just probed; release
+                    except BlockingIOError:
+                        held += 1
+                    finally:
+                        h.close()
+                except Exception:
+                    continue
+            g("cr_review_slots_held", held)
         else:
             g("cr_locks_total", -1)
             g("cr_review_slots_held", -1)
@@ -302,15 +317,33 @@ def collect_action_counters():
 
 
 def collect_heartbeat_freshness():
-    """C: bot heartbeat 'freshness' — age of the newest event-server log. If the bot
-    is healthy it writes logs periodically; when alive but silent too long, this grows
-    and signals a possible hang (complement to the process-presence probe)."""
-    _t("cr_bot_last_log_age_seconds", "Age (s) of the newest event-server log file")
+    """C: bot heartbeat 'freshness' — age of the newest event-server log INSIDE the
+    container. The container's /tmp (ev-server-logs) is NOT a host bind, so a host
+    filesystem scan can't see it and would report a long-stale value even when the
+    bot is healthy (false "bot dead" alert). We read it via `docker exec`, which the
+    deploy host has. Falls back to a host-side scan only if exec fails."""
+    _t("cr_bot_last_log_age_seconds", "Age (s) of the newest event-server log file (container)")
+    now = time.time()
+    log_age = None
     try:
-        # locate the newest ev-server-*.log inside the container (host sees it via bind?)
-        # Fall back to scanning the shared workspace dir for recent logs.
+        # Ask the container for the newest ev-server log and its mtime.
+        rc, out = _q(
+            "docker exec chaos-agent-cr sh -c "
+            "'f=$(ls -t /tmp/ev-server-logs/ev-server-*.log 2>/dev/null | head -1); "
+            "[ -n \"$f\" ] && echo \"$(stat -c %Y \"$f\")\"'",
+            timeout=10,
+        )
+        if rc == 0 and out:
+            mtime = _tonum(out)
+            if mtime > 0:
+                log_age = now - mtime
+    except Exception as e:
+        print(f"[monitor] heartbeat exec err: {e}", file=sys.stderr)
+    if log_age is None:
+        # Fallback: host-side scan (works if the container shares /var/lib/report-server
+        # via bind, but NOT /tmp/ev-server-logs — so this is a best-effort).
         best = None
-        for base in ("/var/lib/report-server/daily/cr-workspace", "/tmp"):
+        for base in ("/var/lib/report-server/daily/cr-workspace",):
             try:
                 if not os.path.isdir(base):
                     continue
@@ -326,11 +359,13 @@ def collect_heartbeat_freshness():
             except Exception:
                 continue
         if best:
-            g("cr_bot_last_log_age_seconds", time.time() - best[1])
-        else:
-            g("cr_bot_last_log_age_seconds", -1)
-    except Exception as e:
-        print(f"[monitor] collect_heartbeat_freshness err: {e}", file=sys.stderr)
+            log_age = now - best[1]
+    # If we truly cannot determine freshness, emit -1 only if the bot process is also
+    # absent; otherwise emit a sentinel that won't trigger a false "dead" alert.
+    if log_age is not None:
+        g("cr_bot_last_log_age_seconds", log_age)
+    else:
+        g("cr_bot_last_log_age_seconds", -1)
 
 
 def collect_disk_usage():
