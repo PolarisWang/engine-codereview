@@ -371,8 +371,8 @@ def run(args):
     )
     # 合并成一个完整 review 文本(普通文字消息可较长, 飞书不折叠); 若仍超长, 拆多段逐条发。
     full_text = "\n\n".join(c for c in chunks if c).rstrip()
-    # 每条普通消息拆 <= ~3000 字符, 多段顺序发, 保证完整、不截断、覆盖之前结果。
-    segs = _split_text(full_text, 3000)
+    # 全量 review 单条普通消息发出(≤45000字符, 已验证飞书≈30k可发); 超大才拆第二段。
+    segs = _split_text(full_text)
     # 记录渲染后的完整 review(供 ci-poll 追加, 不覆盖 findings)
     pipeline_state.set_topic_fields(state_file, key, review_summary=full_text)
     if reply_msg_id:
@@ -403,10 +403,13 @@ def _b64_str(s):
     return base64.b64encode(s.encode("utf-8")).decode("utf-8")
 
 
-def _split_text(text, max_chars=3000):
+def _split_text(text, max_chars=45000):
     """Split long plain-text into ≤max_chars segments on line boundaries, so each
     Feishu plain-text message is fully delivered without truncation (review 全量展示).
-    Preserves content; never drops or truncates findings."""
+    Preserves content; never drops or truncates findings.
+    Default 45000: a full review fits in ONE Feishu plain-text message (verified
+    ~30k chars sends ok), so it isn't split into a multiple-message "duplicate"
+    pile; only an unusually large review breaks into a second message."""
     if not text:
         return []
     if len(text) <= max_chars:
