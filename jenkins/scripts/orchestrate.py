@@ -279,7 +279,7 @@ def run(args):
             # Reuse the card already tied to this topic: update it in place.
             # (review 进度卡复用,非命令反馈,故 PATCH 保留而非新起卡)
             _update_card_text(app_id, app_secret, existing_card,
-                              "🤖 **正在 Review（重试）...**\n重新拉取代码并进行 AI 审查，请稍候...")
+                              M("review_retry_progress"))
             reply_msg_id = existing_card
             pipeline_state.transition(state_file, key, to="PARSING", status="RUNNING",
                                       render_msg_id=reply_msg_id)
@@ -898,11 +898,7 @@ def interact(args):
     # it to the read-only agent loop (which would hallucinate "I'll push" without
     # doing it). Guide them to the exact fixed command instead.
     if _looks_like_operation(_strip_mention(low)):
-        hint = ("🤖 **仅审查答疑**——我不会执行推送/合并/关闭/改码等操作，请用精确命令：\n"
-                "  - `优化`：自动修复关键问题，推送修复分支并创建/更新 MR\n"
-                "  - `关闭` 或 `4`：关闭话题\n"
-                "  - `MR单` / `指引` / `2`：MR 描述 / 修改指引 / 重新审查\n"
-                "  - 若只是想问关于 review 的问题，直接提问即可（我会解答）。")
+        hint = M("qa_hint")
         _finalize(key, hint, render_id, [], state_file, app_id, app_secret)
         return 0
 
@@ -916,7 +912,7 @@ def interact(args):
         text, calls = _agent_llm(all_msgs, system, api_key, base_url, model)
         if not text and not calls:
             # hard failure
-            answer = "⚠️ 暂时无法处理（LLM 调用失败）。可用 `重新审查` / `查看状态`。"
+            answer = M("llm_failed")
             _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret)
             return 0
         if calls:
@@ -942,8 +938,7 @@ def interact(args):
         return 0
 
     # Loop exhausted without plain text — give a useful wrap-up, not a raw tool_use dump.
-    answer = ("已完成多步处理；如需进一步操作，请回复：`1 生成补丁` / `2 重新审查` / "
-              "`3 <关键词> 解释` / `4 关闭` / `MR单` 生成 MR 描述。")
+    answer = M("loop_wrapup")
     _finalize(key, answer, render_id, all_msgs, state_file, app_id, app_secret)
     return 0
 
