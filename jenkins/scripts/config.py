@@ -2,35 +2,96 @@
 """
 config.py — 集中配置中心 for the chaos code-review pipeline.
 
-All tunable runtime parameters live here so operators can adjust them in one
-place without hunting through orchestrate.py. Values are imported into
-orchestrate.py and code_reviewer.py via `from config import *`.
+All tunable runtime parameters, USER-FACING copy (messages), and command words live
+in config.yaml so operators/admins can adjust them in ONE place without touching the
+business code (方案C: 配置统一化)。This module loads config.yaml and exposes:
 
-Edit this file directly; changes take effect on the next pipeline invocation.
+    IDLE_CLOSE_DAYS / AUTO_CLOSE_MR / MAX_CONCURRENT_REVIEWS / ...  参数
+    MSG        dict: user-facing copy templates (from config.yaml messages:)
+    CMD        dict: command word lists (from config.yaml commands:)
+
+Values imported into orchestrate.py / code_reviewer.py via `from config import *`.
+The values below are DEFAULTS; config.yaml overrides them.
 """
-
-# ── 生命周期 (topic lifecycle) ──────────────────────────────────────────
-# 话题多久无新回复自动关闭（天）。用户可在 Feishu 用 `4 关闭` 提前手动关闭。
+import os
+# Defaults first; load_config() later overrides from config.yaml.
 IDLE_CLOSE_DAYS = 2
-# 自动关闭时是否一并关闭本轮创建的 fix-branch MR + 删除 fix 分支，释放资源。
 AUTO_CLOSE_MR = True
-
-# ── 并发 (concurrency admission) ─────────────────────────────────────────
-# 同时允许 running 的独立 review 子进程数量上限。每个 topic 的 review 是独立
-# 子进程（独立 clone、独立跑，互不竞争），超出上限的新请求进入队列并提示。
 MAX_CONCURRENT_REVIEWS = 6
-
-# ── 共享 checkout（arch-D）───────────────────────────────────────────────
-# 持久化 workspace：topics 的 checkout + result 文件都在这。
 DEFAULT_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
-# 复用已有 checkout 目录时是否强制 fetch + reset --hard + clean，避免陈旧/残留
-# SHA 污染下一次 review（曾导致 push 超大 pack / HTTP 413 与损坏改动泄漏）。
 CHECKOUT_RESET_ON_REUSE = True
-
-# ── LLM / agent 编辑 ─────────────────────────────────────────────────────
-# local `claude -p` 用的模型（此为能触达 [1m] 模型、且原始 HTTP 不 503 的通道）。
 EDIT_MODEL = "deepseek-v4-flash[1m]"
-# 每次用户消息最多多少轮 tool-call。
 AGENT_MAX_ROUNDS = 6
-# 每次 agent LLM 回合最大输出 tokens。
 AGENT_MAX_TOKEN = 1000
+
+# 用户可调文案(方案C): 集中到 config.yaml messages:, 这里仅默认值。
+MSG = {
+    "queued": "⚠️ 并发 Review 已达上限，本话题已进入排队，稍后自动开始。",
+    "queued_position": "⚠️ 并发 Review 已达上限，当前排队第 {pos} 位，稍后自动开始。",
+    "started": "↗️ 轮到本话题了，开始自动 Review...",
+    "review_progress": "🤖 **正在 Review...**\n已收到，正在拉取代码并进行 AI 审查，请稍候...",
+    "review_done": "✅ Review 完成。",
+    "optimize_started": "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。",
+    "optimize_note": "（可再次 `优化` 更新已有 MR，无需单独重申。）",
+    "confirm_no_pending": "⛔ 当前没有待确认的自动修改。请先回复 `优化` 生成修改。",
+    "close_confirmed": "🔒 本话题已关闭，不再处理。",
+    "autoclose_reason": "{days}天无新回复自动关闭",
+    "autoclose_notice": "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
+}
+# 命令词(方案C): 集中到 config.yaml commands:, 这里仅默认值。
+CMD = {
+    "optimize": ["优化", "自动优化", "优化代码", "优化并提交"],
+    "autofix": ["改码", "自动修改", "自动修复", "autofix", "改码并提交"],
+    "guidance": ["指引", "修改指引", "怎么改"],
+    "mr": ["mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单"],
+    "status": ["状态", "/状态", "status"],
+    "close": ["4", "关闭", "关闭话题"],
+}
+
+
+def _load_yaml_opt(path=None):
+    """Attempt to parse config.yaml (via common.load_config if available). Returns
+    dict or {} on absence. We build our own minimal read so config.py doesn't hard-depend
+    on common being importable first."""
+    try:
+        from common import load_config
+        return load_config() or {}
+    except Exception:
+        return {}
+
+
+def load_config_merged(path=None):
+    """Merge config.yaml overrides into this module's globals (MSG/CMD/params).
+    Called at import time so `from config import *` sees merged values."""
+    global IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS, DEFAULT_WORKSPACE
+    global CHECKOUT_RESET_ON_REUSE, EDIT_MODEL, AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN
+    global MSG, CMD
+    cfg = _load_yaml_opt(path)
+    life = cfg.get("lifecycle") or {}
+    concurrency = cfg.get("concurrency") or {}
+    ws = cfg.get("workspace") or {}
+    llm = cfg.get("claude") or {}
+    if life.get("idle_close_days") is not None:
+        IDLE_CLOSE_DAYS = int(life["idle_close_days"])
+    if life.get("auto_close_mr") is not None:
+        AUTO_CLOSE_MR = bool(life["auto_close_mr"])
+    if concurrency.get("max_reviews") is not None:
+        MAX_CONCURRENT_REVIEWS = int(concurrency["max_reviews"])
+    if ws.get("base_dir"):
+        DEFAULT_WORKSPACE = ws["base_dir"]
+    if llm.get("model"):
+        EDIT_MODEL = llm["model"]
+    # messages/commands 覆盖
+    m = cfg.get("messages") or {}
+    if isinstance(m, dict):
+        MSG = {**MSG, **{k: (str(v) if v is not None else MSG.get(k, "")) for k, v in m.items()}}
+    c = cfg.get("commands") or {}
+    if isinstance(c, dict):
+        merged = dict(CMD)
+        for k, v in c.items():
+            if isinstance(v, list):
+                merged[k] = [str(x) for x in v]
+        CMD = merged
+
+
+load_config_merged()

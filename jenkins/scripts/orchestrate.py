@@ -45,6 +45,9 @@ from pipeline_state import log_line
 from config import (IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS,
                     DEFAULT_WORKSPACE, CHECKOUT_RESET_ON_REUSE, EDIT_MODEL,
                     AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN)
+import config as _config          # 方案C: 经 config 模块读 MSG/CMD(集中 config.yaml)
+MSG = _config.MSG
+CMD = _config.CMD
 
 # Scripts dir (this file's directory)
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -654,17 +657,18 @@ def _should_auto_close(topic, now_ts=None):
 # "Reliable command routing" block + the confirmation gating handled earlier).
 # Used by _strip_mention so an @-mention that IS itself a command keyword (e.g.
 # `@指引 ...`) is treated as the command, not stripped away into an agent loop.
-_COMMAND_FIRST_WORDS = {
+# 方案C: 命令词表从 config.CMD 读取(集中在 config.yaml commands:), 业务代码不再 hardcode。
+# 追加数字/数字别名等固定路由词。
+_COMMAND_FIRST_WORDS = set()
+for _wlist in _config.CMD.values():
+    if isinstance(_wlist, list):
+        _COMMAND_FIRST_WORDS.update(w for w in _wlist if isinstance(w, str))
+_COMMAND_FIRST_WORDS |= {
     "1", "补丁", "生成补丁", "修复",
     "2", "重新审查", "重审", "review", "重新review",
     "3", "解释",
-    "4", "关闭", "关闭话题",
-    "mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单",
     "预览", "预览补丁", "patch预览",
-    "指引", "修改指引", "怎么改",
-    "改码", "自动修改", "自动修复", "autofix", "改码并提交", "优化", "自动优化", "优化代码",
     "应用并提交", "确认提交", "push并建mr",
-    "状态", "/状态", "status",
 }
 
 
@@ -771,9 +775,9 @@ def interact(args):
                 except Exception as _e:
                     print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
             pipeline_state.close_topic(state_file, key, closed_by="auto",
-                                       reason=f"{IDLE_CLOSE_DAYS}天无新回复自动关闭")
+                                       reason=MSG.get("autoclose_reason", "{days}天无新回复自动关闭").format(days=IDLE_CLOSE_DAYS))
             pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
-            _finalize(key, "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
+            _finalize(key, MSG.get("autoclose_notice") or "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
                       render_id, [], state_file, app_id, app_secret)
             return 0
 
@@ -857,10 +861,10 @@ def interact(args):
         answer = _answer_question(rest or "请解释当前发现", all_findings, api_key, base_url, model)
         _finalize(key, answer, render_id, [], state_file, app_id, app_secret)
         return 0
-    if word in ("4", "关闭", "关闭话题"):
+    if word in CMD["close"]:
         _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor)
         return 0
-    if word in ("mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单"):
+    if word in CMD["mr"]:
         text = _generate_mr_card(topic, all_findings, workspace, key, state_file=state_file)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
@@ -868,15 +872,15 @@ def interact(args):
         text = _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
-    if word in ("指引", "修改指引", "怎么改"):
+    if word in CMD["guidance"]:
         text = _generate_fix_guidance(topic, all_findings, api_key, base_url, model, workspace)
         _finalize(key, text, render_id, [], state_file, app_id, app_secret)
         return 0
-    if word in ("优化", "自动优化", "优化代码", "优化并提交"):
+    if word in CMD["optimize"]:
         # 全自动: 改码→自动 push→创建/更新 MR (无需手动确认)
         return _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
                              app_id, app_secret, actor)
-    if word in ("改码", "自动修改", "自动修复", "autofix", "改码并提交"):
+    if word in CMD["autofix"]:
         return _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
                               app_id, app_secret, actor)
     if word in ("应用并提交", "确认提交", "push并建mr"):
@@ -884,7 +888,7 @@ def interact(args):
         _finalize(key, "⏳ 「应用并提交」将 push 新分支 + 建 MR（受控写操作，暂未执行）。\n"
                        "当前先确认补丁预览：\n" + text[:400], render_id, [], state_file, app_id, app_secret)
         return 0
-    if word in ("状态", "/状态", "status"):
+    if word in CMD["status"]:
         _finalize(key, _build_status_text(topic), render_id, [], state_file, app_id, app_secret)
         return 0
 
@@ -1589,8 +1593,8 @@ def _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
     pipeline_state.set_pending(state_file, key, "agent_edit", patch={"actor": actor})
     pipeline_state.append_approval(state_file, key, actor, "auto_edit", "", "ok", "@优化 enqueued(auto)")
     _proc_reply(key, topic,
-                "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。\n"
-                "（结果可能延迟到下一轮扫描；再次 `优化` 会更新已有 MR，无需单独重申。）",
+                (MSG.get("optimize_started") or "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。\n") +
+                (MSG.get("optimize_note") or "（可再次 `优化` 更新已有 MR，无需单独重申。）"),
                 render_id, state_file, app_id, app_secret, intent="优化：改码→自动推送→创建/更新MR")
     return 0
 
@@ -2494,14 +2498,16 @@ def _release_review_slot():
 
 
 def _queue_notice(app_id, app_secret, reply_msg_id):
-    """Return the Feishu 'queued' notice text for a topic that hit the concurrency cap."""
+    """Return the Feishu 'queued' notice text for a topic that hit the concurrency cap.
+    方案C: 文案来自 config.yaml messages.queued(可配置)。"""
     from config import MAX_CONCURRENT_REVIEWS as _M
-    return (f"⚠️ 并发 Review 已达上限（{_M} 个并行任务），本话题已进入排队。\n"
+    return (MSG.get("queued") or f"⚠️ 并发 Review 已达上限（{_M} 个并行任务），本话题已进入排队。\n"
             f"当前繁忙，稍后会按顺序自动开始审查，请勿重复触发。")
 
 
 def _started_notice():
-    return "↗️ 轮到本话题了，开始自动 Review..."
+    """方案C: 文案来自 config.yaml messages.started."""
+    return MSG.get("started") or "↗️ 轮到本话题了，开始自动 Review..."
 
 
 

@@ -76,3 +76,42 @@ claude:
 
     Rate each finding as: 🔴 Critical, 🟡 Warning, ℹ️ Suggestion
     Summarize at the end with a count of each severity level.
+
+# ============================================================
+# 生命周期 / 并发 / 文案 / 命令词 —— 方案C 配置统一化
+# 这些都可在此文件调整, 无需改代码, 调整后重跑/重启生效。
+# ============================================================
+
+# ── 生命周期 (topic lifecycle) ──
+lifecycle:
+  # 话题多久无新回复自动关闭(天)。
+  idle_close_days: 2
+  # 自动关闭时是否释放 fix-branch MR/删分支。
+  auto_close_mr: true
+
+# ── 并发 (concurrency) ──
+concurrency:
+  # 同时 running 的 review 子进程上限。超出的 topic 排队。
+  max_reviews: 6
+
+# ── 文案 (user-facing copy) —— 改措辞在此, 不碰代码 ──
+messages:
+  queued: "⚠️ 并发 Review 已达上限，本话题已进入排队，稍后自动开始。"
+  queued_position: "⚠️ 并发 Review 已达上限，当前排队第 {pos} 位，稍后自动开始。"
+  started: "↗️ 轮到本话题了，开始自动 Review..."
+  review_progress: "🤖 **正在 Review...**\n已收到，正在拉取代码并进行 AI 审查，请稍候..."
+  optimize_started: "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。"
+  optimize_note: "（可再次 `优化` 更新已有 MR，无需单独重申。）"
+  confirm_no_pending: "⛔ 当前没有待确认的自动修改。请先回复 `优化` 生成修改。"
+  close_confirmed: "🔒 本话题已关闭，不再处理。"
+  autoclose_reason: "{days}天无新回复自动关闭"
+  autoclose_notice: "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。"
+
+# ── 命令词 (command words) —— 调整识别词在此, 不碰代码 ──
+commands:
+  optimize: ["优化", "自动优化", "优化代码", "优化并提交"]
+  autofix: ["改码", "自动修改", "自动修复", "autofix", "改码并提交"]
+  guidance: ["指引", "修改指引", "怎么改"]
+  mr: ["mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单"]
+  status: ["状态", "/状态", "status"]
+  close: ["4", "关闭", "关闭话题"]
