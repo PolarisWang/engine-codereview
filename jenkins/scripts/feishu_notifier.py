@@ -325,16 +325,16 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
         # Total failure — no usable review output at all.
         text += f" ❌ 审查失败\n原因: {error}"
     elif branch_exists is False:
-        text += f" ⏭️ 跳过审查\n原因: 分支 `{review_branch}` 在远程仓库中不存在（可能已被删除或从未创建）"
+        text += " " + MSG.get("skip_branch_missing","⏭️ 跳过审查\n原因: 分支 "+review_branch+" 在远程不存在").format(branch=review_branch)
     elif branch_merged:
         hint = ""
         if mr_state == "merged":
             hint = "（GitLab 显示该 MR 已合并）"
         elif mr_state == "closed":
             hint = "（GitLab 显示该 MR 已关闭）"
-        text += f" ⏭️ 跳过审查\n原因: 分支 `{review_branch}` 已经合并到 `{base_branch}`，没有新的代码变更{hint}"
+        text += " " + MSG.get("skip_branch_merged","").format(branch=review_branch, base=base_branch) + (hint or "")
     elif changed == 0:
-        text += f" ⏭️ 跳过审查\n原因: 该分支相对于 {base_branch} 没有代码变更"
+        text += " " + MSG.get("skip_no_diff","").format(base=base_branch)
     else:
         text += f"\n变更文件: {changed} 个"
         if stats:
@@ -417,7 +417,7 @@ def build_summary_text(issue_key, project, review_branch, base_branch, jira_url,
 
     if mr_url:
         summary += f"MR：{mr_url}\n"
-    summary += f"分支：`{review_branch}` → `{base_branch}`\n\n"
+    summary += MSG.get("branch_line","分支：`{rb}` → `{bb}`\n\n").format(rb=review_branch, bb=base_branch)
 
     # FOCUSED: top findings across engine + game (critical first).
     tops = _concise_findings(engine_result, 3) + _concise_findings(game_result, 3)
@@ -468,11 +468,11 @@ def render_full_findings_text(issue_key, project, review_branch, base_branch, ji
     total_w = (ec.get("warning") or 0) + (gc.get("warning") or 0)
     total_i = (ec.get("suggestion") or 0) + (gc.get("suggestion") or 0)
 
-    header = f"**🔍 {issue_key}** · 审查结果："
+    header = MSG.get("review_title","🔍 {key} · 审查结果：").format(key=issue_key)
     if total_c: header += f"**{total_c} 个 Critical** / "
     header += f"{total_w} 个 Warning / {total_i} 个 Suggestion"
     if mr_url: header += f"\nMR：{mr_url}"
-    header += f"\n分支：`{review_branch}` → `{base_branch}`"
+    header += MSG.get("branch_line","\n分支：`{rb}` → `{bb}`").format(rb=review_branch, bb=base_branch)
     if jira_url: header += f"\n📎 {jira_url}"
 
     # 排序: critical → warning → suggestion; 每条含 repo 来源。
@@ -487,7 +487,7 @@ def render_full_findings_text(issue_key, project, review_branch, base_branch, ji
         groups[grp].append(f"{_sev_mark(f.get('severity'))} `{file}` [{repo}]\n  {issue}\n {f.get('suggestion') or ''}\n")
 
     chunks = [header + "\n"]
-    label = {"critical": "🔴 **Critical 发现**", "warning": "🟡 **Warning 发现**", "suggestion": "ℹ️ **Suggestion 建议**"}
+    label = {"critical": MSG.get("label_critical_findings","🔴 Critical"), "warning": MSG.get("label_warning_findings","🟡 Warning"), "suggestion": MSG.get("label_suggestion_findings","ℹ️ Suggestion")}
     for grp in ("critical", "warning", "suggestion"):
         items = groups[grp]
         if not items:

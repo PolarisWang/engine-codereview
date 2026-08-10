@@ -146,6 +146,14 @@ messages:
   fix_patch_staged_exists: "⛔ 已有待确认的自动修改（staged）。请先回 `优化` 推送，或用 `指引` 看人工方案；本 `补丁` 未覆盖现有修改。"
   no_findings_patch: "ℹ️ 当前没有可生成补丁的 findings，或 `@ok` 后再应用。"
 
+  skip_branch_missing: "⏭️ 跳过审查\n原因: 分支 {branch} 在远程不存在（可能已删除）"
+  skip_branch_merged: "⏭️ 跳过审查\n原因: 分支 {branch} 已合并到 {base}，无新变更"
+  skip_no_diff: "⏭️ 跳过审查\n原因: 该分支相对 {base} 无代码变更"
+  branch_line: "分支：`{rb}` → `{bb}`"
+  label_critical_findings: "🔴 **Critical 发现**"
+  label_warning_findings: "🟡 **Warning 发现**"
+  label_suggestion_findings: "ℹ️ **Suggestion 建议**"
+
 # ── 命令词 (command words) —— 调整识别词在此, 不碰代码 ──
 commands:
   optimize: ["优化", "自动优化", "优化代码", "优化并提交"]
