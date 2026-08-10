@@ -1658,12 +1658,12 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
             cur = (_sha_r.stdout or "").strip()
             if not cur or cur != expected_sha:
                 pipeline_state.set_pending_patch(state_file, key, None)
-                _proc_reply(key, topic, "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期改码提交到错误基线，已取消本次提交。请重新回复 `改码`。", render, state_file, app_id, app_secret)
+                _proc_reply(key, topic, M("confirm_r1_drifted"), render, state_file, app_id, app_secret)
                 return 0
         else:
             # Legacy staged edit without a recorded baseline: safest to refuse.
             pipeline_state.set_pending_patch(state_file, key, None)
-            _proc_reply(key, topic, "⛔ 缺少改码基线记录（旧版本暂存的改码），已取消。请重新回复 `改码`。", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("confirm_r1_missing"), render, state_file, app_id, app_secret)
             return 0
         _sp.run(["git", "-C", checkout, "add", "-A"],
                 capture_output=True, text=True, timeout=60, env=_git_env)
@@ -2318,7 +2318,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         if pp.get("state") != "staged_agent_edit" or not files or not branch:
             pipeline_state.set_pending_patch(state_file, key, None)
             pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, "⛔ 没有待确认的自动改码内容，已取消。", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("consume_no_staged"), render, state_file, app_id, app_secret)
             return False, "agent_edit_confirm: no staged change set"
         if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
             pipeline_state.clear_pending(state_file, key)
@@ -2352,12 +2352,12 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                 if not cur or cur != expected_sha:
                     pipeline_state.set_pending_patch(state_file, key, None)
                     pipeline_state.clear_pending(state_file, key)
-                    _proc_reply(key, topic, "⛔ 工作树已被其他操作重置（基线 SHA 变化），已取消本次提交。请重新回复 `改码`。", render, state_file, app_id, app_secret)
+                    _proc_reply(key, topic, M("confirm_r1_drifted"), render, state_file, app_id, app_secret)
                     return False, "agent_edit_confirm: checkout drifted from baseline"
             else:
                 pipeline_state.set_pending_patch(state_file, key, None)
                 pipeline_state.clear_pending(state_file, key)
-                _proc_reply(key, topic, "⛔ 缺少改码基线记录（旧版本暂存），已取消。请重新回复 `改码`。", render, state_file, app_id, app_secret)
+                _proc_reply(key, topic, M("confirm_r1_missing"), render, state_file, app_id, app_secret)
                 return False, "agent_edit_confirm: missing baseline SHA"
             _sp2.run(["git", "-C", checkout, "add", "-A"],
                      capture_output=True, text=True, timeout=60, env=_git_env)
@@ -2689,7 +2689,7 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
         _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret)
         return
     pipeline_state.set_pending(state_file, key, "re_review")
-    _proc_reply(key, topic, "⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查。", render_id, state_file, app_id, app_secret)
+    _proc_reply(key, topic, M("rerereview_enqueued"), render_id, state_file, app_id, app_secret)
 
 
 def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
@@ -2883,11 +2883,11 @@ def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
     # auto-edit waiting for confirmation.
     cur_pp = topic.get("pending_patch") or {}
     if cur_pp.get("state") == "staged_agent_edit":
-        _proc_reply(key, topic, "⛔ 已有待确认的自动改码（3 个文件 staged）。请先回 `确认提交并建mr` 推送，或用 `指引` 看人工方案；本 `补丁` 未覆盖现有改码。", render_id, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("fix_patch_staged_exists"), render_id, state_file, app_id, app_secret)
         return 0
     patch = _build_patch_target(all_findings, "all")
     if not all_findings or not (patch.get("diff") or "").strip():
-        _proc_reply(key, topic, "ℹ️ 当前没有可生成补丁的 findings，或 `@ok` 后再应用。", render_id, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("no_findings_patch"), render_id, state_file, app_id, app_secret)
         return 0
     pipeline_state.set_pending_patch(state_file, key, {
         "file": "all", "target": "all", "repo": "engine", "diff": patch.get("diff", ""),
