@@ -48,6 +48,7 @@ from config import (IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS,
 import config as _config          # 方案C: 经 config 模块读 MSG/CMD(集中 config.yaml)
 MSG = _config.MSG
 CMD = _config.CMD
+M = _config.M
 
 # Scripts dir (this file's directory)
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -758,7 +759,7 @@ def interact(args):
             pass  # fall through to audit branch below
         else:
             reason = topic.get("closed_reason") or "已关闭"
-            _finalize(key, f"🔒 本话题已关闭（{reason}），不再处理。如需重新审查请新开话题。",
+            _finalize(key, M("closed_with_reason", reason=reason),
                       render_id, [], state_file, app_id, app_secret)
             return 0
     else:
@@ -820,7 +821,7 @@ def interact(args):
                 return 0
             if is_rollback:
                 pipeline_state.set_pending_patch(state_file, key, None)
-                _proc_reply(key, topic, "↩️ 已取消本次自动改码（未推送、未建MR）。", render_id, state_file, app_id, app_secret)
+                _proc_reply(key, topic, M("edit_cancelled"), render_id, state_file, app_id, app_secret)
                 return 0
         else:
             if is_ok:
@@ -885,8 +886,7 @@ def interact(args):
                               app_id, app_secret, actor)
     if word in ("应用并提交", "确认提交", "push并建mr"):
         text = _build_patch_preview_target(all_findings, "all")
-        _finalize(key, "⏳ 「应用并提交」将 push 新分支 + 建 MR（受控写操作，暂未执行）。\n"
-                       "当前先确认补丁预览：\n" + text[:400], render_id, [], state_file, app_id, app_secret)
+        _finalize(key, M("apply_submit_pending") + text[:400], render_id, [], state_file, app_id, app_secret)
         return 0
     if word in CMD["status"]:
         _finalize(key, _build_status_text(topic), render_id, [], state_file, app_id, app_secret)
@@ -1555,7 +1555,7 @@ def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
     Approval happens here (enqueue side); the executor does not re-gate owner."""
     ok, why = _approve(key, topic, actor, "auto_edit")
     if not ok:
-        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret,
+        _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret,
                     intent="自动改码", prefix="🛑")
         return 0
     if not _find_claude():
@@ -1581,7 +1581,7 @@ def _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
     agent_edit_confirm(commit+push+建/更新MR)。"""
     ok, why = _approve(key, topic, actor, "auto_edit")
     if not ok:
-        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret,
+        _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret,
                     intent="优化（全自动修复并建 MR）", prefix="🛑")
         return 0
     if not _find_claude():
@@ -1614,22 +1614,22 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
     branch = pending.get("branch") or ""
     if not files or not branch:
         pipeline_state.set_pending_patch(state_file, key, None)
-        _proc_reply(key, topic, "⛔ 待确认改码内容缺失，已取消。",
+        _proc_reply(key, topic, M("confirm_no_staged"),
                     render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     # Guard: never push to a protected branch.
     if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
-        _proc_reply(key, topic, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。",
+        _proc_reply(key, topic, M("confirm_protected_branch", branch=branch),
                     render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     ok, why = _approve(key, topic, actor, "push_fix_branch", branch=branch)
     if not ok:
-        _proc_reply(key, topic, f"⛔ {why}",
+        _proc_reply(key, topic, M("denied_why", why=why),
                     render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     checkout, err = _ensure_checkout(topic, workspace)
     if err:
-        _proc_reply(key, topic, f"⛔ checkout 失败：{err}",
+        _proc_reply(key, topic, M("confirm_checkout_fail", err=err),
                     render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
     # Ensure we're on the fix branch and the diffs are applied. The staged edits were
@@ -1696,12 +1696,12 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
                 _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
                                   capture_output=True, text=True, timeout=60, env=_git_env)
         if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
-            _proc_reply(key, topic, f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("confirm_commit_fail", err=(_commit.stderr or _commit.stdout)[:200]), render, state_file, app_id, app_secret)
             return 0
         push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                        capture_output=True, text=True, timeout=180, env=_git_env)
         if push.returncode != 0:
-            _proc_reply(key, topic, f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("confirm_push_fail", err=(push.stderr or push.stdout)[:200]), render, state_file, app_id, app_secret)
             return 0
     # Auto-create / detect the fix-branch MR and report its real url.
     # 加固: 传实际 push 的分支(branch), 与 push 严格一致, 杜绝分支来源不一致。
@@ -2035,11 +2035,11 @@ def _confirm_apply(key, topic, workspace, state_file, app_id, app_secret, actor=
     ok, why = _approve(key, topic, actor, "apply_local")
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "apply_local", "", "denied", why)
-        _proc_reply(key, topic, f"⛔ {why}", render, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("denied_why", why=why), render, state_file, app_id, app_secret)
         return 0
     pending = topic.get("pending_patch") or {}
     if not pending:
-        _proc_reply(key, topic, "ℹ️ 没有待应用的补丁，无需操作。", render, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("apply_nothing_pending"), render, state_file, app_id, app_secret)
         return 0
     # Record intent; the Jenkins executor applies it to the shared checkout.
     pipeline_state.append_approval(state_file, key, actor, "apply_local", pending.get("file", ""), "ok", "@ok enqueued")
@@ -2063,11 +2063,11 @@ def _confirm_push(key, topic, workspace, state_file, app_id, app_secret, actor="
     ok, why = _approve(key, topic, actor, "push_remote", branch=branch)
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "denied", why)
-        _proc_reply(key, topic, f"⛔ {why}", render, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("denied_why", why=why), render, state_file, app_id, app_secret)
         return 0
     pipeline_state.append_approval(state_file, key, actor, "push_remote", branch, "ok", "@confirm push enqueued")
     pipeline_state.set_pending(state_file, key, "push")
-    _proc_reply(key, topic, "⏳ 已记录推送请求，Jenkins 将把已应用的改动推到远程分支 `{branch}`。".format(branch=branch), render, state_file, app_id, app_secret)
+    _proc_reply(key, topic, M("push_enqueued", branch=branch), render, state_file, app_id, app_secret)
     return 0
 
 
@@ -2078,11 +2078,11 @@ def _rollback(key, topic, workspace, state_file, app_id, app_secret, actor=""):
     ok, why = _approve(key, topic, actor, "rollback")
     if not ok:
         pipeline_state.append_approval(state_file, key, actor, "rollback", "", "denied", why)
-        _proc_reply(key, topic, f"⛔ {why}", render, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("denied_why", why=why), render, state_file, app_id, app_secret)
         return 0
     pipeline_state.set_pending(state_file, key, "rollback")
     pipeline_state.append_approval(state_file, key, actor, "rollback", "", "ok", "@撤销 enqueued")
-    _proc_reply(key, topic, "⏳ 已记录回退请求，Jenkins 将回退最近一次应用的补丁。", render, state_file, app_id, app_secret)
+    _proc_reply(key, topic, M("rollback_enqueued"), render, state_file, app_id, app_secret)
     return 0
 
 
@@ -2327,14 +2327,14 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             return False, "agent_edit_confirm: no staged change set"
         if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
             pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, f"⛔ 拒绝：{branch} 是受保护分支，请人工处理。", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("confirm_protected_branch", branch=branch), render, state_file, app_id, app_secret)
             return False, f"agent_edit_confirm: protected branch {branch}"
         import subprocess as _sp2
         _git_env = _auth_git_env({"LC_ALL": "C"})
         checkout, err = _ensure_checkout(topic, workspace)
         if err:
             pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, f"⛔ checkout 失败：{err}", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("confirm_checkout_fail", err=err), render, state_file, app_id, app_secret)
             return False, f"agent_edit_confirm: {err}"
         _sp2.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
                  capture_output=True, text=True, timeout=30, env=_git_env)
@@ -2391,13 +2391,13 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                                        capture_output=True, text=True, timeout=60, env=_git_env)
             if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
                 pipeline_state.clear_pending(state_file, key)
-                _proc_reply(key, topic, f"⛔ commit 失败：{(_commit.stderr or _commit.stdout)[:200]}", render, state_file, app_id, app_secret)
+                _proc_reply(key, topic, M("confirm_commit_fail", err=(_commit.stderr or _commit.stdout)[:200]), render, state_file, app_id, app_secret)
                 return False, f"agent_edit_confirm: commit failed"
             push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                             capture_output=True, text=True, timeout=300, env=_git_env)
             if push.returncode != 0:
                 pipeline_state.clear_pending(state_file, key)
-                _proc_reply(key, topic, f"⛔ push 失败：{(push.stderr or push.stdout)[:200]}", render, state_file, app_id, app_secret)
+                _proc_reply(key, topic, M("confirm_push_fail", err=(push.stderr or push.stdout)[:200]), render, state_file, app_id, app_secret)
                 return False, f"agent_edit_confirm: push failed"
         # 加固: 传实际 push 的分支(branch)建 MR, 与 push 严格一致。
         _assert_branch_consistent(branch, _fix_branch(topic), key)
@@ -2644,7 +2644,7 @@ def cmd_action(args):
     if action == "re_review":
         ok, why = _approve(key, topic, actor, "re_review")
         if not ok:
-            _update_card_text(app_id, app_secret, render, f"⛔ {why}", topic_key=key)
+            _update_card_text(app_id, app_secret, render, M("denied_why", why=why), topic_key=key)
             return 1
         pipeline_state.set_pending(state_file, key, "re_review")
         _update_card_text(app_id, app_secret, render,
@@ -2653,7 +2653,7 @@ def cmd_action(args):
     elif action == "close_topic":
         ok, why = _approve(key, topic, actor, "close_topic")
         if not ok:
-            _update_card_text(app_id, app_secret, render, f"⛔ {why}", topic_key=key)
+            _update_card_text(app_id, app_secret, render, M("denied_why", why=why), topic_key=key)
             return 1
         pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户点击关闭按钮")
         _update_card_text(app_id, app_secret, render,
@@ -2662,7 +2662,7 @@ def cmd_action(args):
     elif action == "apply_patch":
         ok, why = _approve(key, topic, actor, "apply_patch")
         if not ok:
-            _update_card_text(app_id, app_secret, render, f"⛔ {why}", topic_key=key)
+            _update_card_text(app_id, app_secret, render, M("denied_why", why=why), topic_key=key)
             return 1
         print(f"[action] apply_patch: propose patch (findings-based) staged by {actor}", flush=True)
         # phase-C1: propose a patch preview from existing findings (not applied).
@@ -2691,7 +2691,7 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
     """指令 `2/重新审查`: owner/admin 校验后入队 re_review（Jenkins 执行）。"""
     ok, why = _approve(key, topic, actor, "re_review")
     if not ok:
-        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret)
         return
     pipeline_state.set_pending(state_file, key, "re_review")
     _proc_reply(key, topic, "⏳ 已记录重新审查请求，Jenkins 将拉取最新代码重新审查。", render_id, state_file, app_id, app_secret)
@@ -2704,7 +2704,7 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     不会推新消息，用户可能看不到。"""
     ok, why = _approve(key, topic, actor, "close_topic")
     if not ok:
-        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret)
         return
     closed = _close_topic_resources(topic)
     pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
@@ -2881,7 +2881,7 @@ def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
     """指令 `1/补丁`: 生成修复补丁方案（基于 findings 的建议，供确认后应用）。"""
     ok, why = _approve(key, topic, actor, "apply_patch")
     if not ok:
-        _proc_reply(key, topic, f"⛔ {why}", render_id, state_file, app_id, app_secret)
+        _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret)
         return 0
     # 流程②: never let a suggestion patch (1/补丁) overwrite an in-progress 改码
     # change set (staged_agent_edit). Otherwise a stray `补丁` reply kills the real

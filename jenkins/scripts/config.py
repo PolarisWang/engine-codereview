@@ -95,3 +95,18 @@ def load_config_merged(path=None):
 
 
 load_config_merged()
+
+
+def M(key, **kw):
+    """Fetch a user-facing message from config.MSG and .format() it. Template uses
+    `{name}` placeholders (str.format style) — NOT f-string — so it's safe both in
+    config.yaml and here. Falls back to the literal key if message missing (so a
+    missing config entry degrades to a visible key instead of crashing)."""
+    tpl = MSG.get(key)
+    if tpl is None:
+        return key
+    try:
+        return tpl.format(**kw)
+    except Exception:
+        # Missing/unused kw or bad placeholder → return template raw rather than crash
+        return tpl

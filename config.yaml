@@ -107,6 +107,21 @@ messages:
   autoclose_reason: "{days}天无新回复自动关闭"
   autoclose_notice: "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。"
 
+  edit_cancelled: "↩️ 已取消本次自动修改（未推送、未建MR）。"
+  apply_submit_pending: "⏳ 「应用并提交」将 push 新分支 + 建 MR（受控写操作，暂未执行）。\n当前先确认补丁预览：\n"
+  closed_with_reason: "🔒 本话题已关闭（{reason}），不再处理。如需重新审查请新开话题。"
+  confirm_no_staged: "⛔ 待确认修改内容缺失，已取消。"
+  confirm_protected_branch: "⛔ 拒绝：{branch} 是受保护分支，请人工处理。"
+  confirm_checkout_fail: "⛔ checkout 失败：{err}"
+  confirm_r1_drifted: "⛔ 工作树已被其他操作重置（基线 SHA 变化），为免把过期修改提交到错误基线，已取消本次提交。请重新回复 `优化`。"
+  confirm_r1_missing: "⛔ 缺少修改基线记录（旧版本暂存），已取消。请重新回复 `优化`。"
+  confirm_commit_fail: "⛔ commit 失败：{err}"
+  confirm_push_fail: "⛔ push 失败：{err}"
+  apply_nothing_pending: "ℹ️ 没有待应用的补丁，无需操作。"
+  push_enqueued: "⏳ 已记录推送请求，Jenkins 将把已应用的改动推到远程分支 `{branch}`。"
+  rollback_enqueued: "⏳ 已记录回退请求，Jenkins 将回退最近一次应用的补丁。"
+  denied_why: "⛔ {why}"
+
 # ── 命令词 (command words) —— 调整识别词在此, 不碰代码 ──
 commands:
   optimize: ["优化", "自动优化", "优化代码", "优化并提交"]
