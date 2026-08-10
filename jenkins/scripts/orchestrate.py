@@ -628,14 +628,18 @@ def _should_auto_close(topic, now_ts=None):
     """R7: whether a topic is due for lazy auto-close (idle > IDLE_CLOSE_DAYS and
     not already CLOSED). Applies to ANY non-CLOSED phase — including DONE/FAILED —
     so finished reviews that stay ignored release their fix MR/branch. Extracted
-    from interact() for testability. `now_ts` is injectable (seconds) for tests."""
+    from interact() for testability. `now_ts` is injectable (seconds) for tests.
+
+    F2: idle 判定用独立的 `last_user_activity` 字段(仅真实用户回复时刷新), 而不是
+    `updated_at` —— 后者会被 ci-poll/consume/review 等 background 写入刷新, 导致活跃
+    话题永不超时。无 last_user_activity 时回退到 updated_at(兼容旧话题)。"""
     if not topic:
         return False
     if topic.get("phase") == "CLOSED":
         return False
     try:
         import time as _time
-        upd = topic.get("updated_at") or ""
+        upd = topic.get("last_user_activity") or topic.get("updated_at") or ""
         if upd:
             ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
             idle_days = ((now_ts if now_ts is not None else _time.time()) - ts) / 86400.0
@@ -721,6 +725,13 @@ def interact(args):
     """
     key = args.key
     reply_text = (args.reply or "").strip()
+    # F2: 真实用户回复刷新 last_user_activity(独立闲置判定), 而非 updated_at.
+    try:
+        topic_cur = pipeline_state.get_topic(state_file, key)
+        if topic_cur is not None and topic_cur.get("phase") != "CLOSED":
+            pipeline_state.set_topic_fields(state_file, key, last_user_activity=pipeline_state._now_iso())
+    except Exception:
+        pass
     workspace = args.workspace
     state_file = args.pipeline_state_file or os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
     app_id = _env("FEISHU_APP_ID")
@@ -2536,6 +2547,41 @@ def consume_all_pending(state_file, workspace, app_id, app_secret, lock_dir=None
     return results
 
 
+def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None):
+    """F1: INDEPENDENT auto-close driver — scans ALL topics on each Jenkins tick and
+    closes any IDLE (past IDLE_CLOSE_DAYS) non-CLOSED topic, releasing its fix MR +
+    branch. Previously _should_auto_close ran ONLY inside interact() (i.e. only when a
+    user happened to reply), so an ignored topic was never actually auto-closed.
+    Returns {key: (ok, note)} for topics actually closed this tick."""
+    lock_dir = lock_dir or pipeline_state.DEFAULT_LOCK_DIR()
+    closed = {}
+    try:
+        topics = pipeline_state.list_topics(state_file)
+    except Exception as e:
+        print(f"[autoclose] list_topics err: {e}", file=sys.stderr)
+        return closed
+    for t in topics:
+        key = t.get("message_id") or ""
+        if not key or t.get("phase") == "CLOSED":
+            continue
+        if not _should_auto_close(t):   # 用独立 last_user_activity(F2)
+            continue
+        # F3: 有 open fix MR 时不自动删分支(防误删未合并 MR), 只关话题并提示;
+        #     无 open fix MR 的孤儿分支才自动释放。
+        try:
+            with pipeline_state.topic_lock_context(lock_dir, key):
+                note = _close_topic_resources_if_safe(t, state_file, key, app_id, app_secret)
+                pipeline_state.close_topic(state_file, key, closed_by="auto",
+                                           reason=f"{IDLE_CLOSE_DAYS}天无新回复自动关闭")
+                pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
+                closed[key] = (True, note)
+                print(f"[autoclose] closed {key[:20]} — {note}", flush=True)
+        except Exception as e:
+            print(f"[autoclose] close {key[:20]} err: {e}", file=sys.stderr)
+            closed[key] = (False, str(e))
+    return closed
+
+
 def poll_ci_all(state_file, workspace, refresh_minutes=15):
     """arch-C: refresh MR CI status onto topic cards for recently-active topics
     that have an mr_url. Deduped by cmd_ci (only posts on change). Returns a dict
@@ -2663,6 +2709,53 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     # 2) ALSO post a NEW thread reply so the close is visible in the group (PATCH
     #    does not create a message). _finalize appends chat history + reply-message.
     _finalize(key, note, render_id, [], state_file, app_id, app_secret)
+
+
+def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret):
+    """F3: auto-close 版资源释放 —— 防误删未合并 MR。
+
+    与 _close_topic_resources 不同: 仅当话题**没有 open 的 owned fix MR** 时才释放
+    该 fix 分支(孤儿分支才自动删); 若有 open fix MR(用户可能还没合并), 则**不自动删
+    分支**, 只关闭话题并提示人工处理, 避免 auto-close 误删在途合并。返回 human note。"""
+    import urllib.request, urllib.error, urllib.parse, json as _json
+    pp = _project_path(topic)
+    tok = _env("GITLAB_TOKEN")
+    if not pp or not tok:
+        return ""
+    new_branch = _fix_branch(topic)
+    proj = urllib.parse.quote(pp, safe="")
+    owned_iids = set(int(x) for x in (topic.get("fix_mr_iids") or []) if str(x).isdigit())
+    # 是否有 open fix MR 还开着
+    open_mr_on_branch = False
+    try:
+        r = urllib.request.Request(
+            f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/merge_requests?state=opened&per_page=100",
+            headers={"PRIVATE-TOKEN": tok})
+        mrs = _json.loads(urllib.request.urlopen(r, timeout=20).read())
+        for m in mrs:
+            if m.get("source_branch") == new_branch or m.get("iid") in owned_iids:
+                open_mr_on_branch = True
+                break
+    except Exception:
+        pass
+    if open_mr_on_branch:
+        return "有 open fix MR，保留分支待人工合并（未自动删除）"
+    # 无 open MR -> 孤儿分支, 安全释放(删分支)
+    if _branch_is_bot_created(proj, new_branch, tok):
+        try:
+            req = urllib.request.Request(
+                f"https://gitlab.booming-inc.com/api/v4/projects/{proj}/repository/branches/"
+                f"{urllib.parse.quote(new_branch, safe='')}",
+                method="DELETE", headers={"PRIVATE-TOKEN": tok})
+            urllib.request.urlopen(req, timeout=20)
+            return f"删除孤儿 fix 分支 {new_branch}"
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return "分支已不存在"
+            return f"删分支失败 HTTP {e.code}"
+        except Exception:
+            return "删分支失败(网络)"
+    return "无 open MR 也无 bot 分支，无需释放"
 
 
 def _branch_is_bot_created(proj, branch, tok):
@@ -3337,7 +3430,12 @@ def main(argv=None):
                                       lock_dir=lock_dir)
         for k, (ok, msg) in results.items():
             print(f"[executor] {k}: {'OK' if ok else 'FAIL'} — {msg}", flush=True)
-        sys.exit(0 if results else 1)
+        # F1: 独立 auto-close 扫描 —— 每个 Jenkins tick 关闭闲置话题。
+        ac = run_autoclose(args.pipeline_state_file, args.workspace,
+                           _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"), lock_dir=lock_dir)
+        for k, (ok, note) in ac.items():
+            print(f"[autoclose] {k}: {'OK' if ok else 'FAIL'} — {note}", flush=True)
+        sys.exit(0 if (results or ac) else 1)
     elif args.command == "action":
         sys.exit(cmd_action(args))
     elif args.command == "ci":
