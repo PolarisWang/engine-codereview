@@ -243,13 +243,13 @@ pipeline {
                     // Prefer processing fresh messages; then drain retryables. Bound total
                     // so we never process more than a handful per build (retry backoff
                     // already limits how many are 'retryable' right now).
-                    def nFresh = Math.min(items.size(), 1)          // one fresh message per build
+                    def nFresh = Math.min(items.size(), 3)          // up to 3 fresh messages per build (排队吞吐优化)
                     def nRetry = Math.min(retryables.size(), 3)     // up to 3 retries per build
                     if (nFresh + nRetry == 0) {
                         currentBuild.result = 'SUCCESS'
                     }
                     int processedCount = 0
-                    for (int k = 0; k < nFresh && processedCount < 4; k++) {
+                    for (int k = 0; k < nFresh && processedCount < 6; k++) {
                         def item = items[k]
                         def issueKey = item.issue_key
                         def jiraUrl = item.jira_url
@@ -273,7 +273,7 @@ pipeline {
                         }
                         processedCount++
                     }
-                    for (int k = 0; k < nRetry && processedCount < 4; k++) {
+                    for (int k = 0; k < nRetry && processedCount < 6; k++) {
                         def r = retryables[k]
                         def msgId = r.message_id
                         def jiraUrl = r.jira_url
