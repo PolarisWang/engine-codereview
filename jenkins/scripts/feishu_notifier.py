@@ -323,7 +323,7 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
     text = f"{repo_icon} **{repo_label} 仓库**"
     if error and not review_text:
         # Total failure — no usable review output at all.
-        text += f" ❌ 审查失败\n原因: {error}"
+        text += " " + MSG.get("review_failed_reason","❌ 审查失败\n原因: "+str(error)).format(msg=error)
     elif branch_exists is False:
         text += " " + MSG.get("skip_branch_missing","⏭️ 跳过审查\n原因: 分支 "+review_branch+" 在远程不存在").format(branch=review_branch)
     elif branch_merged:
@@ -336,34 +336,34 @@ def build_repo_section(repo_label, repo_icon, result, review_branch, base_branch
     elif changed == 0:
         text += " " + MSG.get("skip_no_diff","").format(base=base_branch)
     else:
-        text += f"\n变更文件: {changed} 个"
+        text += MSG.get("changed_files_count","\n变更文件: {n} 个").format(n=changed)
         if stats:
             text += f" ({stats})"
         if sev.get("critical"):
-            text += f"\n🔴 Critical: {sev['critical']}"
+            text += MSG.get("sev_critical_count","\n🔴 Critical: {n}").format(n=sev["critical"])
         if sev.get("warning"):
-            text += f"\n🟡 Warning: {sev['warning']}"
+            text += MSG.get("sev_warning_count","\n🟡 Warning: {n}").format(n=sev["warning"])
         if sev.get("suggestion"):
-            text += f"\nℹ️ Suggestion: {sev['suggestion']}"
+            text += MSG.get("sev_suggestion_count","\nℹ️ Suggestion: {n}").format(n=sev["suggestion"])
         # Evidence chain: expose the diff hash + a few changed files so the result
         # is verifiably tied to a real diff, not a guess.
         diff_hash = (result or {}).get("diff_hash") or ""
         if diff_hash:
-            text += f"\n📄 diff: `{diff_hash[:10]}…`"
+            text += MSG.get("diff_preview","\n📄 diff: `{h}…`").format(h=diff_hash[:10])
         changed_files = ((result or {}).get("changed_files") or [])[:5]
         if changed_files:
             names = []
             for cf in changed_files:
                 parts = cf.split("\t")
                 names.append(parts[-1] if len(parts) > 1 else cf)
-            text += f"\n变更文件预览: {', '.join(names)}"
+            text += MSG.get("files_preview","\n变更文件预览: {names}").format(names=", ".join(names))
             if changed > len(changed_files):
                 text += " …"
         if not sev.get("critical") and not sev.get("warning") and not sev.get("suggestion"):
             text += "\n✅ 未发现严重问题"
         if error and review_text:
             # Partial results — batches succeeded but at least one failed.
-            text += f"\n⚠️ 部分批次的审查失败: {error}（已展示成功的部分）"
+            text += MSG.get("partial_fail","\n⚠️ 部分批次审查失败: {msg}（已展示成功的部分）").format(msg=error)
     return text
 
 

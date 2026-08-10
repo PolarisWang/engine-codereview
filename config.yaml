@@ -154,6 +154,15 @@ messages:
   label_warning_findings: "🟡 **Warning 发现**"
   label_suggestion_findings: "ℹ️ **Suggestion 建议**"
 
+  review_failed_reason: "❌ 审查失败\n原因: {msg}"
+  changed_files_count: "\n变更文件: {n} 个"
+  sev_critical_count: "\n🔴 Critical: {n}"
+  sev_warning_count: "\n🟡 Warning: {n}"
+  sev_suggestion_count: "\nℹ️ Suggestion: {n}"
+  diff_preview: "\n📄 diff: `{h}…`"
+  files_preview: "\n变更文件预览: {names}"
+  partial_fail: "\n⚠️ 部分批次审查失败: {msg}（已展示成功的部分）"
+
 # ── 命令词 (command words) —— 调整识别词在此, 不碰代码 ──
 commands:
   optimize: ["优化", "自动优化", "优化代码", "优化并提交"]
