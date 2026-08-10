@@ -29,7 +29,7 @@ MSG = {
     "queued": "⚠️ 并发 Review 已达上限，本话题已进入排队，稍后自动开始。",
     "queued_position": "⚠️ 并发 Review 已达上限，当前排队第 {pos} 位，稍后自动开始。",
     "started": "↗️ 轮到本话题了，开始自动 Review...",
-    "review_progress": "🤖 **正在 Review...**\n已收到，正在拉取代码并进行 AI 审查，请稍候...",
+    "review_progress": "⏳ 处理中 · 正在 Review...\n已收到 {key}，正在拉取代码并进行 AI 审查，请稍候。\n（这是处理中提示，非最终审查结果）",
     "review_done": "✅ Review 完成。",
     "optimize_started": "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。",
     "optimize_note": "（可再次 `优化` 更新已有 MR，无需单独重申。）",
@@ -97,16 +97,16 @@ def load_config_merged(path=None):
 load_config_merged()
 
 
-def M(key, **kw):
+def M(_k, **kw):
     """Fetch a user-facing message from config.MSG and .format() it. Template uses
     `{name}` placeholders (str.format style) — NOT f-string — so it's safe both in
-    config.yaml and here. Falls back to the literal key if message missing (so a
-    missing config entry degrades to a visible key instead of crashing)."""
-    tpl = MSG.get(key)
+    config.yaml and here. First positional arg is the message key; all kwargs go to
+    .format(), so a template placeholder may be named `key` (e.g. `{key}`) without
+    colliding with the function arg. Falls back to the literal key if message missing."""
+    tpl = MSG.get(_k)
     if tpl is None:
-        return key
+        return _k
     try:
         return tpl.format(**kw)
     except Exception:
-        # Missing/unused kw or bad placeholder → return template raw rather than crash
         return tpl

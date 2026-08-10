@@ -285,7 +285,7 @@ def run(args):
                                       render_msg_id=reply_msg_id)
             _log('PARSING', 'RUNNING', key, getattr(args, "jira_key", ""), '', '', 'reusing card in place (retry)')
         else:
-            progress = "🤖 **正在 Review...**\n已收到，正在拉取代码并进行 AI 审查，请稍候..."
+            progress = M("review_progress", key=issue_key or key)
             rc, out, _ = _run_py("feishu_notifier.py", [
                 "reply-message", "--app-id", app_id, "--app-secret", app_secret,
                 "--chat-id", chat_id, "--message-id", key,
