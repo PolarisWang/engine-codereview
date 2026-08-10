@@ -128,6 +128,14 @@ messages:
   auto_optimizing: "⏳ 已自动优化 {n} 个文件，正在推送修复分支并创建/更新 MR…"
   edit_staged_confirm: "## ⚠️ 自动优化完成，请确认\n\n请回复 `优化` 推送修复分支并创建 MR。"
 
+  review_title: "🔍 {key} · 审查结果"
+  sev_critical_label: "Critical　{n}"
+  sev_warning_label: "Warning　{n}"
+  sev_suggestion_label: "Suggestion　{n}"
+  severity_summary_line: "{c} 个 Critical / {w} 个 Warning / {i} 个 Suggestion"
+  no_issue: "✅ 未发现严重问题"
+  findings_label: "关键发现"
+
 # ── 命令词 (command words) —— 调整识别词在此, 不碰代码 ──
 commands:
   optimize: ["优化", "自动优化", "优化代码", "优化并提交"]

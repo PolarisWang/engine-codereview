@@ -35,6 +35,9 @@ import base64
 
 # Shared helper: HTTP with retry
 from common import http_request
+# 方案C: 用户可见文案从 config.yaml messages 读取(集中配置)
+import config as _config
+MSG = _config.MSG
 
 
 STDIN_PREFIX = "@stdin"
@@ -251,11 +254,11 @@ def build_result_card(issue_key, project, engine_result, game_result, jira_url):
     def sev_text(scores):
         parts = []
         if scores.get("critical"):
-            parts.append(f"🔴 Critical: {scores['critical']}")
+            parts.append("🔴 " + MSG.get("sev_critical_label","Critical: "+str(scores["critical"])).format(n=scores["critical"]))
         if scores.get("warning"):
-            parts.append(f"🟡 Warning: {scores['warning']}")
+            parts.append("🟡 " + MSG.get("sev_warning_label","Warning").format(n=scores["warning"]))
         if scores.get("suggestion"):
-            parts.append(f"ℹ️ Suggestion: {scores['suggestion']}")
+            parts.append("ℹ️ " + MSG.get("sev_suggestion_label","Suggestion").format(n=scores["suggestion"]))
         return " | ".join(parts) if parts else "✅ No issues found"
 
     def get_preview(review_text, max_len=800):
