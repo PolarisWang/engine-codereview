@@ -84,31 +84,48 @@ def _load_skill_review_instructions():
     sk = _os.path.join(skill_root, "SKILL.md")
     if not _os.path.isfile(sk):
         return None
+    ref_dir = _os.path.join(skill_root, "reference")
     # SKILL.md: 提取 Review mindset / Process / severity / 中文输出的关键句
     sk_txt = open(sk, encoding="utf-8", errors="ignore").read()
     lines = [l for l in sk_txt.splitlines() if l.strip()]
-    # 抽含关键引导词的段落
     pick = []
     for l in lines:
         s = l.strip()
         if any(k in s for k in ("Catch bugs", "severity", "Review Process", "Phase 1", "Phase 2",
                                  "Phase 3", "Phase 4", "blocking", "important", "中文", "所有 review")):
             pick.append(s)
-    # 语言参考: cpp.md + python.md 的目录项(检查重点)
-    lang_bullets = []
-    for lang in ("cpp", "python"):
-        p = _os.path.join(skill_root, "reference", lang + ".md")
-        if _os.path.isfile(p):
-            for l in open(p, encoding="utf-8", errors="ignore").read().splitlines():
-                s = l.strip()
-                if s.startswith("- [") or s.startswith("## ") or s.startswith("# "):
-                    lang_bullets.append(s)
+    # 跨切面维度: 抽取 security/architecture/performance/universal/cpp/python 的 ##/### 小节标题
+    # 作为 review 必须覆盖的检查维度(深度体现 skill: 架构/安全/性能/质量/语言专属)。
+    dims = {}
+    ref_priorities = ["security-review-guide", "architecture-review-guide",
+                      "performance-review-guide", "code-quality-universal",
+                      "cpp", "python"]
+    for fname in ref_priorities:
+        p = _os.path.join(ref_dir, fname + ".md")
+        if not _os.path.isfile(p):
+            continue
+        label = {"security-review-guide": "安全(Security)",
+                 "architecture-review-guide": "架构(Architecture)",
+                 "performance-review-guide": "性能(Performance)",
+                 "code-quality-universal": "代码质量(Universal)", "cpp": "C++", "python": "Python"}[fname]
+        heads = []
+        for l in open(p, encoding="utf-8", errors="ignore").read().splitlines():
+            s = l.strip()
+            # 收集 ## / ### 小节标题(检查维度), 去掉纯"目录"等噪音
+            if (s.startswith("## ") or s.startswith("### ")) and s[3:].strip() not in ("目录", "Table of Contents"):
+                heads.append(s)
+        if heads:
+            dims[label] = heads[:14]   # 每文件最多 14 个维度控长度
     parts = ["## 依据 code-review-skill 方法论审查",
              "### 心态与流程", *pick[:40],
-             "### 语言重点(来自 skill 的 C/C++ 与 Python 指南)", *lang_bullets[:60],
-             "### 输出", "所有 finding 用中文描述问题与建议; 严重度分 🔴critical/🟡warning/ℹ️suggestion;",
-             "每个 finding 给 file / severity / 问题 / 建议, 并附简明总结表。"]
-    return "\n".join(parts).strip()[:12000]  # 上限控 token
+             "### 审查必须覆盖的维度(来自 skill 的审查指南)",
+             "请按以下各维度逐一检查并给出 findings(不限于, 但至少覆盖):"]
+    for label, heads in dims.items():
+        parts.append(f"【{label}】")
+        parts.extend(heads)   # 各维度小节标题
+    parts += ["### 输出", "所有 finding 用中文描述问题与建议; 严重度分 🔴critical/🟡warning/ℹ️suggestion;",
+              "每个 finding 给 file / severity / 问题 / 建议, 并附简明总结表。"]
+    return "\n".join(parts).strip()[:16000]  # 上限控 token
 
 
 def load_config():
