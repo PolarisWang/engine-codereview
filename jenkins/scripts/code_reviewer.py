@@ -65,15 +65,64 @@ IMPORTANT: Counts must match actual findings.
 """
 
 
+def _load_skill_review_instructions():
+    """若项目安装了 code-review-skill, 将它的方法论(severity 分级/Review Process/中文输出)
+    + C/C++/Python 语言参考的检查重点, 汇总成一条紧凑的 review system prompt。
+    skill 文件缺失时返回 None(调用方回退默认)。控制长度: 不整篇塞入 238+893+1073 行, 抽核心。
+    """
+    import os as _os
+    scripts_dir = _os.path.dirname(_os.path.abspath(__file__))   # jenkins/scripts
+    proj_root = _os.path.dirname(_os.path.dirname(scripts_dir)) # repo root
+    # 优先读取随代码部署的 jenkins/skills(每个环境都有); 若无回退到开发 .claude/skills。
+    candidates = [
+        _os.path.join(proj_root, "jenkins", "skills", "code-review-skill"),
+        _os.path.join(proj_root, ".claude", "skills", "code-review-skill"),
+    ]
+    skill_root = next((c for c in candidates if _os.path.isfile(_os.path.join(c, "SKILL.md"))), None)
+    if not skill_root:
+        return None
+    sk = _os.path.join(skill_root, "SKILL.md")
+    if not _os.path.isfile(sk):
+        return None
+    # SKILL.md: 提取 Review mindset / Process / severity / 中文输出的关键句
+    sk_txt = open(sk, encoding="utf-8", errors="ignore").read()
+    lines = [l for l in sk_txt.splitlines() if l.strip()]
+    # 抽含关键引导词的段落
+    pick = []
+    for l in lines:
+        s = l.strip()
+        if any(k in s for k in ("Catch bugs", "severity", "Review Process", "Phase 1", "Phase 2",
+                                 "Phase 3", "Phase 4", "blocking", "important", "中文", "所有 review")):
+            pick.append(s)
+    # 语言参考: cpp.md + python.md 的目录项(检查重点)
+    lang_bullets = []
+    for lang in ("cpp", "python"):
+        p = _os.path.join(skill_root, "reference", lang + ".md")
+        if _os.path.isfile(p):
+            for l in open(p, encoding="utf-8", errors="ignore").read().splitlines():
+                s = l.strip()
+                if s.startswith("- [") or s.startswith("## ") or s.startswith("# "):
+                    lang_bullets.append(s)
+    parts = ["## 依据 code-review-skill 方法论审查",
+             "### 心态与流程", *pick[:40],
+             "### 语言重点(来自 skill 的 C/C++ 与 Python 指南)", *lang_bullets[:60],
+             "### 输出", "所有 finding 用中文描述问题与建议; 严重度分 🔴critical/🟡warning/ℹ️suggestion;",
+             "每个 finding 给 file / severity / 问题 / 建议, 并附简明总结表。"]
+    return "\n".join(parts).strip()[:12000]  # 上限控 token
+
+
 def load_config():
-    """Load config from config.yaml (common), falling back to env for model."""
+    """Load config from config.yaml (common), falling back to env for model.
+    review_instructions 优先用 code-review-skill(skill 化方法论+中文); 无 skill 回退配置/默认。"""
     cfg = get_claude_config()
+    skill_instr = _load_skill_review_instructions()
     return {
         "claude": {
             "model": cfg.get("model")
                      or os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
             "max_tokens": cfg.get("max_tokens", 8192),
-            "review_instructions": cfg.get("review_instructions")
+            "review_instructions": skill_instr          # 优先 use skill(你要求)
+                                   or cfg.get("review_instructions")
                                    or DEFAULT_REVIEW_INSTRUCTIONS.strip(),
         }
     }
