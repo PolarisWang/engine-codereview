@@ -122,6 +122,12 @@ messages:
   rollback_enqueued: "⏳ 已记录回退请求，Jenkins 将回退最近一次应用的补丁。"
   denied_why: "⛔ {why}"
 
+  edit_err: "⛔ 自动优化执行异常：{msg}"
+  edit_prep_fail: "⛔ 自动优化准备失败：{msg}"
+  edit_no_diff: "⚠️ 自动优化未生成任何可用修改（可改用 `指引` 看人工修改方案）。"
+  auto_optimizing: "⏳ 已自动优化 {n} 个文件，正在推送修复分支并创建/更新 MR…"
+  edit_staged_confirm: "## ⚠️ 自动优化完成，请确认\n\n请回复 `优化` 推送修复分支并创建 MR。"
+
 # ── 命令词 (command words) —— 调整识别词在此, 不碰代码 ──
 commands:
   optimize: ["优化", "自动优化", "优化代码", "优化并提交"]

@@ -2268,18 +2268,18 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         except Exception as e:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
             pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, f"⛔ 自动改码执行异常：{str(e)[:200]}", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("edit_err", msg=str(e)[:200]), render, state_file, app_id, app_secret)
             return False, f"agent_edit error: {e}"
         if err:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail", err)
             pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, f"⛔ 自动改码准备失败：{err}", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("edit_prep_fail", msg=err), render, state_file, app_id, app_secret)
             return False, f"agent_edit checkout: {err}"
         if not ok_diffs:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail",
                                            "no fixed finding")
             pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, "⚠️ 自动改码未生成任何可用 diff（可改用 `指引` 看人工修改方案）。", render, state_file, app_id, app_secret)
+            _proc_reply(key, topic, M("edit_no_diff"), render, state_file, app_id, app_secret)
             return False, "agent_edit: no usable diff"
         pipeline_state.set_pending_patch(state_file, key, {
             "file": "all", "repo": "engine", "target": "agent_edit",
@@ -2297,7 +2297,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             pipeline_state.set_pending(state_file, key, "agent_edit_confirm",
                                        patch={"actor": act, "branch": branch})
             _proc_reply(key, topic,
-                        f"⏳ 已自动优化 {len(ok_diffs)} 个文件，正在推送修复分支并创建/更新 MR…",
+                        M("auto_optimizing", n=len(ok_diffs)),
                         render, state_file, app_id, app_secret, intent="优化：改码→自动推送→创建/更新MR")
             return True, f"agent_edit: staged {len(ok_diffs)} files; auto-confirm enqueued"
         lines = [f"## ⚠️ 自动改码完成，请确认\n",
