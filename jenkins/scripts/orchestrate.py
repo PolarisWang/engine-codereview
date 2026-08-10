@@ -2583,6 +2583,40 @@ def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None):
     return closed
 
 
+def run_queued_topics(state_file, workspace, app_id, app_secret, limit=3):
+    """F: 排队复入健壮性加固 —— 独立重跑 queued=True 的 topic。
+
+    并发满时被排队(queued=True)的 topic, 原依赖 scanner 在下个 tick 重新从群消息
+    选中它复入。若该话题的群消息被删除/不可见, scanner 不再返回它 → topic 永久滞留。
+    这里在 Jenkins consume tick 里, 独立枚举所有 queued=True 的 topic, 为其重跑
+    orchestrato run()(内部 _acquire_review_slot 会在有槽时自动放行), 不依赖群消息可见。
+    limit 每 tick 最多重试几个, 避免一下子放太多。返回 {key: last_phase}."""
+    import subprocess as _sp, os as _os
+    replayed = {}
+    try:
+        topics = pipeline_state.list_topics(state_file)
+        queued = [t for t in topics if t.get("queued")]
+        for t in queued[:limit]:
+            key = t.get("message_id") or ""
+            if not key or t.get("phase") in ("CLOSED", "DONE", "FAILED"):
+                continue
+            jira_url = t.get("jira_url") or key
+            jira_key = t.get("jira_key") or ""
+            try:
+                r = _sp.run(
+                    [sys.executable, _os.path.join(SCRIPTS_DIR, "orchestrate.py"), "run",
+                     "--key", key, "--mode", "scan",
+                     "--jira-key", jira_key, "--jira-url", jira_url,
+                     "--workspace", workspace, "--pipeline-state-file", state_file],
+                    capture_output=True, text=True, timeout=300)
+                replayed[key] = ("re-run" if r.returncode == 0 else "fail")
+            except Exception as e:
+                replayed[key] = f"err:{str(e)[:40]}"
+    except Exception as e:
+        print(f"[queued] run_queued_topics err: {e}", file=sys.stderr)
+    return replayed
+
+
 def poll_ci_all(state_file, workspace, refresh_minutes=15):
     """arch-C: refresh MR CI status onto topic cards for recently-active topics
     that have an mr_url. Deduped by cmd_ci (only posts on change). Returns a dict
@@ -3436,7 +3470,12 @@ def main(argv=None):
                            _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"), lock_dir=lock_dir)
         for k, (ok, note) in ac.items():
             print(f"[autoclose] {k}: {'OK' if ok else 'FAIL'} — {note}", flush=True)
-        sys.exit(0 if (results or ac) else 1)
+        # F: 排队复入健壮性 —— 独立重跑 queued topic (不依赖群消息可见)。
+        rr = run_queued_topics(args.pipeline_state_file, args.workspace,
+                               _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"))
+        for k, st in rr.items():
+            print(f"[queued] replays {k}: {st}", flush=True)
+        sys.exit(0 if (results or ac or rr) else 1)
     elif args.command == "action":
         sys.exit(cmd_action(args))
     elif args.command == "ci":
