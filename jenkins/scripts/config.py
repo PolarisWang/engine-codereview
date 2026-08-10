@@ -102,10 +102,16 @@ def M(_k, **kw):
     `{name}` placeholders (str.format style) — NOT f-string — so it's safe both in
     config.yaml and here. First positional arg is the message key; all kwargs go to
     .format(), so a template placeholder may be named `key` (e.g. `{key}`) without
-    colliding with the function arg. Falls back to the literal key if message missing."""
+    colliding with the function arg. Falls back to the literal key if message missing.
+
+    The minimal YAML parser keeps `\\n`/`\\t` as LITERAL backslash-n (it doesn't unescape
+    quoted escapes), so we convert them here so cards show real newlines/tabs, not the
+    literal `\\n` text (bug seen as '\n' in Feishu card)."""
     tpl = MSG.get(_k)
     if tpl is None:
         return _k
+    if isinstance(tpl, str):
+        tpl = tpl.replace("\\n", "\n").replace("\\t", "\t")
     try:
         return tpl.format(**kw)
     except Exception:
