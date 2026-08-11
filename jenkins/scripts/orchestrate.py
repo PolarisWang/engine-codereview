@@ -650,6 +650,23 @@ def _agent_system(topic, api_key):
     )
 
 
+def _refresh_last_user_activity(state_file, key):
+    """F2: record a real user reply as the topic's last_user_activity. Extracted so
+    it's independently testable and so the state_file is passed in (previously a
+    before-use bug silently disabled this refresh — see #P0). No-op on a closed or
+    missing topic; swallows storage errors with a logged warning (never breaks the
+    user-facing reply)."""
+    try:
+        cur = pipeline_state.get_topic(state_file, key)
+        if cur is not None and cur.get("phase") != "CLOSED":
+            pipeline_state.set_topic_fields(state_file, key,
+                                             last_user_activity=pipeline_state._now_iso())
+            return True
+    except Exception as _e:
+        print(f"[interact] refresh last_user_activity error: {_e}", file=sys.stderr)
+    return False
+
+
 def _should_auto_close(topic, now_ts=None):
     """R7: whether a topic is due for lazy auto-close (idle > IDLE_CLOSE_DAYS and
     not already CLOSED). Applies to ANY non-CLOSED phase — including DONE/FAILED —
@@ -754,15 +771,12 @@ def interact(args):
     """
     key = args.key
     reply_text = (args.reply or "").strip()
-    # F2: 真实用户回复刷新 last_user_activity(独立闲置判定), 而非 updated_at.
-    try:
-        topic_cur = pipeline_state.get_topic(state_file, key)
-        if topic_cur is not None and topic_cur.get("phase") != "CLOSED":
-            pipeline_state.set_topic_fields(state_file, key, last_user_activity=pipeline_state._now_iso())
-    except Exception:
-        pass
+    # 先解析出 state_file/workspace(它们若不在此处赋值, 手记处会 UnboundLocalError,
+    # 被裸 except 吞掉, 导致 last_user_activity 永不刷新 —— F2 闲置判定失效)。
     workspace = args.workspace
     state_file = args.pipeline_state_file or os.environ.get("PIPELINE_STATE_FILE", "pipeline-state.json")
+    # F2: 真实用户回复刷新 last_user_activity(独立闲置判定), 而非 updated_at。
+    _refresh_last_user_activity(state_file, key)
     app_id = _env("FEISHU_APP_ID")
     app_secret = _env("FEISHU_APP_SECRET")
     api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
@@ -1331,12 +1345,22 @@ def _ensure_checkout(topic, workspace):
         # previous fix attempt. Without this, the reusable checkout silently
         # carries a stale SHA (and stale haves) — which caused oversized push packs
         # (HTTP 413) and foreign/corrupt file states to leak across reviews.
-        _sp.run(["git", "-C", dest, "fetch", "--quiet", "origin", src],
-                capture_output=True, text=True, timeout=300)
-        _sp.run(["git", "-C", dest, "reset", "--hard", f"origin/{src}"],
-                capture_output=True, text=True, timeout=60)
-        _sp.run(["git", "-C", dest, "clean", "-fdx"],
-                capture_output=True, text=True, timeout=60)
+        # P3: 任一复位失败都必须可见 —— 静默失败会留下陈旧基线(MR7091 的串线向量)。
+        _fr = _sp.run(["git", "-C", dest, "fetch", "--quiet", "origin", src],
+                      capture_output=True, text=True, timeout=300)
+        _rr = _sp.run(["git", "-C", dest, "reset", "--hard", f"origin/{src}"],
+                      capture_output=True, text=True, timeout=60)
+        _cr = _sp.run(["git", "-C", dest, "clean", "-fdx"],
+                      capture_output=True, text=True, timeout=60)
+        for _nm, _rc, _err in (("fetch", _fr, _fr.stderr[:300]),
+                               ("reset", _rr, _rr.stderr[:300]),
+                               ("clean", _cr, _cr.stderr[:300])):
+            if _rc != 0:
+                print(f"[checkout] {_nm} failed rc={_rc} in {dest}: {_err}", file=sys.stderr)
+        # P3: reset 是基线完整性的关键 —— 复位失败意味着 checkout 可能停留在陈旧/串线基线
+        # (MR7091 根因), 此时绝不复用该树, 返回错误让调用方重新拉取而非在坏基线上改码。
+        if _rr.returncode != 0:
+            return None, f"checkout 复位到 origin/{src} 失败(基线不可信), 请重试"
         return dest, None
     # Clean URL — no token; git_askpass.sh supplies credentials via env.
     repo_url = f"https://gitlab.booming-inc.com/{pp}.git"
@@ -2939,6 +2963,14 @@ def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret):
     return "无 open MR 也无 bot 分支，无需释放" + note_dir
 
 
+def _is_bot_fix_commit(title):
+    """True if a commit title is a bot-generated fix commit (`[codereview-agent] ...`).
+    Used by 方案A to ensure a fix MR only carries the bot's own fix commits — if a
+    compare range includes any non-bot commit, the fix branch did not sit cleanly on
+    the review branch (serial-baseline pollution, see MR7091) and we refuse to create."""
+    return (title or "").startswith("[codereview-agent]")
+
+
 def _branch_is_bot_created(proj, branch, tok):
     """True if a GitLab branch exists AND its HEAD commit is authored by the bot
     (commit message contains '[codereview-agent]' or author name 'codereview-agent').
@@ -3226,10 +3258,22 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False, branch=None)
                    f"/repository/compare?from={urllib.parse.quote(target, safe='')}"
                    f"&to={urllib.parse.quote(new_branch, safe='')}")
         diffs = (cmp or {}).get("diffs") or []
+        cmp_commits = (cmp or {}).get("commits") or []
     except Exception:
-        diffs = []
+        diffs, cmp_commits = [], []
     if not diffs:
         return None, None, new_branch, "fix 分支相对 " + target + " 无改动，先推送修复再更新MR"
+    # 方案A(基线一致性): fix MR 只能"只含 bot 自己的修复提交"。若 compare 出的提交里
+    # 混入了非 bot 提交(例如共享 checkout 串线带来的 mempool 历史, 见 MR7091), 说明修复
+    # 分支没有干净地落在 review_branch 之上 —— 此时宁可拒建也绝不创建一个"标签对、diff 错"
+    # 的坏 MR。bot 提交特征: 提交信息以 [codereview-agent] 开头(改码/优先生成的)。
+    bot_commits = [c for c in cmp_commits if _is_bot_fix_commit(c.get("title") or "")]
+    if len(bot_commits) != len(cmp_commits):
+        foreign = len(cmp_commits) - len(bot_commits)
+        return None, None, new_branch, (
+            f"修复分支基线异常: 相对 {target} 的提交中 {foreign} 个不是机器人修复提交"
+            f"(疑似串线历史)。已取消创建, 请先 `重新审查` 重建修复分支。"
+        )
 
     # 3) create
     title = f"Fix {topic.get('jira_key') or topic.get('message_id') or ''}: code review fixes"
