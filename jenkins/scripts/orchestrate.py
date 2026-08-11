@@ -2293,6 +2293,7 @@ def _ensure_shared_checkout(topic, repo, workspace):
     方案B(C#2): like autofix, the apply/push/rollback executor operates on the topic's
     per-topic dir {repo}-review/{slug} (not a shared flat dir), so one topic's applied
     patch / branch switch can never leak into another topic's apply/push/rollback."""
+    import subprocess as _sp
     url = ""
     for r in ("engine", "game"):
         if repo == r:
