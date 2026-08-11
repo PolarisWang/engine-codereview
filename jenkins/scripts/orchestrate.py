@@ -3325,6 +3325,9 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
                   engine_repo, game_repo, mr_url, workspace, eng_out, gam_out):
     # Cache dir for reuse by diff_hash (avoids re-POSTing unchanged diffs to the LLM).
     cache_dir = os.path.join(workspace, ".review_cache")
+    # Review cache version: bump when the rendered review format/prompt changes, so
+    # caches written under an older render (e.g. pre-skill-template) are not reused.
+    REVIEW_CACHE_VERSION = 2
 
     def _one(repo, repo_url, rb, baseb, out_path):
         base_args = ["--repo", repo_url, "--branch", rb, "--base-branch", baseb,
@@ -3344,7 +3347,7 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         # review — it means the branch/base produced no diff. Only cache real diffs.
         EMPTY_DIFF_HASHES = {"da39a3ee5e6b4b0d3255bfef95601890afd80709", ""}
         if diff_hash not in EMPTY_DIFF_HASHES:
-            cached = os.path.join(cache_dir, f"{key}_{repo}_{diff_hash}.json")
+            cached = os.path.join(cache_dir, f"v{REVIEW_CACHE_VERSION}_{key}_{repo}_{diff_hash}.json")
             if os.path.exists(cached):
                 # Reuse cached review result (same diff, already reviewed).
                 _log('REPO', 'CACHED', key, issue_key, project, repo,
@@ -3360,7 +3363,7 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         # Save to cache for reuse only for a REAL (non-empty) diff.
         if res and diff_hash and diff_hash not in EMPTY_DIFF_HASHES:
             os.makedirs(cache_dir, exist_ok=True)
-            with open(os.path.join(cache_dir, f"{key}_{repo}_{diff_hash}.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(cache_dir, f"v{REVIEW_CACHE_VERSION}_{key}_{repo}_{diff_hash}.json"), "w", encoding="utf-8") as f:
                 json.dump(res, f, ensure_ascii=False)
         if res is None and rc2 != 0:
             res = {"error": err2 or f"{repo} review failed"}
