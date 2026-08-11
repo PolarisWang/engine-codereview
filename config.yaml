@@ -45,6 +45,8 @@ projects:
 workspace:
   base_dir: /data/codereview/workspace
   cache_repos: true   # reuse local clones, fetch instead of clone
+  # 方案B: 剩余磁盘低于该字节数(默认2GiB)时禁止新建 checkout 目录, 改为复用/拒绝。
+  # disk_free_min_bytes: 2147483648
 
 # ============================================================
 # Real-time event subscription server (topic interaction)
@@ -94,6 +96,9 @@ lifecycle:
 concurrency:
   # 同时 running 的 review 子进程上限。超出的 topic 排队。
   max_reviews: 6
+  # 方案B: 最多同时保留的按-topic 隔离 checkout 目录数(磁盘上限)。
+  # 默认= max_reviews 跟随上限; 超过时新话题复用 LRU 目录或排队。
+  # max_open_checkout_dirs: 6
 
 # ── 文案 (user-facing copy) —— 改措辞在此, 不碰代码 ──
 messages:

@@ -44,7 +44,8 @@ from pipeline_state import log_line
 # Central runtime configuration (lifecycle / concurrency / LLM / workspace).
 from config import (IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS,
                     DEFAULT_WORKSPACE, CHECKOUT_RESET_ON_REUSE, EDIT_MODEL,
-                    AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN, AUTO_CLOSE_HOURS)
+                    AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN, AUTO_CLOSE_HOURS,
+                    MAX_OPEN_CHECKOUT_DIRS, DISK_FREE_MIN_BYTES)
 import config as _config          # 方案C: 经 config 模块读 MSG/CMD(集中 config.yaml)
 MSG = _config.MSG
 CMD = _config.CMD
@@ -1210,12 +1211,90 @@ def _auth_git_env(extra=None):
     return env
 
 
+# ── 方案B: 按-topic 隔离 checkout 目录 ────────────────────────────────
+# 同一 git 仓库的每个 topic 拥有自己独立的 checkout 目录
+#   {workspace}/{repo_name}-review/{slug}
+# 而非所有 topic 挤在一个 {repo_name}-review 里。这消除跨 topic 的 checkout
+# 状态串线(mempool 历史泄漏进 LOD fix MR 的根因之一)。目录路径由 topic 确定性
+# 推导(branch 名), 因此 _ensure_checkout 与 _close_topic_resources 都能算出
+# 同一个目录来做"建 clone"与"关闭即删"配对。
+#
+# 磁盘资源保护(三个保证)：
+#   1) open 话题上限  —— MAX_OPEN_CHECKOUT_DIRS 封顶现有目录数, 超出则不再新建
+#      (topic 保持 pending/排队, 待有关口释放), 避免目录数随累积话题无界增长。
+#   2) 关闭即释放     —— topic CLOSED 时 _close_topic_resources 删除它自己的目录。
+#   3) 磁盘容量保护   —— 新建/复用前检查 statvfs 剩余空间, 低于 DISK_FREE_MIN_BYTES
+#      则拒绝新建(复用或返回错误), 不把共享盘写爆。
+
+def _checkout_slug(topic):
+    """Deterministic, filesystem-safe per-topic slug for the checkout subdir.
+    Derives from the review branch (stable across the topic's lifetime) so close-time
+    can re-derive the same dir. Falls back to the message_id / a hash if no branch."""
+    import re as _re
+    branch = (topic.get("review_branch") or topic.get("base_branch") or "") \
+        if isinstance(topic, dict) else ""
+    slug = _re.sub(r"[^A-Za-z0-9_.-]", "_", branch).strip("._") if branch else ""
+    if not slug:
+        import hashlib
+        src = str(topic.get("message_id")) or str(topic) or "untracked"
+        slug = "topic_" + hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
+    return slug[:64]
+
+
+def _checkout_dir_for(workspace, repo_name, topic):
+    """Return the per-topic checkout dir: {workspace}/{repo}-review/{slug}. Parent
+    {workspace}/{repo}-review is the repo's dir pool (all topics of that repo)."""
+    return os.path.join(workspace, f"{repo_name}-review", _checkout_slug(topic))
+
+
+def _repo_name_from_checkout(checkout):
+    """Robustly recover the repo lock-key from a checkout path under either layout:
+       flat  {workspace}/chaos-cb-2-review        -> 'chaos-cb-2'
+       nested{workspace}/chaos-cb-2-review/{slug} -> 'chaos-cb-2' (parent has -review)
+    Used so the cross-process lock keys stay per-repo regardless of per-topic subdirs."""
+    base = os.path.basename(checkout or "")
+    parent = os.path.basename(os.path.dirname(checkout or "") or "")
+    for cand in (parent, base):
+        if cand.endswith("-review"):
+            return cand[: -len("-review")]
+    return parent or base
+
+
+def _list_checkout_dirs(workspace, repo_name):
+    """List existing per-topic checkout subdir paths for a repo pool (dirs only)."""
+    pool = os.path.join(workspace, f"{repo_name}-review")
+    try:
+        return [os.path.join(pool, n) for n in os.listdir(pool)
+                if os.path.isdir(os.path.join(pool, n))]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+
+
+def _disk_free_bytes(directory):
+    """Free bytes on the filesystem holding `directory` (best-effort; -1 on error).
+    Used so the bot never fills the shared disk (statvfs guard before new clone)."""
+    import shutil
+    try:
+        usage = shutil.disk_usage(os.path.abspath(directory or "."))
+        return usage.free
+    except Exception:
+        return -1
+
+
 def _ensure_checkout(topic, workspace):
-    """Clone (or reuse) the topic's review branch to a deterministic checkout dir in
+    """Clone (or reuse) the topic's OWN review-branch checkout to a per-topic dir in
     workspace. Returns (checkout_dir, err) or (None, err). Authenticates via the
     GIT_ASKPASS helper (token delivered through env, never on argv or in the clone
     URL) so the token is not persisted into <checkout>/.git/config — same rule the
-    reviewer's prepare_repo uses."""
+    reviewer's prepare_repo uses.
+
+    方案B: each topic gets its OWN dir ({repo}-review/{slug}), so a prior topic's
+    git state (e.g. a mempool branch) can never leak into another topic's fix branch.
+    Guards: MAX_OPEN_CHECKOUT_DIRS ceiling + DISK_FREE_MIN_BYTES statvfs protection.
+    The top-level repo basename is also the reason we keep the parent named
+    '{repo}-review' — existing lock/branch logic keys off it."""
     import subprocess as _sp
     src = topic.get("review_branch") or topic.get("base_branch") or ""
     if not src:
@@ -1226,8 +1305,26 @@ def _ensure_checkout(topic, workspace):
     if not pp:
         return None, "no mr project path"
     repo_name = pp.rstrip("/").split("/")[-1]
-    dest = os.path.join(workspace, f"{repo_name}-review")
+    dest = _checkout_dir_for(workspace, repo_name, topic)
     tok = _env("GITLAB_TOKEN")
+    if not tok:
+        return None, "no GITLAB_TOKEN for checkout"
+    # 方案B 磁盘资源保护(3 个保证)：
+    #   a) 磁盘容量 —— 剩余空间低于阈值时绝不再新建 clone(复用已存在目录或拒绝)。
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        free = _disk_free_bytes(workspace)
+        if free >= 0 and free < DISK_FREE_MIN_BYTES:
+            print(f"[checkout] disk low: {free//(1024*1024)}MiB free < "
+                  f"{DISK_FREE_MIN_BYTES//(1024*1024)}MiB; refuse new clone", file=sys.stderr)
+            return None, "磁盘空间不足，稍后再试"
+        #   b) open 目录上限 —— 该 repo 的目录数已达 MAX_OPEN_CHECKOUT_DIRS 且本 topic
+        #      尚未建目录: 不新建, 保持 pending/排队, 等关闭话题释放后再重试(严格隔离,
+        #      不复用他人目录)。这样磁盘上每个 topic 目录数被封顶。
+        existing = _list_checkout_dirs(workspace, repo_name)
+        if len(existing) >= MAX_OPEN_CHECKOUT_DIRS:
+            print(f"[checkout] per-topic dir ceiling "
+                  f"{MAX_OPEN_CHECKOUT_DIRS} reached for {repo_name}; defer", file=sys.stderr)
+            return None, f"当前 open 话题目录数已达上限({MAX_OPEN_CHECKOUT_DIRS})，请先关闭旧话题"
     if os.path.isdir(os.path.join(dest, ".git")):
         # Reuse the tree but force-align it to the latest remote HEAD and drop any
         # residual working changes/untracked files left by an earlier topic or a
@@ -1241,10 +1338,13 @@ def _ensure_checkout(topic, workspace):
         _sp.run(["git", "-C", dest, "clean", "-fdx"],
                 capture_output=True, text=True, timeout=60)
         return dest, None
-    if not tok:
-        return None, "no GITLAB_TOKEN for checkout"
     # Clean URL — no token; git_askpass.sh supplies credentials via env.
     repo_url = f"https://gitlab.booming-inc.com/{pp}.git"
+    # Ensure the repo's pool parent exists so git clone can create the per-topic leaf.
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+    except OSError:
+        pass
     _askpass = os.path.join(SCRIPTS_DIR, "git_askpass.sh")
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=_askpass,
                CR_GITLAB_USER=_env("GITLAB_USER", "gitlab-ci-token"),
@@ -1537,7 +1637,7 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     if err:
         return [], [], branch, None, err, ""
     # R17: serialize edits on this repo's shared checkout across processes.
-    repo_name = os.path.basename(checkout).removesuffix("-review")
+    repo_name = _repo_name_from_checkout(checkout)
     with _checkout_lock(repo_name):
         # _ensure_checkout already reset the reused tree to origin/{src} (fetch + reset +
         # clean), so the fix branch below is carved from the latest remote HEAD, not a
@@ -1665,7 +1765,7 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
     # R17: serialize this repo's shared-checkout mutations (checkout -B / R1
     # guard / add / commit / replay / push) across processes so two topics editing
     # the same repo cannot clobber each other's working tree.
-    repo_name = os.path.basename(checkout).removesuffix("-review")
+    repo_name = _repo_name_from_checkout(checkout)
     with _checkout_lock(repo_name):
         _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
                 capture_output=True, text=True, timeout=60, env=_git_env)
@@ -2362,7 +2462,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         _sp2.run(["git", "-C", checkout, "fetch", "--unshallow", "origin"],
                  capture_output=True, text=True, timeout=600, env=_git_env)
         # R17: serialize this repo's shared-checkout mutations across processes.
-        repo_name = os.path.basename(checkout).removesuffix("-review")
+        repo_name = _repo_name_from_checkout(checkout)
         with _checkout_lock(repo_name):
             _sp2.run(["git", "-C", checkout, "checkout", "-B", branch],
                      capture_output=True, text=True, timeout=60, env=_git_env)
@@ -2805,8 +2905,22 @@ def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret):
                 break
     except Exception:
         pass
+    # 方案B: 无论是否有 open fix MR, 关闭即删本地按-topic checkout 目录(释放磁盘,
+    # 并让 open 目录上限回落)。MR 在服务端, 本地 clone 仅工作副本, 删除安全。
+    try:
+        import shutil as _shutil
+        repo_name = pp.rstrip("/").split("/")[-1]
+        cdir = _checkout_dir_for(_DEFAULT_WORKSPACE, repo_name, topic)
+        if os.path.isdir(cdir):
+            _shutil.rmtree(cdir, ignore_errors=True)
+            note_dir = "、已删本地 checkout 目录" if not os.path.isdir(cdir) else "、本地 checkout 目录删除失败(占用)"
+        else:
+            note_dir = ""
+    except Exception as _e:
+        print(f"[autoclose] local checkout cleanup error: {_e}", file=sys.stderr)
+        note_dir = ""
     if open_mr_on_branch:
-        return "有 open fix MR，保留分支待人工合并（未自动删除）"
+        return "有 open fix MR，保留分支待人工合并（未自动删除）" + note_dir
     # 无 open MR -> 孤儿分支, 安全释放(删分支)
     if _branch_is_bot_created(proj, new_branch, tok):
         try:
@@ -2815,14 +2929,14 @@ def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret):
                 f"{urllib.parse.quote(new_branch, safe='')}",
                 method="DELETE", headers={"PRIVATE-TOKEN": tok})
             urllib.request.urlopen(req, timeout=20)
-            return f"删除孤儿 fix 分支 {new_branch}"
+            return f"删除孤儿 fix 分支 {new_branch}" + note_dir
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                return "分支已不存在"
-            return f"删分支失败 HTTP {e.code}"
+                return "分支已不存在" + note_dir
+            return f"删分支失败 HTTP {e.code}" + note_dir
         except Exception:
-            return "删分支失败(网络)"
-    return "无 open MR 也无 bot 分支，无需释放"
+            return "删分支失败(网络)" + note_dir
+    return "无 open MR 也无 bot 分支，无需释放" + note_dir
 
 
 def _branch_is_bot_created(proj, branch, tok):
@@ -2934,6 +3048,20 @@ def _close_topic_resources(topic):
                     notes.append(f"删分支失败 HTTP {e.code} ({br})")
             except Exception:
                 notes.append(f"删分支失败(网络) ({br})")
+    # 3) 释放本地按-topic checkout 目录(方案B): topic 关闭即删, 释放磁盘并保证
+    #    open 目录上限能回落。目录不存在则幂等跳过; 删除失败仅记录, 不阻断关闭。
+    try:
+        import shutil as _shutil
+        repo_name = pp.rstrip("/").split("/")[-1]
+        cdir = _checkout_dir_for(_DEFAULT_WORKSPACE, repo_name, topic)
+        if os.path.isdir(cdir):
+            _shutil.rmtree(cdir, ignore_errors=True)
+            if not os.path.isdir(cdir):
+                notes.append("删除本地 checkout 目录")
+            else:
+                notes.append("删除本地 checkout 目录失败(占用)")
+    except Exception as _e:
+        print(f"[close] local checkout cleanup error: {_e}", file=sys.stderr)
     return "（已释放：{}）".format("、".join(notes)) if notes else ""
 
 
