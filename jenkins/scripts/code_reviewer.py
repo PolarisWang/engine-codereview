@@ -153,11 +153,18 @@ REVIEW_TOOLS = [{
     "description": (
         "Return the code review findings as structured JSON. Use this tool "
         "EVERY time you complete a review. The findings array is the source of "
-        "truth for severity counts."
+        "truth for severity counts. Also provide a short summary, a few strengths, "
+        "and assign each finding a review category (architecture/security/performance/"
+        "quality) so the report can be rendered in the code-review-skill template."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
+            "summary": {"type": "string",
+                        "description": "1-2 sentence overview of what was reviewed and the overall conclusion (中文)."},
+            "strengths": {"type": "array",
+                          "items": {"type": "string"},
+                          "description": "2-3 things that were done well (中文, optional)."},
             "findings": {
                 "type": "array",
                 "items": {
@@ -169,6 +176,11 @@ REVIEW_TOOLS = [{
                             "type": "string",
                             "enum": ["critical", "warning", "suggestion"],
                             "description": "Severity of this finding."
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": ["architecture", "security", "performance", "quality"],
+                            "description": "Review dimension of this finding (from the skill's cross-cutting guides)."
                         },
                         "issue": {"type": "string",
                                   "description": "One-line description of the problem."},
@@ -510,41 +522,65 @@ def _findings_counts(findings):
     return counts
 
 
-def _build_markdown_from_findings(findings):
-    """Build a complete, readable markdown report from structured findings, with
-    a summary table that matches severity_counts exactly.
+def _build_markdown_from_findings(findings, meta=None):
+    """Build a review report modeled on the code-review-skill PR template:
+      Summary / Strengths / Architecture&Performance / Required(blocking) / Important / Nit.
 
-    skill 风格: 使用 code-review-skill 的 severity 标签体系(🔴[blocking]/🟡[important]/
-    🟢[nit]/ℹ️[suggestion]), 按 Review Process 分阶段组织, 中文叙述式 —— 而非仅纯条目。
+    Uses `meta` (summary/strengths) and per-finding `category`(architecture/security/
+    performance/quality) when provided; falls back to plain severity grouping when the
+    model didn't supply them, so the card is always complete.
     """
-    # skill 的 severity 标签: critical->[blocking], warning->[important], suggestion->[nit]
+    meta = meta or {}
+    findings = findings or []
+    def _norm_idx(f):
+        s = (f.get("severity") or "").lower()
+        return 0 if s in ("critical","high","error","blocker") else (1 if s in ("warning","warn") else 2)
     def _tag(f):
         s = (f.get("severity") or "").strip().lower()
         if s in ("critical", "high", "error", "blocker"):
             return ("🔴", "[blocking]", "必须修复")
         if s in ("warning", "warn", "medium", "minor"):
             return ("🟡", "[important]", "应处理")
-        return ("🟢", "[nit]", "建议")
-    reviews = []
-    for f in findings or []:
-        emoji, tag, rank = _tag(f)
-        reviews.append(
-            f"### {emoji} {tag} {rank}\n\n"
-            f"**文件**: {f.get('file','')}\n"
-            f"**问题**: {f.get('issue','')}\n"
-            f"**建议**: {f.get('suggestion','')}\n")
-    if not reviews:
-        return ""
-    c = _findings_counts(findings)
-    # skill 风格总结(带分级标签 + 阶段说明)
-    return ("## 代码审查结果（依据 code-review-skill 方法论）\n\n"
-            "### 维度覆盖: 架构 / 安全 / 性能 / 代码质量 / 语言专属\n"
-            "### Findings:\n\n" + "\n".join(reviews) +
-            f"\n## 审查总结（{sum(c.values())} 项）\n"
-            f"- 🔴 [blocking] 必须修复: {c['critical']}\n"
-            f"- 🟡 [important] 应处理: {c['warning']}\n"
-            f"- 🟢 [nit] 可选/建议: {c['suggestion']}\n"
-            "> 建议修复顺序: 先 [blocking], 再 [important], [nit] 视资源而定。可对 [blocking] 走自动修复闭环(`优化`)。")
+        return ("🟢", "[nit]", "可选")
+    groups = {"critical": [], "warning": [], "suggestion": []}
+    for f in findings:
+        groups[["critical", "warning", "suggestion"][_norm_idx(f)]].append({**f, **{"_tag": _tag(f)}})
+
+    c = {"critical": len(groups["critical"]), "warning": len(groups["warning"]), "suggestion": len(groups["suggestion"])}
+
+    parts = ["# 🔍 Code Review 报告（依据 code-review-skill）"]
+    # Summary
+    if meta.get("summary"):
+        parts.append(f"## 📋 Summary\n{meta['summary']}")
+    else:
+        parts.append(f"## 📋 Summary\n审查 {sum(c.values())} 项发现, 其中 {c['critical']} 项必改。")
+    # Strengths (fallback: omit if none)
+    if meta.get("strengths"):
+        parts.append("## ✅ Strengths\n" + "\n".join(f"- {s}" for s in meta["strengths"][:3]))
+    # Architecture & Performance (from category=arch/perf findings)
+    arch = [f for f in findings if (f.get("category") or "").lower() == "architecture"]
+    perf = [f for f in findings if (f.get("category") or "").lower() == "performance"]
+    if arch or perf:
+        ap = ["## 🔍 Architecture & Performance"]
+        if arch:
+            ap.append("**架构**:\n" + "\n".join(f"  - {f['file']}: {f['issue']}" for f in arch[:5]))
+        if perf:
+            ap.append("**性能**:\n" + "\n".join(f"  - {f['file']}: {f['issue']}" for f in perf[:5]))
+        parts.append("\n".join(ap))
+    # Findings by severity
+    for k in ("critical", "warning", "suggestion"):
+        if not groups[k]:
+            continue
+        emoji, tag, rank = groups[k][0]["_tag"]
+        parts.append(f"## {emoji} {tag} {rank} ({len(groups[k])})")
+        for f in groups[k]:
+            cat = f.get("category") or ""
+            parts.append(f"- **{f['file']}**{('['+cat+']') if cat else ''}: {f['issue']} → 建议 {f['suggestion']}")
+    # Summary counts
+    parts.append("## 📊 总结")
+    parts.append(f"🔴[blocking] {c['critical']} / 🟡[important] {c['warning']} / 🟢[nit] {c['suggestion']}")
+    parts.append("> 建议修复顺序: 先 [blocking], 再 [important], [nit] 视资源而定。")
+    return "\n\n".join(parts)
 
 
 def _count_severities(review_text):
@@ -645,6 +681,7 @@ def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
     # Extract markdown text + structured findings from the response blocks.
     review_text = ""
     findings = None
+    meta = {}
     try:
         blocks = result.get("content") or []
         text_parts = []
@@ -655,13 +692,17 @@ def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
                 inp = b.get("input") or {}
                 if isinstance(inp.get("findings"), list):
                     findings = inp["findings"]
+                if inp.get("summary"):
+                    meta["summary"] = inp["summary"]
+                if inp.get("strengths"):
+                    meta["strengths"] = inp["strengths"]
         review_text = "".join(text_parts)
         if findings:
             # Always produce a complete, count-consistent markdown report rebuilt
             # from the structured findings. This avoids truncated/fragmentary text
             # blocks from a tool-only or partial response, and guarantees the
             # detailed card matches severity_counts exactly.
-            review_text = _build_markdown_from_findings(findings)
+            review_text = _build_markdown_from_findings(findings, meta=meta)
         if not review_text:
             review_text = result.get("completion", json.dumps(result))
     except Exception:

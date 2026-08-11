@@ -367,13 +367,22 @@ def run(args):
     # 5. Render + send final summary as PLAIN-TEXT messages (普通文字消息, 全量不折叠).
     pipeline_state.transition(state_file, key, to="NOTIFYING", status="RUNNING")
     _log('NOTIFY', 'RUNNING', key, issue_key, project, '', 'sending final summary')
-    chunks = feishu_notifier.render_full_findings_text(
-        issue_key, project, review_branch, base_branch, jira_url, mr_url,
-        eng_res or {}, gam_res or {},
-    )
-    # 合并成一个完整 review 文本(普通文字消息可较长, 飞书不折叠); 若仍超长, 拆多段逐条发。
-    full_text = "\n\n".join(c for c in chunks if c).rstrip()
-    # 全量 review 单条普通消息发出(≤45000字符, 已验证飞书≈30k可发); 超大才拆第二段。
+    # 方案C: 直接用 code_reviewer 产出的 skill 模板 review_text(含 Summary/Strengths/
+    # 架构性能/严重度), 而非 feishu_notifier 旧的分组重渲染 —— 保证群里显示 skill 模板。
+    rev_texts = []
+    for res in (eng_res or {}, gam_res or {}):
+        rt = ((res or {}).get("review") or {}).get("review_text") or ""
+        if rt:
+            rev_texts.append(rt)
+    if rev_texts:
+        full_text = "\n\n".join(rev_texts)
+    else:
+        chunks = feishu_notifier.render_full_findings_text(
+            issue_key, project, review_branch, base_branch, jira_url, mr_url,
+            eng_res or {}, gam_res or {},
+        )
+        full_text = "\n\n".join(c for c in chunks if c).rstrip()
+    # 全量 review 单条普通消息发出(≤45000字符); 超大才拆第二段。
     segs = _split_text(full_text)
     # 记录渲染后的完整 review(供 ci-poll 追加, 不覆盖 findings)
     pipeline_state.set_topic_fields(state_file, key, review_summary=full_text)
