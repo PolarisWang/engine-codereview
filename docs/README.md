@@ -77,3 +77,39 @@
 docker exec chaos-agent-cr bash /home/jenkins/workspace/code-review-pipeline/deploy/startup.sh  # 容器重启后恢复
 sudo /home/debian/agent/engine-codereview/deploy/ops/healthcheck.sh  # 健康探活
 ```
+
+---
+
+## 九、review 输出（方案C: skill 模板 + 相关机制）
+
+bot 的 review 结果按 **code-review-skill PR 模板**输出(中文):
+```
+# 🔍 Code Review 报告（依据 code-review-skill）
+## 📋 Summary   ## ✅ Strengths   ## 🔍 Architecture & Performance
+## 🔴 [blocking] 必须修复   ## 🟡 [important] 应处理   ## 🟢 [nit] 可选
+## 📊 总结
+```
+由 `code_reviewer._build_markdown_from_findings(meta)` 渲染; `_call_llm_batch` 返回
+summary/strengths/category, review_with_claude **跨批次聚合**后用全量 findings + 聚合
+meta 重渲染单份完整模板(避免大 MR 分 8 批时 Strengths 只来自末批)。
+`run()` 直接用该 render 出的 review_text 发出(不经 feishu_notifier 重渲染)。
+
+**缓存失效**: `.review_cache` 按 `v<REVIEW_CACHE_VERSION>_<key>_<repo>_<hash>.json` 命名;
+渲染/格式变化时**把 REVIEW_CACHE_VERSION+1** 即让旧缓存忽略,不误复用旧格式。
+当前版本=2。
+
+## 十、已知坑 / 注意
+
+| 坑 | 说明 |
+|---|---|
+| 缓存绕开新格式 | 渲染变化后若没 bump 版本, 旧缓存会复用旧格式。已由版本号解决; 但仍建议测试新模板时用新分支/无缓存话题。 |
+| 分批 review | 大 diff 分 N 批("第 N/M 部分"), 每批独立 LLM; meta 已跨批聚合。 |
+| 发卡分条 | review 超 45000 字符会分多条普通消息(非重复, 是分片)。超大 review 非单条。 |
+| CI 不触发 | `.gitlab-ci rules` 只认 merge_request_event, ci-poll 只跟踪不触发。 |
+| bot 不随容器 init 起 | 容器重启需 startup.sh/apply.sh(监控容器自动恢复)。 |
+| 进度卡显示 | 显示 jira_key 或短 id(非一长串 message_id); `\n` 已转真换行。 |
+
+## 十一、端到端自测
+
+`python tests/e2e/closed_loop.py --jira-url <URL>` 在容器内驱动完整闭环
+(review→优化→建MR→验证→关闭清理), 用于回归。pytest: `PYTHONPATH=.deps-pytest python3 -m pytest`(66 用例)。
