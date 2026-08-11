@@ -512,24 +512,39 @@ def _findings_counts(findings):
 
 def _build_markdown_from_findings(findings):
     """Build a complete, readable markdown report from structured findings, with
-    a summary table that matches severity_counts exactly."""
-    sev_labels = {"critical": "🔴 Critical", "warning": "🟡 Warning",
-                  "suggestion": "ℹ️ Suggestion"}
+    a summary table that matches severity_counts exactly.
+
+    skill 风格: 使用 code-review-skill 的 severity 标签体系(🔴[blocking]/🟡[important]/
+    🟢[nit]/ℹ️[suggestion]), 按 Review Process 分阶段组织, 中文叙述式 —— 而非仅纯条目。
+    """
+    # skill 的 severity 标签: critical->[blocking], warning->[important], suggestion->[nit]
+    def _tag(f):
+        s = (f.get("severity") or "").strip().lower()
+        if s in ("critical", "high", "error", "blocker"):
+            return ("🔴", "[blocking]", "必须修复")
+        if s in ("warning", "warn", "medium", "minor"):
+            return ("🟡", "[important]", "应处理")
+        return ("🟢", "[nit]", "建议")
     reviews = []
     for f in findings or []:
-        label = sev_labels[_normalize_severity(f.get("severity"))]
+        emoji, tag, rank = _tag(f)
         reviews.append(
-            f"### {label}\n\n"
+            f"### {emoji} {tag} {rank}\n\n"
             f"**文件**: {f.get('file','')}\n"
             f"**问题**: {f.get('issue','')}\n"
             f"**建议**: {f.get('suggestion','')}\n")
     if not reviews:
         return ""
     c = _findings_counts(findings)
-    return ("## 代码审查结果\n\n" + "\n".join(reviews) +
-            f"\n## 总结\n| 严重级别 | 数量 |\n|---------|------|\n"
-            f"| 🔴 Critical | {c['critical']} |\n| 🟡 Warning | {c['warning']} |\n"
-            f"| ℹ️ Suggestion | {c['suggestion']} |")
+    # skill 风格总结(带分级标签 + 阶段说明)
+    return ("## 代码审查结果（依据 code-review-skill 方法论）\n\n"
+            "### 维度覆盖: 架构 / 安全 / 性能 / 代码质量 / 语言专属\n"
+            "### Findings:\n\n" + "\n".join(reviews) +
+            f"\n## 审查总结（{sum(c.values())} 项）\n"
+            f"- 🔴 [blocking] 必须修复: {c['critical']}\n"
+            f"- 🟡 [important] 应处理: {c['warning']}\n"
+            f"- 🟢 [nit] 可选/建议: {c['suggestion']}\n"
+            "> 建议修复顺序: 先 [blocking], 再 [important], [nit] 视资源而定。可对 [blocking] 走自动修复闭环(`优化`)。")
 
 
 def _count_severities(review_text):
