@@ -1297,6 +1297,53 @@ def _disk_free_bytes(directory):
         return -1
 
 
+def _sweep_orphan_checkout_dirs(workspace, state_file):
+    """C#3: reclaim per-topic checkout dirs whose owning topic no longer exists.
+
+    A topic that crashes before close can leave its `{repo}-review/{slug}` dir behind,
+    which never enters the open-dir ceiling and never gets cleaned -> enough crashes
+    exhaust MAX_OPEN_CHECKOUT_DIRS and block new topics. This sweep, run opportunistically
+    every autoclose tick, computes the set of slugs still owned by any live (non-CLOSED)
+    topic and deletes every `{workspace}/*-review/*` subdir whose slug is not in that set.
+
+    Conservative by design: a dir is only removed if its slug matches NO live topic, so
+    we can never delete a live topic's checkout. (A cross-repo slug collision keeps an
+    orphan but never touches a live dir — safe, just slower to reclaim.)"""
+    try:
+        topics = pipeline_state.list_topics(state_file)
+    except Exception as _e:
+        print(f"[sweep] list_topics error: {_e}", file=sys.stderr)
+        return
+    live = set()
+    for t in topics:
+        if isinstance(t, dict) and t.get("phase") != "CLOSED":
+            live.add(_checkout_slug(t))
+    try:
+        entries = os.listdir(workspace or ".")
+    except OSError:
+        return
+    import shutil as _shutil
+    removed = 0
+    for entry in entries:
+        if not entry.endswith("-review"):
+            continue
+        pool = os.path.join(workspace, entry)
+        if not os.path.isdir(pool):
+            continue
+        try:
+            for slug in os.listdir(pool):
+                if slug in live:
+                    continue
+                d = os.path.join(pool, slug)
+                if os.path.isdir(d) and os.path.isdir(os.path.join(d, ".git")):
+                    _shutil.rmtree(d, ignore_errors=True)
+                    removed += 1
+        except OSError:
+            continue
+    if removed:
+        print(f"[sweep] removed {removed} orphaned checkout dir(s) under {workspace}", flush=True)
+
+
 def _ensure_checkout(topic, workspace):
     """Clone (or reuse) the topic's OWN review-branch checkout to a per-topic dir in
     workspace. Returns (checkout_dir, err) or (None, err). Authenticates via the
@@ -2129,10 +2176,14 @@ def _repo_url_from_mr(topic):
 
 def _resolve_repo_checkout(workspace, topic, repo):
     """
-    Locate a topic repo's git checkout under workspace. Returns (checkout_dir, real_repo_name)
-    or None. Mirrors code_reviewer.prepare_repo naming (url basename minus .git), tried for
-    both engine and game repos; repo selects which one.
-    """
+    Locate THIS topic's repo checkout dir under workspace. Returns (checkout_dir, real_repo_name)
+    or (None, name when no url). Mirrors code_reviewer.prepare_repo naming (url basename minus .git)
+    tried for both engine and game repos; repo selects which one.
+
+    方案B: like autofix, the apply/push/rollback executor now uses THIS topic's isolated
+    per-topic dir {workspace}/{repo}-review/{slug} instead of a shared flat {workspace}/{repo},
+    so a different topic's applied patch / branch state can never leak into these ops
+    (C#2: closes the last shared-checkout serial-baseline gap)."""
     repos = {}
     for r in ("engine", "game"):
         url = (topic.get(f"{r}_repo")
@@ -2142,7 +2193,7 @@ def _resolve_repo_checkout(workspace, topic, repo):
             repos[r] = url
     url = repos.get(repo) or (list(repos.values())[0] if repos else "")
     if not url:
-        return None, None
+        return None, ""
     # Convert scp-style (git@host:path/repo.git) to https so the basename is the
     # real repo name — same rule code_reviewer.prepare_repo uses after ssh_to_https.
     import re as _re
@@ -2151,10 +2202,7 @@ def _resolve_repo_checkout(workspace, topic, repo):
         if m:
             url = f"https://{m.group(1)}/{m.group(2)}"
     name = url.rstrip("/").split("/")[-1].replace(".git", "")
-    candidate = os.path.join(workspace, name)
-    if os.path.isdir(os.path.join(candidate, ".git")):
-        return candidate, name
-    return candidate, name
+    return _checkout_dir_for(workspace, name, topic), name
 
 
 def _run_git(args, cwd):
@@ -2237,10 +2285,14 @@ def _rollback(key, topic, workspace, state_file, app_id, app_secret, actor=""):
 # Returns a human-readable result per action.
 
 def _ensure_shared_checkout(topic, repo, workspace):
-    """Locate (or lazily create) the shared repo checkout for a topic using the
-    engine/game repo URLs recorded on the topic. Returns (dirname, None) or
-    (None, error). Uses `workspace` as the base; both interaction & executor must
-    point at the SAME workspace (shared bind) so state/checkout stay consistent."""
+    """Locate (or lazily create) THIS topic's isolated repo checkout dir under
+    workspace. Returns (dirname, None) or (None, error). Uses `workspace` as the base;
+    both interaction & executor must point at the SAME workspace (shared bind) so
+    state/checkout stay consistent.
+
+    方案B(C#2): like autofix, the apply/push/rollback executor operates on the topic's
+    per-topic dir {repo}-review/{slug} (not a shared flat dir), so one topic's applied
+    patch / branch switch can never leak into another topic's apply/push/rollback."""
     url = ""
     for r in ("engine", "game"):
         if repo == r:
@@ -2251,30 +2303,48 @@ def _ensure_shared_checkout(topic, repo, workspace):
     if not url:
         return None, f"no repo_url recorded for '{repo}'"
     checkout, name = _resolve_repo_checkout(workspace, topic, repo)
+    if not checkout:
+        return None, f"no checkout dir for '{repo}'"
     # If present, reuse it but force-align to the latest remote HEAD of the topic's
     # review branch, and drop any working-tree residue (stale fix patches, foreign
-    # branch switches, leftover build artifacts) from a prior topic sharing this tree.
-    # This is the same "never trust a reused checkout" rule as _ensure_checkout.
-    if os.path.isdir(os.path.join(checkout or "", ".git")):
+    # branch switches, leftover build artifacts). Same "never trust a reused checkout"
+    # rule as _ensure_checkout. Log + hard-fail on a failed reset (stale baseline).
+    if os.path.isdir(os.path.join(checkout, ".git")):
         src = topic.get("review_branch") or ""
         if src:
-            _sp.run(["git", "-C", checkout, "fetch", "--quiet", "origin", src],
-                    capture_output=True, text=True, timeout=300)
-            _sp.run(["git", "-C", checkout, "reset", "--hard", f"origin/{src}"],
-                    capture_output=True, text=True, timeout=60)
+            _fr = _sp.run(["git", "-C", checkout, "fetch", "--quiet", "origin", src],
+                          capture_output=True, text=True, timeout=300)
+            _rr = _sp.run(["git", "-C", checkout, "reset", "--hard", f"origin/{src}"],
+                          capture_output=True, text=True, timeout=60)
             _sp.run(["git", "-C", checkout, "clean", "-fdx"],
                     capture_output=True, text=True, timeout=60)
+            for _nm, _rc, _err in (("apply-fetch", _fr, _fr.stderr[:200]),
+                                   ("apply-reset", _rr, _rr.stderr[:200])):
+                if _rc != 0:
+                    print(f"[apply] {_nm} failed rc={_rc}: {_err}", file=sys.stderr)
+            if _rr.returncode != 0:
+                return None, f"checkout 复位到 origin/{src} 失败(基线不可信)"
         return checkout, None
-    # If not present, clone it (executor may need credentials via git env).
-    try:
-        rc, out, err = _run_py("code_reviewer.py", [
-            "--repo", url, "--branch", topic.get("review_branch") or "",
-            "--base-branch", topic.get("base_branch") or "", "--dry",
-            "--workspace", workspace, "--output", os.path.join(workspace, f"dry_{repo}.json")])
-        if rc != 0:
-            return None, f"checkout prep failed: {err[:150]}"
-    except Exception as e:
-        return None, f"checkout prep error: {e}"
+    # If not present, clone into the per-topic dir directly (token via git_askpass env).
+    os.makedirs(os.path.dirname(checkout), exist_ok=True)
+    _askpass = os.path.join(SCRIPTS_DIR, "git_askpass.sh")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=_askpass,
+               CR_GITLAB_USER=_env("GITLAB_USER", "gitlab-ci-token"),
+               CR_GITLAB_TOKEN=_env("GITLAB_TOKEN"))
+    # project path from the topic's MR url (same as _ensure_checkout); clean https,
+    # no token in the URL.
+    import jira_parser as _jp
+    pp, _ = _jp.parse_gitlab_mr_url(topic.get("mr_url") or "") \
+        if "merge_requests" in (topic.get("mr_url") or "") else (None, None)
+    repo_url = url  # default to the recorded engine/game url (already https)
+    if pp:
+        repo_url = f"https://gitlab.booming-inc.com/{pp}.git"
+    src = topic.get("review_branch") or topic.get("base_branch") or ""
+    r = _sp.run(["git", "clone", "--quiet", "--single-branch", "--branch", src,
+                 "--depth", "2", repo_url, checkout],
+                capture_output=True, text=True, env=env, timeout=600)
+    if r.returncode != 0 or not os.path.isdir(os.path.join(checkout, ".git")):
+        return None, f"apply checkout clone failed: {r.stderr[:200]}"
     return checkout, None
 
 
@@ -2709,6 +2779,12 @@ def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None, chat
     except Exception as e:
         print(f"[autoclose] list_topics err: {e}", file=sys.stderr)
         return closed
+    # C#3: opportunistically reclaim orphans left by topics that crashed before close,
+    # so the open-dir ceiling (MAX_OPEN_CHECKOUT_DIRS) can't be exhausted by them.
+    try:
+        _sweep_orphan_checkout_dirs(workspace, state_file)
+    except Exception as _e:
+        print(f"[autoclose] orphan sweep error: {_e}", file=sys.stderr)
     for t in topics:
         key = t.get("message_id") or ""
         if not key or t.get("phase") == "CLOSED":
