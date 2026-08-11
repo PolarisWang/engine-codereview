@@ -16,6 +16,7 @@ The values below are DEFAULTS; config.yaml overrides them.
 import os
 # Defaults first; load_config() later overrides from config.yaml.
 IDLE_CLOSE_DAYS = 2
+AUTO_CLOSE_HOURS = 48   # auto-close 闲置小时(默认48=2天, 测试可改小)
 AUTO_CLOSE_MR = True
 MAX_CONCURRENT_REVIEWS = 6
 DEFAULT_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
@@ -64,7 +65,7 @@ def _load_yaml_opt(path=None):
 def load_config_merged(path=None):
     """Merge config.yaml overrides into this module's globals (MSG/CMD/params).
     Called at import time so `from config import *` sees merged values."""
-    global IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS, DEFAULT_WORKSPACE
+    global IDLE_CLOSE_DAYS, AUTO_CLOSE_HOURS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS, DEFAULT_WORKSPACE
     global CHECKOUT_RESET_ON_REUSE, EDIT_MODEL, AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN
     global MSG, CMD
     cfg = _load_yaml_opt(path)

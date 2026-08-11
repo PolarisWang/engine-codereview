@@ -44,7 +44,7 @@ from pipeline_state import log_line
 # Central runtime configuration (lifecycle / concurrency / LLM / workspace).
 from config import (IDLE_CLOSE_DAYS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS,
                     DEFAULT_WORKSPACE, CHECKOUT_RESET_ON_REUSE, EDIT_MODEL,
-                    AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN)
+                    AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN, AUTO_CLOSE_HOURS)
 import config as _config          # 方案C: 经 config 模块读 MSG/CMD(集中 config.yaml)
 MSG = _config.MSG
 CMD = _config.CMD
@@ -669,12 +669,12 @@ def _should_auto_close(topic, now_ts=None):
                or topic.get("updated_at") or "")
         if upd:
             ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
-            idle_days = ((now_ts if now_ts is not None else _time.time()) - ts) / 86400.0
+            idle_hours = ((now_ts if now_ts is not None else _time.time()) - ts) / 3600.0
         else:
-            idle_days = IDLE_CLOSE_DAYS + 1
+            idle_hours = AUTO_CLOSE_HOURS + 1
     except Exception:
-        idle_days = 0
-    return idle_days > IDLE_CLOSE_DAYS
+        idle_hours = 0
+    return idle_hours > AUTO_CLOSE_HOURS
 
 
 # First-token command keywords recognized by the reliable router (orchestrate.py
@@ -799,7 +799,7 @@ def interact(args):
                 except Exception as _e:
                     print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
             pipeline_state.close_topic(state_file, key, closed_by="auto",
-                                       reason=MSG.get("autoclose_reason", "{days}天无新回复自动关闭").format(days=IDLE_CLOSE_DAYS))
+                                       reason=MSG.get("autoclose_reason", "{hours}小时无新回复自动关闭").format(hours=AUTO_CLOSE_HOURS))
             pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
             _finalize(key, MSG.get("autoclose_notice") or "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
                       render_id, [], state_file, app_id, app_secret)
@@ -2571,11 +2571,12 @@ def consume_all_pending(state_file, workspace, app_id, app_secret, lock_dir=None
     return results
 
 
-def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None):
+def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None, chat_id=""):
     """F1: INDEPENDENT auto-close driver — scans ALL topics on each Jenkins tick and
-    closes any IDLE (past IDLE_CLOSE_DAYS) non-CLOSED topic, releasing its fix MR +
+    closes any IDLE (past AUTO_CLOSE_HOURS) non-CLOSED topic, releasing its fix MR +
     branch. Previously _should_auto_close ran ONLY inside interact() (i.e. only when a
     user happened to reply), so an ignored topic was never actually auto-closed.
+    On close it also posts a short group message (已自动关闭 + 释放) so the group sees it.
     Returns {key: (ok, note)} for topics actually closed this tick."""
     lock_dir = lock_dir or pipeline_state.DEFAULT_LOCK_DIR()
     closed = {}
@@ -2596,10 +2597,18 @@ def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None):
             with pipeline_state.topic_lock_context(lock_dir, key):
                 note = _close_topic_resources_if_safe(t, state_file, key, app_id, app_secret)
                 pipeline_state.close_topic(state_file, key, closed_by="auto",
-                                           reason=f"{IDLE_CLOSE_DAYS}天无新回复自动关闭")
+                                           reason=f"{AUTO_CLOSE_HOURS}小时无新回复自动关闭")
                 pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
                 closed[key] = (True, note)
                 print(f"[autoclose] closed {key[:20]} — {note}", flush=True)
+                # 群里发一条"已自动关闭"消息, 让用户明确看到(auto-close 不额外建卡)。
+                if app_id and app_secret and chat_id:
+                    _run_py("feishu_notifier.py", [
+                        "reply-message", "--app-id", app_id, "--app-secret", app_secret,
+                        "--chat-id", chat_id, "--message-id", key,
+                        "--message-base64",
+                        _b64_str((MSG.get("autoclose_notice") or "🔒 已自动关闭") +
+                                 (("（" + note + "）") if note else ""))])
         except Exception as e:
             print(f"[autoclose] close {key[:20]} err: {e}", file=sys.stderr)
             closed[key] = (False, str(e))
@@ -3496,7 +3505,8 @@ def main(argv=None):
             print(f"[executor] {k}: {'OK' if ok else 'FAIL'} — {msg}", flush=True)
         # F1: 独立 auto-close 扫描 —— 每个 Jenkins tick 关闭闲置话题。
         ac = run_autoclose(args.pipeline_state_file, args.workspace,
-                           _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"), lock_dir=lock_dir)
+                           _env("FEISHU_APP_ID"), _env("FEISHU_APP_SECRET"), lock_dir=lock_dir,
+                           chat_id=_env("FEISHU_CHAT_ID"))
         for k, (ok, note) in ac.items():
             print(f"[autoclose] {k}: {'OK' if ok else 'FAIL'} — {note}", flush=True)
         # F: 排队复入健壮性 —— 独立重跑 queued topic (不依赖群消息可见)。

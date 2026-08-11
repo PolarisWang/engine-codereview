@@ -86,6 +86,7 @@ claude:
 lifecycle:
   # 话题多久无新回复自动关闭(天)。
   idle_close_days: 2
+  auto_close_hours: 1
   # 自动关闭时是否释放 fix-branch MR/删分支。
   auto_close_mr: true
 
