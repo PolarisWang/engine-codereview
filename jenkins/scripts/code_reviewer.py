@@ -707,7 +707,7 @@ def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
             review_text = result.get("completion", json.dumps(result))
     except Exception:
         review_text = json.dumps(result)
-    return review_text, findings, None
+    return review_text, findings, None, meta
 
 
 def review_with_claude(diff_info, config, project, issue_key, repo_type):
@@ -764,6 +764,7 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
     all_text = []
     all_findings = []
     total = {"critical": 0, "warning": 0, "suggestion": 0}
+    agg_meta = {}   # 跨批次聚合 summary/strengths
     first_error = None
 
     for idx, batch_diff in enumerate(batches, start=1):
@@ -823,7 +824,7 @@ At the end, provide a summary with count of each severity level.
 
 IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
 
-        review_text, findings, err = _call_llm_batch(
+        review_text, findings, err, batch_meta = _call_llm_batch(
             system_prompt, user_prompt, api_key, base_url, model, max_output_tokens
         )
         if err:
@@ -831,6 +832,13 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
                 first_error = err
             print(f"[review] Batch {idx}/{num_batches} failed: {err}", flush=True)
             continue
+        # 聚合 batch 的 meta: summary 取首个非空; strengths 各批合并去重。
+        batch_meta = batch_meta or {}
+        if batch_meta.get("summary") and not agg_meta.get("summary"):
+            agg_meta["summary"] = batch_meta["summary"]
+        for s in (batch_meta.get("strengths") or []):
+            if s and s not in agg_meta.get("strengths", []):
+                agg_meta["strengths"] = agg_meta.get("strengths", []) + [s]
 
         if num_batches > 1:
             all_text.append(f"### 第 {idx}/{num_batches} 部分\n{review_text}")
@@ -862,9 +870,12 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
             "batches": num_batches,
         }
 
+    # 跨批次聚合: 用全部 findings + 聚合的 summary/strengths 重新渲染成完整 skill 模板,
+    # 而非各批 "第 N/M 部分" 拼接(那会丢失聚合 meta 且 render 不完整)。
+    final_text = _build_markdown_from_findings(all_findings, meta=agg_meta)
     return {
-        "summary": "",
-        "review_text": "\n\n".join(all_text),
+        "summary": agg_meta.get("summary", ""),
+        "review_text": final_text,
         "severity_counts": total,
         "findings": all_findings,
         "error": first_error,   # non-None if at least one batch failed (partial results)
