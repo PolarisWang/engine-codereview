@@ -19,6 +19,12 @@ IDLE_CLOSE_DAYS = 2
 AUTO_CLOSE_HOURS = 48   # auto-close 闲置小时(默认48=2天, 测试可改小)
 AUTO_CLOSE_MR = True
 MAX_CONCURRENT_REVIEWS = 6
+# 方案B: 最多同时保留的按-topic 隔离 checkout 目录数(磁盘上限)。
+# 默认与并发审查上限一致; 超过时新话题不再另建目录, 改为复用 LRU 目录或排队。
+MAX_OPEN_CHECKOUT_DIRS = 0   # 0 = 跟随 MAX_CONCURRENT_REVIEWS
+# 方案B: 剩余磁盘低于该字节数时禁止新建 checkout 目录(改成复用/拒绝), 保护共享盘。
+DISK_FREE_MIN_BYTES = 0      # 0 = 关闭该保护; 默认 2GiB 在 load_config_merged 里给出
+DISK_FREE_MIN_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024  # 2 GiB
 DEFAULT_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
 CHECKOUT_RESET_ON_REUSE = True
 EDIT_MODEL = "deepseek-v4-flash[1m]"
@@ -67,6 +73,7 @@ def load_config_merged(path=None):
     Called at import time so `from config import *` sees merged values."""
     global IDLE_CLOSE_DAYS, AUTO_CLOSE_HOURS, AUTO_CLOSE_MR, MAX_CONCURRENT_REVIEWS, DEFAULT_WORKSPACE
     global CHECKOUT_RESET_ON_REUSE, EDIT_MODEL, AGENT_MAX_ROUNDS, AGENT_MAX_TOKEN
+    global MAX_OPEN_CHECKOUT_DIRS, DISK_FREE_MIN_BYTES
     global MSG, CMD
     cfg = _load_yaml_opt(path)
     life = cfg.get("lifecycle") or {}
@@ -79,10 +86,19 @@ def load_config_merged(path=None):
         AUTO_CLOSE_MR = bool(life["auto_close_mr"])
     if concurrency.get("max_reviews") is not None:
         MAX_CONCURRENT_REVIEWS = int(concurrency["max_reviews"])
+    if concurrency.get("max_open_checkout_dirs") is not None:
+        MAX_OPEN_CHECKOUT_DIRS = int(concurrency["max_open_checkout_dirs"])
     if ws.get("base_dir"):
         DEFAULT_WORKSPACE = ws["base_dir"]
+    if ws.get("disk_free_min_bytes") is not None:
+        DISK_FREE_MIN_BYTES = int(ws["disk_free_min_bytes"])
     if llm.get("model"):
         EDIT_MODEL = llm["model"]
+    # 方案B: open-checkout 上限默认跟随并发审查上限; 磁盘保护默认 2GiB。
+    if not MAX_OPEN_CHECKOUT_DIRS:
+        MAX_OPEN_CHECKOUT_DIRS = MAX_CONCURRENT_REVIEWS
+    if not DISK_FREE_MIN_BYTES:
+        DISK_FREE_MIN_BYTES = DISK_FREE_MIN_BYTES_DEFAULT
     # messages/commands 覆盖
     m = cfg.get("messages") or {}
     if isinstance(m, dict):
