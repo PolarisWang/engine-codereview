@@ -535,65 +535,90 @@ def _findings_counts(findings):
     return counts
 
 
+def _one_line(text, limit):
+    """Collapse arbitrary LLM prose into one line of at most `limit` chars, keeping
+    the leading key point and clipping the tail with '…'. Newlines/whitespace are
+    folded. Used so a finding's issue/suggestion reads as a terse one-liner instead
+    of a multi-sentence paragraph (方案C: 言简意赅)."""
+    if not text:
+        return ""
+    s = " ".join(str(text).split())          # fold all whitespace/newlines
+    if len(s) <= limit:
+        return s
+    return s[: limit].rstrip() + "…"
+
+
 def _build_markdown_from_findings(findings, meta=None):
-    """Build a review report modeled on the code-review-skill PR template:
+    """Build a concise review report modeled on the code-review-skill PR template:
       Summary / Strengths / Architecture&Performance / Required(blocking) / Important / Nit.
 
     Uses `meta` (summary/strengths) and per-finding `category`(architecture/security/
     performance/quality) when provided; falls back to plain severity grouping when the
     model didn't supply them, so the card is always complete.
+
+    方案C(言简意赅): keep the skill's severity grouping & sections, but compress every
+    piece — summary/strengths to one-liners, and each finding to a single clipped line
+    `file 问题 → 修法` — instead of dumping full LLM paragraphs into the group card.
     """
     meta = meta or {}
     findings = findings or []
-    def _norm_idx(f):
-        s = (f.get("severity") or "").lower()
-        return 0 if s in ("critical","high","error","blocker") else (1 if s in ("warning","warn") else 2)
+
     def _tag(f):
         s = (f.get("severity") or "").strip().lower()
         if s in ("critical", "high", "error", "blocker"):
-            return ("🔴", "[blocking]", "必须修复")
+            return ("🔴", "blocking", "必须修复")
         if s in ("warning", "warn", "medium", "minor"):
-            return ("🟡", "[important]", "应处理")
-        return ("🟢", "[nit]", "可选")
+            return ("🟡", "important", "应处理")
+        return ("🟢", "nit", "可选")
+
     groups = {"critical": [], "warning": [], "suggestion": []}
     for f in findings:
-        groups[["critical", "warning", "suggestion"][_norm_idx(f)]].append({**f, **{"_tag": _tag(f)}})
+        s = (f.get("severity") or "").lower()
+        k = ("critical" if s in ("critical", "high", "error", "blocker")
+             else "warning" if s in ("warning", "warn", "medium", "minor")
+             else "suggestion")
+        groups[k].append({**f, "_tag": _tag(f)})
 
-    c = {"critical": len(groups["critical"]), "warning": len(groups["warning"]), "suggestion": len(groups["suggestion"])}
+    c = {"critical": len(groups["critical"]), "warning": len(groups["warning"]),
+         "suggestion": len(groups["suggestion"])}
+    total = sum(c.values())
 
-    parts = ["# 🔍 Code Review 报告（依据 code-review-skill）"]
-    # Summary
+    # Trim lengths (characters). These bound how much prose lands in the group card
+    # (方案C: 言简意赅 — keep the point, drop the padding).
+    ISSUE_LIM, FIX_LIM, SUMMARY_LIM, STRENGTH_LIM = 48, 34, 92, 60
+
+    parts = [f"🔍 Code Review — {total} 项 ({c['critical']} 必改)"]
+    # Summary: one line
     if meta.get("summary"):
-        parts.append(f"## 📋 Summary\n{meta['summary']}")
-    else:
-        parts.append(f"## 📋 Summary\n审查 {sum(c.values())} 项发现, 其中 {c['critical']} 项必改。")
-    # Strengths (fallback: omit if none)
+        parts.append(f"Summary：{_one_line(meta['summary'], SUMMARY_LIM)}")
+    # Strengths: one compact line (fallback: omit)
     if meta.get("strengths"):
-        parts.append("## ✅ Strengths\n" + "\n".join(f"- {s}" for s in meta["strengths"][:3]))
-    # Architecture & Performance (from category=arch/perf findings)
-    arch = [f for f in findings if (f.get("category") or "").lower() == "architecture"]
-    perf = [f for f in findings if (f.get("category") or "").lower() == "performance"]
-    if arch or perf:
-        ap = ["## 🔍 Architecture & Performance"]
-        if arch:
-            ap.append("**架构**:\n" + "\n".join(f"  - {f['file']}: {f['issue']}" for f in arch[:5]))
-        if perf:
-            ap.append("**性能**:\n" + "\n".join(f"  - {f['file']}: {f['issue']}" for f in perf[:5]))
-        parts.append("\n".join(ap))
-    # Findings by severity
-    for k in ("critical", "warning", "suggestion"):
+        strengths = [_one_line(s, STRENGTH_LIM) for s in meta["strengths"][:3]]
+        strength_line = "；".join(s for s in strengths if s).strip("。；")
+        if strength_line:
+            parts.append(f"✅ {strength_line}")
+    # Architecture & Performance -> folded straight into findings (one-liners below),
+    # no separate verbose section.
+
+    # Findings by severity (compact; each finding = one clipped line).
+    for k, label in (("critical", "blocking"), ("warning", "important"), ("suggestion", "nit")):
         if not groups[k]:
             continue
         emoji, tag, rank = groups[k][0]["_tag"]
-        parts.append(f"## {emoji} {tag} {rank} ({len(groups[k])})")
-        for f in groups[k]:
-            cat = f.get("category") or ""
-            parts.append(f"- **{f['file']}**{('['+cat+']') if cat else ''}: {f['issue']} → 建议 {f['suggestion']}")
-    # Summary counts
-    parts.append("## 📊 总结")
-    parts.append(f"🔴[blocking] {c['critical']} / 🟡[important] {c['warning']} / 🟢[nit] {c['suggestion']}")
-    parts.append("> 建议修复顺序: 先 [blocking], 再 [important], [nit] 视资源而定。")
-    return "\n\n".join(parts)
+        parts.append(f"{emoji} {tag} ({len(groups[k])})")
+        for f in groups[k][:10]:                       # cap per-severity lines for brevity
+            issue = _one_line(f.get("issue"), ISSUE_LIM)
+            fix = _one_line(f.get("suggestion"), FIX_LIM)
+            desc = f"{_one_line(f.get('file'), 60)}: {issue}"
+            if fix:
+                desc += f" → {fix}"
+            cat = (f.get("category") or "").strip()
+            parts.append(f"· [{cat}] {desc}" if cat else f"· {desc}")
+
+    # Count line (compact)
+    parts.append(f"📊 🔴{c['critical']} / 🟡{c['warning']} / 🟢{c['suggestion']}")
+    return "\n".join(p for p in parts if p)
+
 
 
 def _count_severities(review_text):
