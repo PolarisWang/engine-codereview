@@ -810,7 +810,7 @@ def interact(args):
             # Release fix-branch MRs + delete the fix branch (best-effort).
             if AUTO_CLOSE_MR:
                 try:
-                    _close_topic_resources(topic)
+                    _close_topic_resources(topic, workspace)
                 except Exception as _e:
                     print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
             pipeline_state.close_topic(state_file, key, closed_by="auto",
@@ -901,7 +901,7 @@ def interact(args):
         _finalize(key, answer, render_id, [], state_file, app_id, app_secret)
         return 0
     if word in CMD["close"]:
-        _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor)
+        _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor, workspace=workspace)
         return 0
     if word in CMD["mr"]:
         text = _generate_mr_card(topic, all_findings, workspace, key, state_file=state_file)
@@ -2719,7 +2719,7 @@ def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None, chat
         #     无 open fix MR 的孤儿分支才自动释放。
         try:
             with pipeline_state.topic_lock_context(lock_dir, key):
-                note = _close_topic_resources_if_safe(t, state_file, key, app_id, app_secret)
+                note = _close_topic_resources_if_safe(t, state_file, key, app_id, app_secret, workspace)
                 pipeline_state.close_topic(state_file, key, closed_by="auto",
                                            reason=f"{AUTO_CLOSE_HOURS}小时无新回复自动关闭")
                 pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
@@ -2882,7 +2882,7 @@ def _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor="
     _proc_reply(key, topic, M("rerereview_enqueued"), render_id, state_file, app_id, app_secret)
 
 
-def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
+def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor="", workspace=None):
     """指令 `4/关闭`: owner/admin 关闭话题。关闭时会一并关闭该话题创建的 OPEN MR
     （fix-branch）并删除 fix 分支，release 资源；原 review MR 不受影响。
     成功后发一条新的群回复（reply-message）让用户明确看到"已关闭"——PATCH 改卡
@@ -2891,7 +2891,7 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     if not ok:
         _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id, app_secret)
         return
-    closed = _close_topic_resources(topic)
+    closed = _close_topic_resources(topic, workspace)
     pipeline_state.close_topic(state_file, key, closed_by=actor, reason="用户指令关闭")
     pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
     note = f"🔒 本话题已关闭。{closed} 不处理。" if closed else "🔒 本话题已关闭，不再处理。"
@@ -2902,12 +2902,14 @@ def _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor=""):
     _finalize(key, note, render_id, [], state_file, app_id, app_secret)
 
 
-def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret):
+def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret, workspace=None):
     """F3: auto-close 版资源释放 —— 防误删未合并 MR。
 
     与 _close_topic_resources 不同: 仅当话题**没有 open 的 owned fix MR** 时才释放
     该 fix 分支(孤儿分支才自动删); 若有 open fix MR(用户可能还没合并), 则**不自动删
-    分支**, 只关闭话题并提示人工处理, 避免 auto-close 误删在途合并。返回 human note。"""
+    分支**, 只关闭话题并提示人工处理, 避免 auto-close 误删在途合并。返回 human note。
+    `workspace`: 与 _ensure_checkout 一致的工作区(缺省用配置默认); 删除本 topic 的
+    checkout 目录必须用真实创建时的工作区, 否则会删错位置/删不到(见方案B磁盘保护)。"""
     import urllib.request, urllib.error, urllib.parse, json as _json
     pp = _project_path(topic)
     tok = _env("GITLAB_TOKEN")
@@ -2931,10 +2933,11 @@ def _close_topic_resources_if_safe(topic, state_file, key, app_id, app_secret):
         pass
     # 方案B: 无论是否有 open fix MR, 关闭即删本地按-topic checkout 目录(释放磁盘,
     # 并让 open 目录上限回落)。MR 在服务端, 本地 clone 仅工作副本, 删除安全。
+    use_ws = workspace or _DEFAULT_WORKSPACE
     try:
         import shutil as _shutil
         repo_name = pp.rstrip("/").split("/")[-1]
-        cdir = _checkout_dir_for(_DEFAULT_WORKSPACE, repo_name, topic)
+        cdir = _checkout_dir_for(use_ws, repo_name, topic)
         if os.path.isdir(cdir):
             _shutil.rmtree(cdir, ignore_errors=True)
             note_dir = "、已删本地 checkout 目录" if not os.path.isdir(cdir) else "、本地 checkout 目录删除失败(占用)"
@@ -2992,10 +2995,12 @@ def _branch_is_bot_created(proj, branch, tok):
         return False  # branch missing / API error -> do not delete
 
 
-def _close_topic_resources(topic):
+def _close_topic_resources(topic, workspace=None):
     """Release all remote resources owned by THIS topic's fix branch:
       1) close every OPEN fix-branch MR this bot created for the topic (R2), and
       2) delete the fix branch itself (if it still exists AND we own it).
+      `workspace`: 与 _ensure_checkout 一致的工作区(缺省用配置默认), 用于删除本 topic
+      的 checkout 目录时定位到真实创建路径。
     Returns a human note ('' if nothing done). Only touches MRs attributed to
     THIS topic; leaves the original review MR (source == {src}) and any
     unrelated MR/branch untouched.
@@ -3082,10 +3087,11 @@ def _close_topic_resources(topic):
                 notes.append(f"删分支失败(网络) ({br})")
     # 3) 释放本地按-topic checkout 目录(方案B): topic 关闭即删, 释放磁盘并保证
     #    open 目录上限能回落。目录不存在则幂等跳过; 删除失败仅记录, 不阻断关闭。
+    use_ws = workspace or _DEFAULT_WORKSPACE
     try:
         import shutil as _shutil
         repo_name = pp.rstrip("/").split("/")[-1]
-        cdir = _checkout_dir_for(_DEFAULT_WORKSPACE, repo_name, topic)
+        cdir = _checkout_dir_for(use_ws, repo_name, topic)
         if os.path.isdir(cdir):
             _shutil.rmtree(cdir, ignore_errors=True)
             if not os.path.isdir(cdir):
