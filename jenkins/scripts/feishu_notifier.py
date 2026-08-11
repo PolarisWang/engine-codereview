@@ -468,26 +468,34 @@ def render_full_findings_text(issue_key, project, review_branch, base_branch, ji
     total_w = (ec.get("warning") or 0) + (gc.get("warning") or 0)
     total_i = (ec.get("suggestion") or 0) + (gc.get("suggestion") or 0)
 
-    header = MSG.get("review_title","🔍 {key} · 审查结果：").format(key=issue_key)
-    if total_c: header += f"**{total_c} 个 Critical** / "
-    header += f"{total_w} 个 Warning / {total_i} 个 Suggestion"
+    header = MSG.get("review_title","🔍 {key} · 审查结果").format(key=issue_key)
+    header += "\n**维度覆盖**: 架构 / 安全 / 性能 / 代码质量 / 语言专属（依据 code-review-skill）"
+    if total_c: header += f"\n🔴[blocking] 必须修复 {total_c} / "
+    header += f"🟡[important] 应处理 {total_w}"
+    if total_i: header += f" / 🟢[nit] 可选 {total_i}"
     if mr_url: header += f"\nMR：{mr_url}"
     header += MSG.get("branch_line","\n分支：`{rb}` → `{bb}`").format(rb=review_branch, bb=base_branch)
     if jira_url: header += f"\n📎 {jira_url}"
 
     # 排序: critical → warning → suggestion; 每条含 repo 来源。
     allf_sorted = sorted(allf, key=_sev_l)
+    def _tag(f):
+        s = (f.get("severity") or "").strip().lower()
+        if s in ("critical","high","error","blocker"): return ("🔴","[blocking]","必须修复")
+        if s in ("warning","warn","minor"): return ("🟡","[important]","应处理")
+        return ("🟢","[nit]","建议")
     groups = {"critical": [], "warning": [], "suggestion": []}
     for f in allf_sorted:
         key = _sev_l(f)
         grp = "critical" if key == 0 else ("warning" if key == 1 else "suggestion")
+        emoji, tag, rank = _tag(f)
         repo = _repo_of(f)
         file = f.get("file") or f.get("path") or "?"
         issue = (f.get("issue") or "").strip()
-        groups[grp].append(f"{_sev_mark(f.get('severity'))} `{file}` [{repo}]\n  {issue}\n {f.get('suggestion') or ''}\n")
+        groups[grp].append(f"{emoji} {tag} {rank} `{file}` [{repo}]\n  问题：{issue}\n  建议：{f.get('suggestion') or ''}\n")
 
     chunks = [header + "\n"]
-    label = {"critical": MSG.get("label_critical_findings","🔴 Critical"), "warning": MSG.get("label_warning_findings","🟡 Warning"), "suggestion": MSG.get("label_suggestion_findings","ℹ️ Suggestion")}
+    label = {"critical": "🔴 [blocking] 必须修复", "warning": "🟡 [important] 应处理", "suggestion": "🟢 [nit] 可选/建议"}
     for grp in ("critical", "warning", "suggestion"):
         items = groups[grp]
         if not items:
