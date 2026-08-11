@@ -655,16 +655,18 @@ def _should_auto_close(topic, now_ts=None):
     so finished reviews that stay ignored release their fix MR/branch. Extracted
     from interact() for testability. `now_ts` is injectable (seconds) for tests.
 
-    F2: idle 判定用独立的 `last_user_activity` 字段(仅真实用户回复时刷新), 而不是
-    `updated_at` —— 后者会被 ci-poll/consume/review 等 background 写入刷新, 导致活跃
-    话题永不超时。无 last_user_activity 时回退到 updated_at(兼容旧话题)。"""
+    F2/B: idle 判定用 `last_user_activity`(仅真实用户回复刷新); 若无用户回复
+    (last_user_activity 缺失)则用 `created_at` —— 而非 `updated_at`(会被 ci-poll/consume/
+    review 等 background 写入刷新, 导致活跃话题永不超时)。created_at 缺失的历史话题
+    回退 updated_at 兜底(避免误关)。"""
     if not topic:
         return False
     if topic.get("phase") == "CLOSED":
         return False
     try:
         import time as _time
-        upd = topic.get("last_user_activity") or topic.get("updated_at") or ""
+        upd = (topic.get("last_user_activity") or topic.get("created_at")
+               or topic.get("updated_at") or "")
         if upd:
             ts = _time.mktime(_time.strptime(upd, "%Y-%m-%dT%H:%M:%S"))
             idle_days = ((now_ts if now_ts is not None else _time.time()) - ts) / 86400.0

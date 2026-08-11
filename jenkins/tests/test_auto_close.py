@@ -82,3 +82,29 @@ def test_no_last_user_activity_falls_back_to_updated_at():
     t = {"phase": "DONE",
          "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 3 * 86400))}  # 无 last_user_activity
     assert _should_auto_close(t, now_ts=NOW2) is True  # 回退到 updated_at, 3 天 > 2 天
+
+
+# --- 方案B: 无 last_user_activity 时用 created_at 而非 updated_at (修复永不自动关) ---
+
+def test_no_user_activity_uses_created_at_not_updated_at():
+    NOW2 = time.time()
+    # created_at 很旧(按创建算闲置), updated_at 很新(被扫描刷新), 无 last_user_activity
+    t = {"phase": "DONE",
+         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 3 * 86400)),
+         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 60))}  # 被后台刷新
+    # 方案B: 用 created_at(3天) 而非 updated_at(1分) -> 应 idle
+    assert _should_auto_close(t, now_ts=NOW2) is True
+
+
+def test_legacy_no_created_at_falls_back_to_updated_at():
+    NOW2 = time.time()
+    t = {"phase": "DONE", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 3 * 86400))}
+    assert _should_auto_close(t, now_ts=NOW2) is True  # 缺 created_at -> 兜底 updated_at
+
+
+def test_has_last_user_activity_still_priority():
+    NOW2 = time.time()
+    t = {"phase": "DONE",
+         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 5 * 86400)),
+         "last_user_activity": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 3600))}  # 用户1h前
+    assert _should_auto_close(t, now_ts=NOW2) is False  # 用户活动优先, 不算 idle
