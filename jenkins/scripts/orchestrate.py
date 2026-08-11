@@ -285,7 +285,9 @@ def run(args):
                                       render_msg_id=reply_msg_id)
             _log('PARSING', 'RUNNING', key, getattr(args, "jira_key", ""), '', '', 'reusing card in place (retry)')
         else:
-            progress = M("review_progress", key=issue_key or key)
+            # 进度卡显示易读标识: jira_key(如 CB2N-25256) > 短 message_id(截断避免一长串)。
+            _disp = getattr(args, "jira_key", "") or issue_key or (key[-12:] if key else "")
+            progress = M("review_progress", key=_disp)
             rc, out, _ = _run_py("feishu_notifier.py", [
                 "reply-message", "--app-id", app_id, "--app-secret", app_secret,
                 "--chat-id", chat_id, "--message-id", key,
