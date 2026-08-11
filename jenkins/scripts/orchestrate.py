@@ -395,6 +395,11 @@ def run(args):
             if rc != 0:
                 rc_all = rc
                 _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'reply-message failed: {err}')
+        # 交互指引卡: review 结果后单独发一张, 教用户下一步(重点是 `优化` 自动改码+提MR)。
+        if rc_all == 0:
+            _run_py("feishu_notifier.py", [
+                "reply-message", "--app-id", app_id, "--app-secret", app_secret,
+                "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(M("interact_hint"))])
         if rc_all != 0:
             topic_after = pipeline_state.record_failure(state_file, key, "reply-message failed")
             _alert_if_exhausted(state_file, topic_after, app_id, app_secret)

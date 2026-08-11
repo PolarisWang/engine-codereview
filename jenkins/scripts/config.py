@@ -33,6 +33,7 @@ MSG = {
     "review_done": "✅ Review 完成。",
     "optimize_started": "⏳ 已开始优化：AI 将自动修复关键问题，改码完成后自动推送修复分支并创建/更新 MR。",
     "optimize_note": "（可再次 `优化` 更新已有 MR，无需单独重申。）",
+    "interact_hint": "🤖 **下一步操作**\n- `优化`：自动修复关键问题 → 推送分支 → 建/更新 MR\n- `关闭`/`4`：关闭话题",
     "confirm_no_pending": "⛔ 当前没有待确认的自动修改。请先回复 `优化` 生成修改。",
     "close_confirmed": "🔒 本话题已关闭，不再处理。",
     "autoclose_reason": "{days}天无新回复自动关闭",
