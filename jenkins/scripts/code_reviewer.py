@@ -65,10 +65,15 @@ IMPORTANT: Counts must match actual findings.
 """
 
 
-def _load_skill_review_instructions():
+def _load_skill_review_instructions(repo_type=None):
     """若项目安装了 code-review-skill, 将它的方法论(severity 分级/Review Process/中文输出)
-    + C/C++/Python 语言参考的检查重点, 汇总成一条紧凑的 review system prompt。
+    + 与该被审代码语言匹配的语言参考的检查重点, 汇总成一条紧凑的 review system prompt。
     skill 文件缺失时返回 None(调用方回退默认)。控制长度: 不整篇塞入 238+893+1073 行, 抽核心。
+
+    语言感知(repo_type): engine/game 都是 C/C++ 游戏引擎仓库 -> 倾向 C++ 维度, 不强行注入
+    Python/前端 JS 维度。通用(security/arch/quality)维度仍注入, 但语义从"必须覆盖"改为
+    "供参考, 仅当 diff 确实涉及才核对", 避免模型为凑维度而编造与 diff 无关的 finding
+    (如把 web 的内存泄漏模板套到 C++ 引擎上)。
     """
     import os as _os
     scripts_dir = _os.path.dirname(_os.path.abspath(__file__))   # jenkins/scripts
@@ -94,12 +99,18 @@ def _load_skill_review_instructions():
         if any(k in s for k in ("Catch bugs", "severity", "Review Process", "Phase 1", "Phase 2",
                                  "Phase 3", "Phase 4", "blocking", "important", "中文", "所有 review")):
             pick.append(s)
-    # 跨切面维度: 抽取 security/architecture/performance/universal/cpp/python 的 ##/### 小节标题
-    # 作为 review 必须覆盖的检查维度(深度体现 skill: 架构/安全/性能/质量/语言专属)。
-    dims = {}
+    # 跨切面维度: 抽取 security/architecture/performance/universal 的 ##/### 小节标题
+    # 作为"供参考"的检查维度; 语言专属参考只注入与被审代码匹配的那份(避免把 Python /
+    # 前端模板套到 C++ 引擎, 导致与 diff 无关的内存/LOD 类噪音 finding)。
+    # engine/game 都是 C/C++ 引擎仓库 -> 默认 cpp; 其它 repo_type 视为通用。
+    lang_guide = "cpp"
+    if repo_type and "python" in str(repo_type).lower():
+        lang_guide = "python"
     ref_priorities = ["security-review-guide", "architecture-review-guide",
-                      "performance-review-guide", "code-quality-universal",
-                      "cpp", "python"]
+                      "code-quality-universal", lang_guide]
+    if repo_type and "web" in str(repo_type).lower():
+        ref_priorities.append("performance-review-guide")  # 仅前端类才注入 web 性能维度
+    dims = {}
     for fname in ref_priorities:
         p = _os.path.join(ref_dir, fname + ".md")
         if not _os.path.isfile(p):
@@ -118,8 +129,9 @@ def _load_skill_review_instructions():
             dims[label] = heads[:14]   # 每文件最多 14 个维度控长度
     parts = ["## 依据 code-review-skill 方法论审查",
              "### 心态与流程", *pick[:40],
-             "### 审查必须覆盖的维度(来自 skill 的审查指南)",
-             "请按以下各维度逐一检查并给出 findings(不限于, 但至少覆盖):"]
+             "### 供参考的检查维度(来自 skill 的审查指南)",
+             "这些维度**仅供参考**：仅当 diff 确实涉及对应主题时才逐一核对并给 finding；"
+             "**切勿为了凑齐维度而编造与本次 diff 无关的问题**。优先给出与本次代码变更直接相关的发现。"]
     for label, heads in dims.items():
         parts.append(f"【{label}】")
         parts.extend(heads)   # 各维度小节标题
@@ -128,11 +140,12 @@ def _load_skill_review_instructions():
     return "\n".join(parts).strip()[:16000]  # 上限控 token
 
 
-def load_config():
+def load_config(repo_type=None):
     """Load config from config.yaml (common), falling back to env for model.
-    review_instructions 优先用 code-review-skill(skill 化方法论+中文); 无 skill 回退配置/默认。"""
+    review_instructions 优先用 code-review-skill(skill 化方法论+中文，语言感知 repo_type);
+    无 skill 回退配置/默认。"""
     cfg = get_claude_config()
-    skill_instr = _load_skill_review_instructions()
+    skill_instr = _load_skill_review_instructions(repo_type)
     return {
         "claude": {
             "model": cfg.get("model")
@@ -902,7 +915,7 @@ def main():
     parser.add_argument("--mr-url", default="", help="Merge request URL")
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(repo_type=args.repo_type)
     os.makedirs(args.workspace, exist_ok=True)
 
     # Prepare repo and get diff
