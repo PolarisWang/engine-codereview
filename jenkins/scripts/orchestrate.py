@@ -362,7 +362,7 @@ def run(args):
     _record_repo_state(state_file, key, "game", gam_out, gam_res, review_branch, base_branch,
                        repo_url=game_repo)
     _log('REPO', 'DONE', key, issue_key, project, '', 'repo states recorded')
-    _update_state_card(state_file, app_id, app_secret, key)
+    # (不再提前 update 进度卡 —— 让最终 review 结果在下方一次性刷新进度卡, 避免中途变稀疏状态卡)
 
     # 5. Render + send final summary as PLAIN-TEXT messages (普通文字消息, 全量不折叠).
     pipeline_state.transition(state_file, key, to="NOTIFYING", status="RUNNING")
@@ -387,21 +387,23 @@ def run(args):
     # 记录渲染后的完整 review(供 ci-poll 追加, 不覆盖 findings)
     pipeline_state.set_topic_fields(state_file, key, review_summary=full_text)
     if reply_msg_id:
+        # 方案D: 用 update-reply 把进度卡(reply_msg_id)刷新成最终 review 结果(不另发),
+        # 这样 thread 里只有 1 条 review 结果卡(由进度卡演进), 不再出现"两条 review 结果"。
         rc_all = 0
         for seg in segs:
             rc, _, err = _run_py("feishu_notifier.py", [
-                "reply-message", "--app-id", app_id, "--app-secret", app_secret,
-                "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(seg)])
+                "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+                "--message-id", reply_msg_id, "--message-base64", _b64_str(seg)])
             if rc != 0:
                 rc_all = rc
-                _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'reply-message failed: {err}')
+                _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'update reply failed: {err}')
         # 交互指引卡: review 结果后单独发一张, 教用户下一步(重点是 `优化` 自动改码+提MR)。
         if rc_all == 0:
             _run_py("feishu_notifier.py", [
                 "reply-message", "--app-id", app_id, "--app-secret", app_secret,
                 "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(M("interact_hint"))])
         if rc_all != 0:
-            topic_after = pipeline_state.record_failure(state_file, key, "reply-message failed")
+            topic_after = pipeline_state.record_failure(state_file, key, "update reply failed")
             _alert_if_exhausted(state_file, topic_after, app_id, app_secret)
             return 1
         pipeline_state.transition(state_file, key, to="DONE", status="SUCCESS")
@@ -3414,13 +3416,16 @@ def _record_repo_state(state_file, key, repo, out_path, res, review_branch, base
 
 
 def _update_state_card(state_file, app_id, app_secret, key):
+    """使用 review 结果(skill 模板)更新进度卡(render_msg_id), 让进度卡演进出最终
+    review 结果 —— 而非另发一条, 从而不出现"两条 review 结果"。若无 review_summary
+    则回退渲染状态卡。"""
     if not app_id or not app_secret:
         return
     try:
         topic = pipeline_state.get_topic(state_file, key)
         if not topic or not topic.get("render_msg_id"):
             return
-        text = feishu_notifier.render_state_card(topic)
+        text = topic.get("review_summary") or feishu_notifier.render_state_card(topic)
         _run_py("feishu_notifier.py", [
             "update-reply", "--app-id", app_id, "--app-secret", app_secret,
             "--message-id", topic["render_msg_id"], "--message-base64", _b64_str(text)])
