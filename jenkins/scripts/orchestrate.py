@@ -2434,6 +2434,7 @@ def _ensure_shared_checkout(topic, repo, workspace):
     per-topic dir {repo}-review/{slug} (not a shared flat dir), so one topic's applied
     patch / branch switch can never leak into another topic's apply/push/rollback."""
     import subprocess as _sp
+    import re as _re
     url = ""
     for r in ("engine", "game"):
         if repo == r:
@@ -2477,9 +2478,15 @@ def _ensure_shared_checkout(topic, repo, workspace):
     import jira_parser as _jp
     pp, _ = _jp.parse_gitlab_mr_url(topic.get("mr_url") or "") \
         if "merge_requests" in (topic.get("mr_url") or "") else (None, None)
-    repo_url = url  # default to the recorded engine/game url (already https)
-    if pp:
-        repo_url = f"https://gitlab.booming-inc.com/{pp}.git"
+    # Use THIS repo's own URL (which already resolves to engine or game correctly) —
+    # do NOT override with the engine MR's project path, or the GAME repo would clone
+    # the ENGINE repo (seen live: game dir got chaos-cb-2.git instead of conquerors-blade-2).
+    # Normalize ssh:// to https:// so git_askpass token auth works.
+    if url.startswith("git@"):
+        _m = _re.match(r'git@([^:]+):(.+)', url)
+        if _m:
+            url = f"https://{_m.group(1)}/{_m.group(2)}"
+    repo_url = url.rstrip("/").removesuffix(".git") + ".git"
     src = topic.get("review_branch") or topic.get("base_branch") or ""
     r = _sp.run(["git", "clone", "--quiet", "--single-branch", "--branch", src,
                  "--depth", "2", repo_url, checkout],
