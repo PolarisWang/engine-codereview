@@ -47,6 +47,15 @@ def test_keeps_severity_grouping(compact):
     assert "blocking (1)" in compact
 
 
+def test_uses_basename_not_full_path(compact):
+    # finding file was "a/chaos_client_game_actor_manager.cpp"; only the basename
+    # should appear (short paths don't get clipped by the truncation)
+    assert "chaos_client_game_actor_manager.cpp" in compact
+    assert "/a/chaos_client_game_actor_manager" not in compact
+    # no truncated-path artifact: the leading dir must not be echoed with a "…"
+    assert "a/chaos_client_game_actor_manag…" not in compact
+
+
 def test_finding_is_a_single_line(compact):
     # each finding emitted as exactly one line containing `→`
     lines = [l for l in compact.splitlines() if l.startswith("·")]

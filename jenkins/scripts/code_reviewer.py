@@ -609,7 +609,9 @@ def _build_markdown_from_findings(findings, meta=None):
         for f in groups[k][:10]:                       # cap per-severity lines for brevity
             issue = _one_line(f.get("issue"), ISSUE_LIM)
             fix = _one_line(f.get("suggestion"), FIX_LIM)
-            desc = f"{_one_line(f.get('file'), 60)}: {issue}"
+            # 只用最短文件名(basename), 不用完整路径 —— 完整路径太长会被截断丢信息
+            fname = os.path.basename((f.get("file") or "").strip().rstrip("/")) or (f.get("file") or "?")
+            desc = f"{_one_line(fname, 48)}: {issue}"
             if fix:
                 desc += f" → {fix}"
             cat = (f.get("category") or "").strip()

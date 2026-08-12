@@ -370,11 +370,13 @@ def run(args):
     _log('NOTIFY', 'RUNNING', key, issue_key, project, '', 'sending final summary')
     # 方案C: 直接用 code_reviewer 产出的 skill 模板 review_text(含 Summary/Strengths/
     # 架构性能/严重度), 而非 feishu_notifier 旧的分组重渲染 —— 保证群里显示 skill 模板。
+    # engine/game 两份分开、各加一行短标(引擎仓库 / 游戏仓库), 否则合并后分不清来源。
     rev_texts = []
-    for res in (eng_res or {}, gam_res or {}):
+    repo_labels = {"engine": "🛠️ 引擎仓库(engine)", "game": "🎮 游戏仓库(game)"}
+    for repo, res in (("engine", eng_res or {}), ("game", gam_res or {})):
         rt = ((res or {}).get("review") or {}).get("review_text") or ""
         if rt:
-            rev_texts.append(rt)
+            rev_texts.append(f"**{repo_labels.get(repo, repo)}**\n{rt}")
     if rev_texts:
         full_text = "\n\n".join(rev_texts)
     else:
