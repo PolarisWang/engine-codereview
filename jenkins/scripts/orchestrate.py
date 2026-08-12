@@ -1796,10 +1796,12 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     findings only)."""
     import subprocess as _sp
     ws = workspace or _DEFAULT_WORKSPACE
-    src = topic.get("review_branch") or ""
-    task = topic.get("jira_key") or "task"
-    suffix = "" if repo == "engine" else f"-{repo}"
-    branch = f"{src}-fix-{task}{suffix}" if src else f"fix-{task}{suffix}"
+    # Per-topic-unique fix branch (_new_branch_name appends a message_id hash) so two
+    # topics on the same Jira do NOT collide on the same fix branch (previously the
+    # inline {src}-fix-{task} reused the LAST topic's branch -> push "fetch first" reject).
+    # Add -game for the game repo so engine/game don't collide either.
+    base = _new_branch_name(topic)
+    branch = f"{base}-{repo}" if repo == "game" else base
     # Engine/game each have their own checkout carrying their own files. _ensure_shared_checkout
     # resolves the correct repo's URL+dir and resets it to origin/{src} (clean edit base).
     checkout, err = _ensure_shared_checkout(topic, repo, ws)
