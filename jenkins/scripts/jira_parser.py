@@ -18,7 +18,7 @@ import urllib.parse
 
 # Shared helpers: config from config.yaml, Jira URL pattern, HTTP with retry
 from common import load_config, get_project, get_projects, get_claude_config, \
-    JIRA_URL_PATTERN, http_request
+    JIRA_URL_PATTERN, http_request, c_gitlab_host
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ def jira_request(path, host, token):
 
 def gitlab_api_get(path, token):
     """Make a GitLab API GET request."""
-    url = f"https://gitlab.booming-inc.com/api/v4/{path.lstrip('/')}"
+    url = f"https://{c_gitlab_host()}/api/v4/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     resp = http_request("GET", url, headers=headers)
     if resp is None:
@@ -376,7 +376,7 @@ def main():
                         "target_branch": gm.get("target_branch") or project_cfg["default_branch"],
                         "state": "opened",
                     }
-                    result["mr_url"] = f"https://gitlab.booming-inc.com/{project_path}/-/merge_requests/{gm.get('iid')}"
+                    result["mr_url"] = f"https://{c_gitlab_host()}/{project_path}/-/merge_requests/{gm.get('iid')}"
                     print(f"[gitlab] bind review -> {gm['branch']} (MR {gm.get('iid')})", file=sys.stderr)
                     break
 
@@ -428,7 +428,7 @@ def main():
                     "target_branch": gm.get("target_branch") or project_cfg["default_branch"],
                     "state": "opened",
                 }
-                result["mr_url"] = f"https://gitlab.booming-inc.com/{project_path}/-/merge_requests/{gm.get('iid')}"
+                result["mr_url"] = f"https://{c_gitlab_host()}/{project_path}/-/merge_requests/{gm.get('iid')}"
                 print(f"[gitlab] bind review -> {gm['branch']} (MR {gm.get('iid')})", file=sys.stderr)
                 break
 
