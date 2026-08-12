@@ -131,7 +131,9 @@ pipeline {
         // fallback below is a documented hardcoded default.
         FEISHU_APP_ID = "${env.FEISHU_APP_ID ?: ''}"
         FEISHU_APP_SECRET = "${env.FEISHU_APP_SECRET ?: ''}"
-        FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_e817ca07b9c71539e334b1701f2054b4'}"
+        # 正式环境群固定为 oc_e817... (注释掉 `${env.FEISHU_CHAT_ID ?: ...}` 只因外层 env 可能仍带旧
+        # oc_254e 的值, 会让 `?:` 兜底不生效; 直接用固定新群, 换群时改这一行)。
+        FEISHU_CHAT_ID = 'oc_e817ca07b9c71539e334b1701f2054b4'
         // Fallback webhook — a live incoming-webhook URL is hardcoded here for
         // resilience when the Bot API is unavailable (see docs/jenkins-credentials.md).
         // Prefer injecting FEISHU_WEBHOOK_URL_OVERRIDE via Jenkins credentials.
