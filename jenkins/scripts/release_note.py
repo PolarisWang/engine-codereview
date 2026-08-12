@@ -16,6 +16,8 @@ import sys
 
 # 本周期边界：上版本 tag。首次发布(无 tag)用双点到根。
 TYPE_ORDER = ["feat", "fix", "chore", "docs", "refactor", "perf", "test", "build", "ci", "style", "other"]
+# 每个严重度/类型小节最多展示的行数（防刷屏；超出显式标注剩余条数）
+MAX_LINES = 12
 TYPE_CN = {"feat": "✨ 新功能", "fix": "🐛 问题修复", "chore": "🧰 维护",
            "docs": "📝 文档", "refactor": "♻️ 重构", "perf": "⚡ 性能",
            "test": "🧪 测试", "build": "🔨 构建", "ci": "🚦 CI",
@@ -50,11 +52,12 @@ def _scope_of(title):
 
 
 def group_commits(commits):
-    """commits: [(short_sha, title)]. Return list of (type, [{'sha','title','rest'}])."""
+    """commits: [(short_sha, title)]. Return list of (type, [{'sha','title','scope','rest'}])."""
     groups = {}
     for sha, title in commits:
         t, scope, _bang, rest = _scope_of(title)
-        groups.setdefault(t, []).append({"sha": sha, "title": title, "rest": (rest or title)})
+        groups.setdefault(t, []).append({"sha": sha, "title": title,
+                                          "scope": scope, "rest": (rest or title)})
     ordered = [t for t in TYPE_ORDER if t in groups]
     ordered += [t for t in groups if t not in TYPE_ORDER]
     return [(t, groups[t]) for t in ordered]
@@ -103,10 +106,13 @@ def build_note(version, commits, include_summary=True):
         lines.append("")
     for typ, items in group_commits(commits):
         lines.append(f"{TYPE_CN.get(typ, '📦 其他')}")
-        for it in items[:6]:
-            lines.append(f" · {it['rest'].strip().strip('.')}")  # 用 rest(去 type: 前缀)
-        if len(items) > 6:
-            lines.append(f" (共 {len(items)} 项，其余见提交历史)")
+        for it in items[:MAX_LINES]:
+            rest = it['rest'].strip().strip('.')
+            scope = (it.get('scope') or '').strip()
+            # 言简意赅：若有 scope(文件/模块)则前置突出，再加一句简短描述。
+            lines.append(f" · {scope}：{rest}" if scope else f" · {rest}")
+        if len(items) > MAX_LINES:
+            lines.append(f" （该节共 {len(items)} 项，其余见 history）")
         lines.append("")
     return "\n".join(lines).rstrip()
 

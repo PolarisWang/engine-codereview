@@ -53,15 +53,18 @@ def _polish_release_note(version, commits):
         return None
     grouped_lines = []
     for t, items in rn.group_commits(commits):
-        grouped_lines.append(f"{t}: " + "; ".join(it['rest'] for it in items[:6]))
+        for it in items[:8]:
+            scope = (it.get('scope') or '').strip()
+            rest = it['rest'].strip().strip('.')
+            grouped_lines.append(f"{t} {scope + ':' if scope else ''} {rest}".rstrip())
     raw = "\n".join(grouped_lines)
     prompt = (
-        f"你是一名发布经理。请把下面代码仓库的改动整理成一份**官方中文 release note**（版本 v{version}）。\n"
+        f"你是一名发布经理。请把下面代码仓库的改动整理成一份**言简意赅**的官方中文 release note（版本 v{version}）。\n"
         "要求：\n"
-        "- 分三节：✨ 新功能 / 🐛 问题修复 / 🧰 维护\n"
-        "- 每节 2-4 句通顺、面向团队与开发者的官方措辞，概括本节改动，不要逐条堆 commit\n"
-        "- 若有 breaking/重大改动，加一节 ⚠️ 注意事项\n"
-        "- 只输出 markdown 正文，开头是 `🆕 版本 v{version} 发布`，不要 extra 标题栏\n\n"
+        "- 分三节：✨ 新功能 / 🐛 问题修复 / 🧰 维护（有 breaking 再加 ⚠️ 注意事项）\n"
+        "- **每条一行**，格式：`· 文件名/模块：一句话`（**突出文件名**，简洁描述，10-25 字左右）\n"
+        "- 不要写成段落；每条一行、寥寥数言\n"
+        "- 开头是 `🆕 版本 v{version} 发布`，只输出 markdown 正文\n\n"
         f"改动：\n{raw}"
     )
     try:
