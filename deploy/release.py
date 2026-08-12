@@ -42,6 +42,46 @@ def load_cfg():
         return {}
 
 
+def _polish_release_note(version, commits):
+    """用 LLM 把分组版 release note 润色成官方中文文案。失败/无凭证返回原分组版。"""
+    import json as _json
+    import urllib.request as _ur
+    api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+    base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+    model = os.environ.get("ANTHROPIC_MODEL") or "deepseek-v4-flash"
+    if not api_key:
+        return None
+    grouped_lines = []
+    for t, items in rn.group_commits(commits):
+        grouped_lines.append(f"{t}: " + "; ".join(it['rest'] for it in items[:6]))
+    raw = "\n".join(grouped_lines)
+    prompt = (
+        f"你是一名发布经理。请把下面代码仓库的改动整理成一份**官方中文 release note**（版本 v{version}）。\n"
+        "要求：\n"
+        "- 分三节：✨ 新功能 / 🐛 问题修复 / 🧰 维护\n"
+        "- 每节 2-4 句通顺、面向团队与开发者的官方措辞，概括本节改动，不要逐条堆 commit\n"
+        "- 若有 breaking/重大改动，加一节 ⚠️ 注意事项\n"
+        "- 只输出 markdown 正文，开头是 `🆕 版本 v{version} 发布`，不要 extra 标题栏\n\n"
+        f"改动：\n{raw}"
+    )
+    try:
+        payload = _json.dumps({
+            "model": model, "max_tokens": 700,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+        req = _ur.Request(f"{base_url}/v1/messages", data=payload,
+                          headers={"Content-Type": "application/json", "x-api-key": api_key,
+                                   "anthropic-version": "2023-06-01"}, method="POST")
+        with _ur.urlopen(req, timeout=120) as resp:
+            result = _json.loads(resp.read())
+        text = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
+        text = text.strip()
+        return text if text else None
+    except Exception as e:
+        print(f"[release] LLM 润色失败，退回分组版：{e}", file=sys.stderr)
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="本地版本发布（仅用户要求时运行）")
     ap.add_argument("--repo-dir", default=".", help="要被发布(打 tag)的 git 仓库（默认当前仓）")
@@ -79,11 +119,11 @@ def main():
     tag = f"v{version}"
     note = rn.build_note(ver, commits)
 
+    # LLM 润色成官方中文（可选；失败/无凭证自动退回分组版）
     if rel.get("note_llm"):
-        try:
-            from orchestrate import _polish_release_note_direct  # 若存在润色
-        except Exception:
-            pass  # 无润色则保留分组版
+        polished = _polish_release_note(version, commits)
+        if polished:
+            note = polished
 
     print(f"prev={prev or '(none)'} next={tag} commits={len(commits)}")
 
