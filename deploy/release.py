@@ -60,11 +60,11 @@ def _polish_release_note(version, commits):
     raw = "\n".join(grouped_lines)
     prompt = (
         f"你是一名发布经理。请把下面代码仓库的改动整理成一份**言简意赅**的官方中文 release note（版本 v{version}）。\n"
-        "要求：\n"
-        "- 分三节：✨ 新功能 / 🐛 问题修复 / 🧰 维护（有 breaking 再加 ⚠️ 注意事项）\n"
-        "- **每条一行**，格式：`· 文件名/模块：一句话`（**突出文件名**，简洁描述，10-25 字左右）\n"
-        "- 不要写成段落；每条一行、寥寥数言\n"
-        "- 开头是 `🆕 版本 v{version} 发布`，只输出 markdown 正文\n\n"
+        "规则：\n"
+        "- 只按实际提交类型分节：✨ 新功能 / 🐛 问题修复 / 🧰 维护；某类没有改动就不要列该节（禁止编造）\n"
+        "- **每条一行**，`· 一句话`（10-25 字）。**不要重复**同一文件名/模块前缀多次，也不要同一改动拆成多行\n"
+        "- 英文 scope(如 release-note/config) 若只为标注类别则**不出现**在行首，改成描述里自然的词\n"
+        "- 开头 `🆕 版本 v{version} 发布`，只输出 markdown 正文\n\n"
         f"改动：\n{raw}"
     )
     try:
@@ -122,8 +122,9 @@ def main():
     tag = f"v{version}"
     note = rn.build_note(ver, commits)
 
-    # LLM 润色成官方中文（可选；失败/无凭证自动退回分组版）
-    if rel.get("note_llm"):
+    # LLM 润色成官方中文（可选；失败/无凭证自动退回分组版）。
+    # 小发布(≤2 提交)直接用分组 ters 版即可，避免 LLM 把一个提交拆出多个重复小节的噪音。
+    if rel.get("note_llm") and len(commits) > 2:
         polished = _polish_release_note(version, commits)
         if polished:
             note = polished
