@@ -15,6 +15,13 @@ projects:
     game_repo: "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git"
     default_branch: main
 
+  ENG:
+    jira_project_key: ENG
+    name: "Engine"
+    engine_repo: "git@gitlab.booming-inc.com:booming/dev/chaos.git"
+    game_repo: "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git"
+    default_branch: main
+
   CB2:
     jira_project_key: CB2
     name: "CB2"
