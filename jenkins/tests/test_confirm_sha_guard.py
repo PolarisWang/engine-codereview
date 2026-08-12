@@ -76,7 +76,7 @@ def _mock_confirm(monkeypatch, topic, head_sha):
             return _R()
         return _R()
 
-    monkeypatch.setattr("orchestrate._ensure_checkout_preserve", lambda topic, ws: ("/fake/co", None))
+    monkeypatch.setattr("orchestrate._ensure_checkout_preserve", lambda topic, ws, repo="engine": ("/fake/co", None))
     monkeypatch.setattr(subprocess, "run", fake_sp_run)
     monkeypatch.setattr("orchestrate._approve", lambda *a, **k: (True, "approved"))
     monkeypatch.setattr("orchestrate._update_card_text", lambda *a, **k: None)
@@ -113,7 +113,7 @@ def _mock_confirm_no_advance(monkeypatch, head_sha):
             return _R()
         return _R()
 
-    monkeypatch.setattr("orchestrate._ensure_checkout_preserve", lambda topic, ws: ("/fake/co", None))
+    monkeypatch.setattr("orchestrate._ensure_checkout_preserve", lambda topic, ws, repo="engine": ("/fake/co", None))
     monkeypatch.setattr(subprocess, "run", fake_sp_run)
     monkeypatch.setattr("orchestrate._approve", lambda *a, **k: (True, "approved"))
     monkeypatch.setattr("orchestrate._update_card_text", lambda *a, **k: None)

@@ -1444,8 +1444,8 @@ def _ensure_checkout(topic, workspace):
         return None, f"clone err: {e}"
 
 
-def _ensure_checkout_preserve(topic, workspace):
-    """Locate THIS topic's per-topic checkout WITHOUT resetting/cleaning it,
+def _ensure_checkout_preserve(topic, workspace, repo="engine"):
+    """Locate THIS topic's per-repo checkout WITHOUT resetting/cleaning it,
     preserving the working-tree edits that _agent_edit_all wrote (agent_edit →
     staged_agent_edit → agent_edit_confirm runs across separate consume ticks.)
 
@@ -1454,22 +1454,22 @@ def _ensure_checkout_preserve(topic, workspace):
     working-tree edits. The stored-diff replay then failed (context mismatch) and the
     old code silently pushed an empty branch → fix branch == review tip → no MR.
 
-    With per-topic isolation, the same per-topic dir (`{repo}-review/{slug}`) is shared
-    between edit and confirm, so we can safely REUSE it in place: the edits are still in
-    the working tree/index, and `git commit` picks them up directly. Only clone if the
-    dir is missing (rare — edit should have created it)."""
+    `repo` selects engine vs game: each repo has ITS OWN per-topic dir
+    ({repo}-review/{slug}), so confirm reuses the same dir the edit ran in (safe with
+    per-topic isolation). Only clone if the dir is missing (rare — edit created it)."""
     import subprocess as _sp
     src = topic.get("review_branch") or topic.get("base_branch") or ""
-    mr_url = topic.get("mr_url") or ""
-    import jira_parser as _jp
-    pp, _ = _jp.parse_gitlab_mr_url(mr_url) if "merge_requests" in mr_url else (None, None)
-    if not pp:
-        return None, "no mr project path"
-    repo_name = pp.rstrip("/").split("/")[-1]
-    dest = _checkout_dir_for(workspace, repo_name, topic)
+    # Resolve this repo's real dir + name + project (engine from mr_url, game from
+    # game_repo URL) so confirm lands on the SAME checkout the edit used.
+    dest, repo_name = _resolve_repo_checkout(workspace, topic, repo)
+    if not dest:
+        return None, "no checkout dir for " + repo
+    pp = _repo_project(topic, repo)
     if os.path.isdir(os.path.join(dest, ".git")):
         # PRESERVE working tree + index (the staged diffs). Do NOT fetch/reset/clean.
         return dest, None
+    if not pp:
+        return None, "no project path for " + repo
     # Not present: clone it fresh (edited branch state is gone anyway).
     tok = _env("GITLAB_TOKEN")
     if not tok:
@@ -1766,20 +1766,28 @@ def _agent_edit_preview(topic, all_findings, api_key, base_url, workspace=None, 
     return show[0].get("file") if show else None, "", "agent edit failed on all candidate findings"
 
 
-def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, model=EDIT_MODEL):
+def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, model=EDIT_MODEL, repo="engine"):
     """Multi-file agent edit (closure #4): iterate over critical/high findings (up to 3)
     and fix each in the SAME working tree on the fix branch `{src}-fix-{task}`. Changes are
     cumulative (each later file is edited against the tree mutated by earlier fixes), so the
     returned diffs form one coherent change set. Returns (ok_diffs, failed, branch, checkout,
     err, checkout_sha). checkout_sha is the fix-branch base commit at edit time (R1): the
     confirm step checks the tree is still on this SHA before pushing, so a reused/reset
-    checkout can't silently replay stale diffs onto a drifted base."""
+    checkout can't silently replay stale diffs onto a drifted base.
+
+    方案(双MR): `repo` selects engine or game; each repo runs on ITS OWN checkout and
+    produces its own fix branch {src}-fix-{task}(-game), so a repo with findings gets its
+    own MR. `all_findings` must already be scoped to `repo` (engine findings only / game
+    findings only)."""
     import subprocess as _sp
     ws = workspace or _DEFAULT_WORKSPACE
     src = topic.get("review_branch") or ""
     task = topic.get("jira_key") or "task"
-    branch = f"{src}-fix-{task}" if src else f"fix-{task}"
-    checkout, err = _ensure_checkout(topic, ws)
+    suffix = "" if repo == "engine" else f"-{repo}"
+    branch = f"{src}-fix-{task}{suffix}" if src else f"fix-{task}{suffix}"
+    # Engine/game each have their own checkout carrying their own files. _ensure_shared_checkout
+    # resolves the correct repo's URL+dir and resets it to origin/{src} (clean edit base).
+    checkout, err = _ensure_shared_checkout(topic, repo, ws)
     if err:
         return [], [], branch, None, err, ""
     # R17: serialize edits on this repo's shared checkout across processes.
@@ -1863,92 +1871,48 @@ def _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
     return 0
 
 
-def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app_id, app_secret, actor=""):
-    """确认自动改码: consume the staged_agent_edit change set — commit on the fix branch,
-    push it, auto-create the fix MR, and report the real MR url. Returns rc."""
+def _commit_push_create_mr_for_repo(key, topic, repo_set, state_file, workspace):
+    """Confirm ONE repo's staged fix set: commit on its fix branch in its per-repo
+    checkout (preserving the working-tree edits _agent_edit_all wrote), push, auto-create
+    the fix MR on THAT repo's project. Returns (mriid, murl, mrnote, err) — on err
+    (mriid None) the MR was not created and a reply must be posted by the caller.
+
+    `repo_set` = {repo, branch, files, checkout_sha}. Wired for the per-repo (双MR)
+    design: engine and game each get their own fix branch + MR on their own project."""
     import subprocess as _sp
-    render = topic.get("render_msg_id") or ""
-    pending = (topic.get("pending_patch") or {})
-    if pending.get("state") != "staged_agent_edit":
-        _proc_reply(key, topic,
-                    "⛔ 当前没有待确认的自动改码。请先回复 `改码` 生成修改。",
-                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-        return 0
-    files = pending.get("files") or []
-    branch = pending.get("branch") or ""
-    if not files or not branch:
-        pipeline_state.set_pending_patch(state_file, key, None)
-        _proc_reply(key, topic, M("confirm_no_staged"),
-                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-        return 0
-    # Guard: never push to a protected branch.
-    if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
-        _proc_reply(key, topic, M("confirm_protected_branch", branch=branch),
-                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-        return 0
-    ok, why = _approve(key, topic, actor, "push_fix_branch", branch=branch)
-    if not ok:
-        _proc_reply(key, topic, M("denied_why", why=why),
-                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-        return 0
-    # 根因修复: 确认阶段必须复用 _agent_edit_all 留下的工作树(不改写), 否则
-    # _ensure_checkout 的 reset+clean 会清掉已生成的改动, 重放 diff 又失败 →
-    # 空提交 → push 空分支 → MR"无改动"创建失败。
-    checkout, err = _ensure_checkout_preserve(topic, workspace)
+    repo = repo_set.get("repo") or "engine"
+    branch = repo_set.get("branch") or ""
+    files = repo_set.get("files") or []
+    expected_sha = repo_set.get("checkout_sha") or ""
+    if not branch or not files:
+        return None, "", "", "no staged branch/files"
+    # 根因修复: confirm 复用 edit 时的工作树(不改写), 否则 reset+clean 清掉改动 ->
+    # 重放失败 -> 空提交 -> push 空分支 -> MR"无改动"创建失败。
+    checkout, err = _ensure_checkout_preserve(topic, workspace, repo=repo)
     if err:
-        _proc_reply(key, topic, M("confirm_checkout_fail", err=err),
-                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-        return 0
-    # Ensure we're on the fix branch and the diffs are applied. The staged edits were
-    # written to the shared checkout's working tree by _cmd_auto_edit; if a later
-    # process reset the tree (nothing-to-commit), re-apply the stored diffs. git's
-    # "nothing to commit" message goes to STDOUT and is locale-dependent, so force
-    # LC_ALL=C and match on output, not stderr.
+        return None, "", "", f"checkout: {err}"
     _git_env = _auth_git_env({"LC_ALL": "C"})
-    # Ensure a git identity exists in this checkout so `git commit` does not fail
-    # with "Author identity unknown" on a fresh container without global git config.
     _sp.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
             capture_output=True, text=True, timeout=30, env=_git_env)
     _sp.run(["git", "-C", checkout, "config", "user.name", "codereview-agent"],
             capture_output=True, text=True, timeout=30, env=_git_env)
-    # R17: serialize this repo's shared-checkout mutations (checkout -B / R1
-    # guard / add / commit / replay / push) across processes so two topics editing
-    # the same repo cannot clobber each other's working tree.
     repo_name = _repo_name_from_checkout(checkout)
     with _checkout_lock(repo_name):
         _sp.run(["git", "-C", checkout, "checkout", "-B", branch],
                 capture_output=True, text=True, timeout=60, env=_git_env)
-        # R1 guard: refuse to push a stale edit set. We recorded the base commit at
-        # edit time (checkout_sha); if the reused/shared checkout was reset by another
-        # tick (re_review / another topic / cleanup) since, HEAD no longer equals that
-        # base, so replaying the stored diffs could apply them onto a drifted base.
-        # A missing baseline (legacy pending) is also refused (fail-safe).
-        expected_sha = (pending or {}).get("checkout_sha") or ""
         if expected_sha:
             _sha_r = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
                              capture_output=True, text=True, timeout=30, env=_git_env)
             cur = (_sha_r.stdout or "").strip()
             if not cur or cur != expected_sha:
-                pipeline_state.set_pending_patch(state_file, key, None)
-                _proc_reply(key, topic, M("confirm_r1_drifted"), render, state_file, app_id, app_secret)
-                return 0
+                return None, "", "", "R1: checkout drifted from baseline"
         else:
-            # Legacy staged edit without a recorded baseline: safest to refuse.
-            pipeline_state.set_pending_patch(state_file, key, None)
-            _proc_reply(key, topic, M("confirm_r1_missing"), render, state_file, app_id, app_secret)
-            return 0
-        _sp.run(["git", "-C", checkout, "add", "-A"],
-                capture_output=True, text=True, timeout=60, env=_git_env)
+            return None, "", "", "R1: missing baseline"
+        _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
         _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
                           capture_output=True, text=True, timeout=60, env=_git_env)
         _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
         if _commit.returncode != 0 and "nothing to commit" in _commit_out:
-            # tree was clean relative to the fix-branch HEAD: a later process's
-            # _ensure_checkout reset+clean wiped the working-tree edits made by
-            # _agent_edit_all, so re-apply the STORED diffs. Must check every apply's
-            # rc — a silent apply failure => empty commit => we'd push a no-change
-            # branch, and _create_or_get_mr then reports "fix 分支无改动" / MR create
-            # fails (the bug under investigation). Fail loudly instead of pushing air.
             import tempfile
             apply_errs = []
             for d in files:
@@ -1971,68 +1935,102 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
                     except OSError:
                         pass
             if apply_errs:
-                # Any stored diff failed to re-apply: do NOT push an empty/partial
-                # branch. Report clearly and keep the change set for manual @改码 retry.
-                pipeline_state.set_pending(state_file, key, "agent_edit",
-                                           patch={"actor": actor, "branch": branch})
-                _proc_reply(key, topic,
-                            "⛔ 确认阶段重放自动改码失败（工作树被复用的 checkout 复位清空后，"
-                            f"无法重新应用以下改动）：\n" + "\n".join("· " + e for e in apply_errs[:5]) +
-                            "\n\n请重新回复 `优化` 生成新的修复。",
-                            render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-                return 0
+                return None, "", "\n".join("· " + e for e in apply_errs[:5]), "replay-apply-failed"
             _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
             _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
                               capture_output=True, text=True, timeout=60, env=_git_env)
-        if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
-            _proc_reply(key, topic, M("confirm_commit_fail", err=(_commit.stderr or _commit.stdout)[:200]), render, state_file, app_id, app_secret)
-            return 0
-        # Safety net: verify a real fix commit exists on the fix branch (HEAD advanced
-        # past the R1 base). If HEAD is still on checkout_sha, no fix landed — refuse to
-        # push a no-change branch (which previously caused MR creation to fail with
-        # "fix 分支相对 <target> 无改动").
+        if _commit.returncode != 0 and "nothing to commit" not in (_commit_out):
+            return None, "", (_commit.stderr or _commit.stdout)[:200], "commit-failed"
+        # safety net: HEAD must advance past the baseline (a real fix commit exists)
         if expected_sha:
             _after = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
                              capture_output=True, text=True, timeout=30, env=_git_env)
             if ((_after.stdout or "").strip() or "") == (expected_sha or "").strip():
-                pipeline_state.set_pending(state_file, key, "agent_edit",
-                                           patch={"actor": actor, "branch": branch})
-                _proc_reply(key, topic,
-                            "⛔ 没有可推送的自动改码（修复提交未生成，分支仍停留在基线）。"
-                            "请重新回复 `优化` 生成新的修复。",
-                            render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-                return 0
+                return None, "", "", "no-fix-commit"
         push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                        capture_output=True, text=True, timeout=180, env=_git_env)
         if push.returncode != 0:
-            _proc_reply(key, topic, M("confirm_push_fail", err=(push.stderr or push.stdout)[:200]), render, state_file, app_id, app_secret)
+            return None, "", (push.stderr or push.stdout)[:200], "push-failed"
+    # Auto-create/detect the fix-branch MR on the repo's project.
+    import jira_parser as _jpx
+    _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, [], create_if_missing=True, branch=branch, repo=repo)
+    return _mriid, murl, mrnote, (None if _mriid else "mr-create-failed")
+
+
+def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app_id, app_secret, actor=""):
+    """确认自动改码(双MR): iterate the per-repo staged change sets, each on its own
+    checkout/fix-branch/project, commit+push+create its MR, then post one merged reply."""
+    render = topic.get("render_msg_id") or ""
+    pending = (topic.get("pending_patch") or {})
+    if pending.get("state") != "staged_agent_edit":
+        _proc_reply(key, topic,
+                    "⛔ 当前没有待确认的自动改码。请先回复 `改码` 生成修改。",
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+        return 0
+    repos = pending.get("repos") or []
+    if not repos:
+        files = pending.get("files") or []
+        branch = pending.get("branch") or ""
+        if not files or not branch:
+            pipeline_state.set_pending_patch(state_file, key, None)
+            _proc_reply(key, topic, M("confirm_no_staged"),
+                        render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
             return 0
-    # Auto-create / detect the fix-branch MR and report its real url.
-    # 加固: 传实际 push 的分支(branch), 与 push 严格一致, 杜绝分支来源不一致。
-    _assert_branch_consistent(branch, _fix_branch(topic), key)
-    mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True, branch=branch)
-    if mriid:
-        # Record ownership (R2): we created/attributed this fix MR; close-time will
-        # match by iid, never by bare branch name, so a same-named MR owned by
-        # someone else is left alone.
-        pipeline_state.record_fix_mr(state_file, key, mriid)
-    for f in files:
-        pipeline_state.record_applied_patch(state_file, key, {
-            "file": f.get("file", ""), "repo": "engine", "branch": branch,
-            "applied_at": "now", "mode": "agent_edit",
-        })
-    pipeline_state.append_approval(state_file, key, actor, "push_fix_branch", branch, "ok",
-                                   "pushed + MR " + (murl or ""))
+        repos = [{"repo": "engine", "branch": branch, "files": files,
+                  "checkout_sha": pending.get("checkout_sha") or ""}]
+    for rs in repos:
+        if (rs.get("branch") or "").split("/")[-1] in PROTECTED_BRANCHES or (rs.get("branch") or "") in PROTECTED_BRANCHES:
+            _proc_reply(key, topic, M("confirm_protected_branch", branch=rs.get("branch")),
+                        render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+            return 0
+    ok, why = _approve(key, topic, actor, "push_fix_branch",
+                       branch=",".join((rs.get("branch") or "") for rs in repos))
+    if not ok:
+        _proc_reply(key, topic, M("denied_why", why=why),
+                    render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+        return 0
+    results = []
+    hard_fail = None
+    for rs in repos:
+        mriid, murl, mrnote, err = _commit_push_create_mr_for_repo(key, topic, rs, state_file, workspace)
+        if err:
+            hard_fail = (rs.get("repo"), err, mrnote or "")
+            results.append({"repo": rs.get("repo"), "branch": rs.get("branch"),
+                            "ok": False, "murl": "", "mrnote": mrnote or "", "files": rs.get("files") or []})
+            continue
+        results.append({"repo": rs.get("repo"), "branch": rs.get("branch"), "ok": True,
+                        "murl": murl, "mrnote": mrnote or "", "files": rs.get("files") or []})
+        if mriid:
+            pipeline_state.record_fix_mr(state_file, key, mriid)
+        pipeline_state.append_approval(state_file, key, actor, "push_fix_branch",
+                                       rs.get("branch"), "ok", "pushed + MR " + (murl or ""))
+        for f in (rs.get("files") or []):
+            pipeline_state.record_applied_patch(state_file, key, {
+                "file": f.get("file", ""), "repo": rs.get("repo") or "engine",
+                "branch": rs.get("branch", ""), "applied_at": "now", "mode": "agent_edit",
+            })
     pipeline_state.set_pending_patch(state_file, key, None)
-    text = (f"✅ **自动改码已推送** `{branch}`（{len(files)} 个文件）。\n"
-            f"- 推送分支：`{branch}`\n"
-            f"- 本次修复 MR：{murl if murl else '（创建失败：' + mrnote + '）'}\n"
-            f"- 原评审 MR：{topic.get('mr_url') or ''}\n\n"
-            f"> 已推送到 `{branch}`，修复 MR 见上（机器人只创建 MR，不合并代码；请到 GitLab 自行 review 后决定）。`4` 可关闭话题（会连同关闭本轮 fix 分支的 OPEN MR）。")
-    _finalize(key, text, render, [], state_file, app_id, app_secret)
+    if hard_fail:
+        note = "🛑 确认阶段失败(" + str(hard_fail[0]) + "): " + str(hard_fail[1])
+        if hard_fail[2]:
+            note += "\n" + str(hard_fail[2])
+        note += "\n\n请重新回复 `优化` 生成新的修复。"
+        _proc_reply(key, topic, note, render, state_file, app_id, app_secret,
+                    intent="确认并推送修复分支", prefix="🛑")
+        return 0
+    out_lines = []
+    for r in results:
+        if r["ok"] and r["murl"]:
+            out_lines.append("✅ **自动改码已推送** `" + r["branch"] + "`（" + r["repo"] + "，" +
+                            str(len(r["files"])) + " 个文件）。\n" +
+                            "- 推送分支：`" + r["branch"] + "`\n" +
+                            "- 本次修复 MR：" + r["murl"])
+        else:
+            out_lines.append("⚠️ " + r["repo"] + " 修复 MR 未创建（" + (r["mrnote"] or "未知") + "）")
+    out_lines.append("- 原评审 MR：" + (topic.get("mr_url") or "") +
+                     "\n\n> 修复 MR 由机器人创建，请到 GitLab 自行 review 后合并；`4` 可关闭话题（会连带关闭本轮 fix 分支的 OPEN MR）。")
+    _finalize(key, "\n".join(out_lines), render, [], state_file, app_id, app_secret)
     return 0
-
-
 def _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace=None):
     """Build a human preview using the Y auto-fix (real checkout + apply --check)."""
     ok, failed, branch_name, err = _auto_fix_in_checkout(
@@ -2584,205 +2582,139 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         return True, ("rolled back to " + before[:8]) if before else "rolled back"
 
     if action == "agent_edit":
-        # 改码: run claude -p to auto-fix findings, stage the diffs for @确认.
+        # 改码: run claude -p to auto-fix findings per repo, stage the diffs for @确认.
         # Approval was done at enqueue time in interact (owner-gated); the real
         # actor rides in pending.patch.actor (consume_all_pending hardcodes "jenkins").
         act = (pending.get("patch") or {}).get("actor") or "jenkins"
         api_key = _env("ANTHROPIC_AUTH_TOKEN") or _env("ANTHROPIC_API_KEY")
         base_url = _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-        try:
-            ok_diffs, failed, branch, _co, err, checkout_sha = _agent_edit_all(
-                topic, all_findings, api_key, base_url, workspace)
-        except Exception as e:
-            pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
-            pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, M("edit_err", msg=str(e)[:200]), render, state_file, app_id, app_secret)
-            return False, f"agent_edit error: {e}"
-        if err:
-            pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail", err)
-            pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, M("edit_prep_fail", msg=err), render, state_file, app_id, app_secret)
-            return False, f"agent_edit checkout: {err}"
-        if not ok_diffs:
-            pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "fail",
-                                           "no fixed finding")
+        # 方案(双MR): engine 与 game 各自跑 _agent_edit_all（各自 checkout+fix 分支），
+        # 有改动的仓库各得到一个修复 MR。findings 已按仓库分开(_eng_f/_gam_f)。
+        repo_findings = {"engine": _eng_f or [], "game": _gam_f or []}
+        staged_repos = []          # list of {repo, branch, files, checkout_sha}
+        merged_failed = []
+        for repo in ("engine", "game"):
+            rf = repo_findings.get(repo) or []
+            if not rf:
+                continue
+            try:
+                ok_diffs, failed, branch, _co, err, checkout_sha = _agent_edit_all(
+                    topic, rf, api_key, base_url, workspace, repo=repo)
+            except Exception as e:
+                pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
+                pipeline_state.clear_pending(state_file, key)
+                _proc_reply(key, topic, M("edit_err", msg=str(e)[:200]), render, state_file, app_id, app_secret)
+                return False, f"agent_edit error: {e}"
+            if err:
+                merged_failed.append(f"{repo}: {err}")
+                continue
+            if ok_diffs:
+                staged_repos.append({"repo": repo, "branch": branch,
+                                     "files": ok_diffs, "checkout_sha": checkout_sha})
+            merged_failed.extend((f"{repo}: {ff}" for ff in (failed or [])))
+        if not staged_repos:
+            pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail",
+                                           "no fixed finding" if not merged_failed else "; ".join(merged_failed[:2]))
             pipeline_state.clear_pending(state_file, key)
             _proc_reply(key, topic, M("edit_no_diff"), render, state_file, app_id, app_secret)
             return False, "agent_edit: no usable diff"
+        # store the per-repo staged sets (confirm iterates them -> per-repo push+MR)
         pipeline_state.set_pending_patch(state_file, key, {
-            "file": "all", "repo": "engine", "target": "agent_edit",
-            "state": "staged_agent_edit", "branch": branch,
-            "diff": "", "files": ok_diffs, "created_at": "now",
-            "checkout_sha": checkout_sha,   # R1 base-commit guard for confirm
+            "file": "all", "target": "agent_edit",
+            "state": "staged_agent_edit",
+            "diff": "", "created_at": "now",
+            "repos": staged_repos,      # list of {repo, branch, files, checkout_sha}
         })
-        pipeline_state.append_approval(state_file, key, act, "auto_edit", branch, "ok",
-                                       f"staged {len(ok_diffs)} files")
+        pipeline_state.append_approval(state_file, key, act, "auto_edit",
+                                       ",".join(r["branch"] for r in staged_repos), "ok",
+                                       f"staged {sum(len(r['files']) for r in staged_repos)} files across "
+                                       f"{', '.join(r['repo'] for r in staged_repos)}")
         pipeline_state.clear_pending(state_file, key)
         # 优化 全自动: 若用户触发的是 `优化`(auto_confirm=True), 自动入队确认(commit+push+建/更新MR),
         # 无需手动 `@确认`。否则(手动 `改码`)仍展示待确认。
         if topic.get("auto_confirm"):
             pipeline_state.set_topic_fields(state_file, key, auto_confirm=False)
             pipeline_state.set_pending(state_file, key, "agent_edit_confirm",
-                                       patch={"actor": act, "branch": branch})
+                                       patch={"actor": act})
             _proc_reply(key, topic,
-                        M("auto_optimizing", n=len(ok_diffs)),
+                        M("auto_optimizing", n=sum(len(r["files"]) for r in staged_repos)),
                         render, state_file, app_id, app_secret, intent="优化：改码→自动推送→创建/更新MR")
-            return True, f"agent_edit: staged {len(ok_diffs)} files; auto-confirm enqueued"
-        lines = [f"## ⚠️ 自动改码完成，请确认\n",
-                 f"将修复推送到**新分支** `{branch}`（不覆盖原始 `{topic.get('review_branch') or ''}`），"
-                 f"确认后自动创建修复 MR。\n"]
-        for d in ok_diffs:
-            lines.append(f"\n### {d['file']}\n```diff\n{d['diff'][:1500]}\n```")
-        if failed:
+            return True, f"agent_edit: staged {sum(len(r['files']) for r in staged_repos)} files; auto-confirm enqueued"
+        lines = [f"## ⚠️ 自动改码完成，请确认\n"]
+        for sr in staged_repos:
+            lines.append(f"将修复推送到**新分支** `{sr['branch']}`（{sr['repo']}，不覆盖原始 "
+                         f"`{topic.get('review_branch') or ''}`），确认后自动创建对应 MR。\n")
+            for d in sr["files"]:
+                lines.append(f"\n### {d['file']}\n```diff\n{d['diff'][:1500]}\n```")
+        if merged_failed:
             lines.append("\n---\n**未能自动修复的文件**：")
-            for file, why in failed:
-                lines.append(f"- `{file}`: {why}")
+            for ff in merged_failed[:5]:
+                lines.append(f"- {ff}")
         lines.append("\n> 回复 `@确认 提交并建mr` 推送并建 MR；回复 `@撤销` 取消。")
         _finalize(key, "\n".join(lines), render, [], state_file, app_id, app_secret)
-        return True, f"agent_edit: staged {len(ok_diffs)} files for confirm"
+        return True, f"agent_edit: staged {sum(len(r['files']) for r in staged_repos)} files for confirm"
 
     if action == "agent_edit_confirm":
-        # 确认改码: commit + push the fix branch + auto-create the MR. Approval was
-        # done at enqueue time; the actor rides in pending.patch.actor.
+        # 确认改码(双MR): commit+push+create MR for each per-repo staged set in
+        # pending_patch.repos, then post one merged reply listing every MR.
         act = (pending.get("patch") or {}).get("actor") or "jenkins"
         pp = topic.get("pending_patch") or {}
-        files = pp.get("files") or []
-        branch = pp.get("branch") or ""
-        if pp.get("state") != "staged_agent_edit" or not files or not branch:
+        repos = pp.get("repos") or []
+        if pp.get("state") != "staged_agent_edit" or not repos:
             pipeline_state.set_pending_patch(state_file, key, None)
             pipeline_state.clear_pending(state_file, key)
             _proc_reply(key, topic, M("consume_no_staged"), render, state_file, app_id, app_secret)
             return False, "agent_edit_confirm: no staged change set"
-        if (branch or "").split("/")[-1] in PROTECTED_BRANCHES or branch in PROTECTED_BRANCHES:
-            pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, M("confirm_protected_branch", branch=branch), render, state_file, app_id, app_secret)
-            return False, f"agent_edit_confirm: protected branch {branch}"
-        import subprocess as _sp2
-        _git_env = _auth_git_env({"LC_ALL": "C"})
-        # 根因修复: 复用 _agent_edit_all 留下的工作树(不改写), 避免 reset+clean 清掉改动
-        checkout, err = _ensure_checkout_preserve(topic, workspace)
-        if err:
-            pipeline_state.clear_pending(state_file, key)
-            _proc_reply(key, topic, M("confirm_checkout_fail", err=err), render, state_file, app_id, app_secret)
-            return False, f"agent_edit_confirm: {err}"
-        _sp2.run(["git", "-C", checkout, "config", "user.email", "codereview-agent@booming-inc.com"],
-                 capture_output=True, text=True, timeout=30, env=_git_env)
-        _sp2.run(["git", "-C", checkout, "config", "user.name", "codereview-agent"],
-                 capture_output=True, text=True, timeout=30, env=_git_env)
-        # Unshallow the depth-2 clone so the push won't be rejected by the server.
-        _sp2.run(["git", "-C", checkout, "fetch", "--unshallow", "origin"],
-                 capture_output=True, text=True, timeout=600, env=_git_env)
-        # R17: serialize this repo's shared-checkout mutations across processes.
-        repo_name = _repo_name_from_checkout(checkout)
-        with _checkout_lock(repo_name):
-            _sp2.run(["git", "-C", checkout, "checkout", "-B", branch],
-                     capture_output=True, text=True, timeout=60, env=_git_env)
-            # R1 guard: refuse to push a stale edit set (see _cmd_confirm_agent_edit).
-            expected_sha = (pp or {}).get("checkout_sha") or ""
-            if expected_sha:
-                _sha_r = _sp2.run(["git", "-C", checkout, "rev-parse", "HEAD"],
-                                  capture_output=True, text=True, timeout=30, env=_git_env)
-                cur = (_sha_r.stdout or "").strip()
-                if not cur or cur != expected_sha:
-                    pipeline_state.set_pending_patch(state_file, key, None)
-                    pipeline_state.clear_pending(state_file, key)
-                    _proc_reply(key, topic, M("confirm_r1_drifted"), render, state_file, app_id, app_secret)
-                    return False, "agent_edit_confirm: checkout drifted from baseline"
-            else:
-                pipeline_state.set_pending_patch(state_file, key, None)
+        for rs in repos:
+            if (rs.get("branch") or "").split("/")[-1] in PROTECTED_BRANCHES or (rs.get("branch") or "") in PROTECTED_BRANCHES:
                 pipeline_state.clear_pending(state_file, key)
-                _proc_reply(key, topic, M("confirm_r1_missing"), render, state_file, app_id, app_secret)
-                return False, "agent_edit_confirm: missing baseline SHA"
-            _sp2.run(["git", "-C", checkout, "add", "-A"],
-                     capture_output=True, text=True, timeout=60, env=_git_env)
-            _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                               capture_output=True, text=True, timeout=60, env=_git_env)
-            _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
-            if _commit.returncode != 0 and "nothing to commit" in _commit_out:
-                # replay the staged diffs into the (possibly reset) tree. Check every
-                # apply's rc — a silent apply failure => empty commit => we'd push a
-                # no-change branch and MR creation then fails with "fix 分支无改动"
-                # (the bug under investigation). Fail loudly instead.
-                import tempfile as _tf
-                apply_errs = []
-                for d in files:
-                    diff = d.get("diff") or ""
-                    if not diff:
-                        apply_errs.append("(empty diff)")
-                        continue
-                    with _tf.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
-                        _f.write(diff)
-                        _pf = _f.name
-                    try:
-                        _ap = _sp2.run(["git", "-C", checkout, "apply", "--3way", _pf],
-                                       capture_output=True, text=True, timeout=60, env=_git_env)
-                        if _ap.returncode != 0:
-                            apply_errs.append((d.get("file") or "?") + ": " +
-                                              ((_ap.stderr or _ap.stdout) or "apply failed").strip()[:120])
-                    finally:
-                        try:
-                            os.unlink(_pf)
-                        except OSError:
-                            pass
-                if apply_errs:
-                    pipeline_state.set_pending_patch(state_file, key, None)
-                    pipeline_state.clear_pending(state_file, key)
-                    _proc_reply(key, topic,
-                                "⛔ 确认阶段重放自动改码失败（工作树被复用的 checkout 复位清空后，"
-                                f"无法重新应用改动）：\n" + "\n".join("· " + e for e in apply_errs[:5]) +
-                                "\n\n请重新回复 `优化` 生成新的修复。",
-                                render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-                    return False, f"agent_edit_confirm: replay apply failed"
-                _sp2.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
-                _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                                   capture_output=True, text=True, timeout=60, env=_git_env)
-            if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
-                pipeline_state.clear_pending(state_file, key)
-                _proc_reply(key, topic, M("confirm_commit_fail", err=(_commit.stderr or _commit.stdout)[:200]), render, state_file, app_id, app_secret)
-                return False, f"agent_edit_confirm: commit failed"
-            # Safety net: verify a real fix commit exists (HEAD advanced past the R1
-            # base). If HEAD is still on checkout_sha, no fix landed — refuse to push a
-            # no-change branch (previously caused MR creation to fail with
-            # "fix 分支相对 <target> 无改动").
-            if expected_sha:
-                _after = _sp2.run(["git", "-C", checkout, "rev-parse", "HEAD"],
-                                  capture_output=True, text=True, timeout=30, env=_git_env)
-                if ((_after.stdout or "").strip() or "") == (expected_sha or "").strip():
-                    pipeline_state.set_pending_patch(state_file, key, None)
-                    pipeline_state.clear_pending(state_file, key)
-                    _proc_reply(key, topic,
-                                "⛔ 没有可推送的自动改码（修复提交未生成，分支仍停留在基线）。"
-                                "请重新回复 `优化` 生成新的修复。",
-                                render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
-                    return False, "agent_edit_confirm: no fix commit created"
-            push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
-                            capture_output=True, text=True, timeout=300, env=_git_env)
-            if push.returncode != 0:
-                pipeline_state.clear_pending(state_file, key)
-                _proc_reply(key, topic, M("confirm_push_fail", err=(push.stderr or push.stdout)[:200]), render, state_file, app_id, app_secret)
-                return False, f"agent_edit_confirm: push failed"
-        # 加固: 传实际 push 的分支(branch)建 MR, 与 push 严格一致。
-        _assert_branch_consistent(branch, _fix_branch(topic), key)
-        _mriid, murl, _nb, mrnote = _create_or_get_mr(topic, all_findings, create_if_missing=True, branch=branch)
-        if _mriid:
-            pipeline_state.record_fix_mr(state_file, key, _mriid)  # R2 ownership ledger
-        for f in files:
-            pipeline_state.record_applied_patch(state_file, key, {
-                "file": f.get("file", ""), "repo": "engine", "branch": branch,
-                "applied_at": "now", "mode": "agent_edit", "commit_before": "",
-            })
-        pipeline_state.append_approval(state_file, key, act, "push_fix_branch", branch, "ok",
-                                       "pushed + MR " + (murl or ""))
+                _proc_reply(key, topic, M("confirm_protected_branch", branch=rs.get("branch")),
+                            render, state_file, app_id, app_secret)
+                return False, f"agent_edit_confirm: protected branch {rs.get('branch')}"
+        results = []
+        hard_fail = None
+        for rs in repos:
+            mriid, murl, mrnote, err = _commit_push_create_mr_for_repo(key, topic, rs, state_file, workspace)
+            if err:
+                hard_fail = (rs.get("repo"), err, mrnote or "")
+                results.append({"repo": rs.get("repo"), "branch": rs.get("branch"),
+                                "ok": False, "murl": "", "mrnote": mrnote or "", "files": rs.get("files") or []})
+                continue
+            results.append({"repo": rs.get("repo"), "branch": rs.get("branch"), "ok": True,
+                            "murl": murl, "mrnote": mrnote or "", "files": rs.get("files") or []})
+            if mriid:
+                pipeline_state.record_fix_mr(state_file, key, mriid)  # R2 ownership ledger
+            pipeline_state.append_approval(state_file, key, act, "push_fix_branch",
+                                           rs.get("branch"), "ok", "pushed + MR " + (murl or ""))
+            for f in (rs.get("files") or []):
+                pipeline_state.record_applied_patch(state_file, key, {
+                    "file": f.get("file", ""), "repo": rs.get("repo") or "engine",
+                    "branch": rs.get("branch", ""), "applied_at": "now", "mode": "agent_edit",
+                    "commit_before": "",
+                })
         pipeline_state.set_pending_patch(state_file, key, None)
         pipeline_state.clear_pending(state_file, key)
-        text = (f"✅ **自动改码已推送** `{branch}`（{len(files)} 个文件）。\n"
-                f"- 推送分支：`{branch}`\n"
-                f"- 本次修复 MR：{murl if murl else '（创建失败：' + mrnote + '）'}\n"
-                f"- 原评审 MR：{topic.get('mr_url') or ''}\n\n"
-                f"> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
-        _finalize(key, text, render, [], state_file, app_id, app_secret)
-        return True, f"agent_edit_confirm: pushed {branch} + MR"
-
+        if hard_fail:
+            note = "🛑 确认阶段失败(" + str(hard_fail[0]) + "): " + str(hard_fail[1])
+            if hard_fail[2]:
+                note += "\n" + str(hard_fail[2])
+            note += "\n\n请重新回复 `优化` 生成新的修复。"
+            _proc_reply(key, topic, note, render, state_file, app_id, app_secret,
+                        intent="确认并推送修复分支", prefix="🛑")
+            return False, "agent_edit_confirm: failed for " + str(hard_fail[0])
+        out_lines = []
+        for r in results:
+            if r["ok"] and r["murl"]:
+                out_lines.append("✅ **自动改码已推送** `" + r["branch"] + "`（" + r["repo"] + "，" +
+                                str(len(r["files"])) + " 个文件）。\n" +
+                                "- 推送分支：`" + r["branch"] + "`\n" +
+                                "- 本次修复 MR：" + r["murl"])
+            else:
+                out_lines.append("⚠️ " + r["repo"] + " 修复 MR 未创建（" + (r["mrnote"] or "未知") + "）")
+        out_lines.append("- 原评审 MR：" + (topic.get("mr_url") or "") +
+                         "\n\n> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
+        _finalize(key, "\n".join(out_lines), render, [], state_file, app_id, app_secret)
+        return True, "agent_edit_confirm: pushed " + ",".join(r["branch"] for r in results) + " + MR(s)"
     pipeline_state.clear_pending(state_file, key)
     return False, f"unknown pending action: {action}"
 
@@ -3416,7 +3348,36 @@ def _project_path(topic):
     return ""
 
 
-def _create_or_get_mr(topic, all_findings, create_if_missing=False, branch=None):
+def _repo_project(topic, repo):
+    """Resolve the GitLab project path for a repo: engine from the recorded MR url
+    (authoritative), game from the game_repo URL (a different project). Used so the
+    fix MR for the GAME repo is created on the GAME project, not the engine one."""
+    if repo == "engine":
+        return _project_path(topic)
+    url = (topic.get("game_repo")
+           or (topic.get("repos") or {}).get("game", {}).get("repo_url")
+           or "") or ""
+    if not url:
+        # fall back to the engine project only if game is truly unresolved
+        return _project_path(topic)
+    import re as _re
+    if url.startswith("git@"):
+        m = _re.match(r'git@([^:]+):(.+)', url)
+        if m:
+            url = f"https://{m.group(1)}/{m.group(2)}"
+    path = url.rstrip("/")
+    # strip scheme+host -> group/subgroup/project (no .git)
+    path = path.replace(".git", "")
+    if "://" in path:
+        path = path.split("://", 1)[1]
+    # drop the host (first segment, e.g. "gitlab.booming-inc.com"), keep the project
+    # path group/subgroup/project (drop any trailing segment like /-).
+    parts = [p for p in path.split("/") if p]
+    parts = parts[1:] if len(parts) > 1 else parts
+    return "/".join(parts) if parts else ""
+
+
+def _create_or_get_mr(topic, all_findings, create_if_missing=False, branch=None, repo="engine"):
     """检测/创建 fix 分支的修复 MR（根治后的幂等实现）。
 
     `branch`: 可显式指定本次要检测/创建 MR 的修复分支。优先顺序：
@@ -3434,7 +3395,7 @@ def _create_or_get_mr(topic, all_findings, create_if_missing=False, branch=None)
       - target 用 base_branch or 'master'，脆弱。现优先 base_branch，否则从 review 分支推导。
     Returns (mr_iid, mr_web_url, source_branch, note)."""
     import urllib.request, urllib.error, urllib.parse, json as _json
-    pp = _project_path(topic)
+    pp = _repo_project(topic, repo)   # engine from mr_url; game from game_repo URL
     tok = _env("GITLAB_TOKEN")
     if not pp or not tok:
         return None, None, "", "no project path or token"
