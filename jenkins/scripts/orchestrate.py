@@ -592,6 +592,24 @@ AGENT_TOOLS = [
         "input_schema": {"type": "object",
                          "properties": {"question": {"type": "string"}}, "required": ["question"]},
     },
+    {
+        "name": "deep_dive",
+        "description": "深入分析指定的若干条 review 发现（用 #序号 或 文件名 指定，如 '#2'/'#2,5'/'scene.cpp'/'all'）。返回对每条发现的更深入解释：根因、涉及代码范围、更具体的修复建议。只读，不改任何结论。",
+        "input_schema": {"type": "object",
+                         "properties": {"targets": {"type": "string",
+                                                   "description": "要深入的发现引用：#序号 / 文件名子串 / all"}},
+                         "required": ["targets"]},
+    },
+    {
+        "name": "challenge",
+        "description": "质疑/复核指定的 review 发现（用 #序号 或 文件名 指定），给出「成立/存疑/不成立」的再核结论及依据。只读，不改任何结论。",
+        "input_schema": {"type": "object",
+                         "properties": {"targets": {"type": "string",
+                                                   "description": "要质疑的发现引用：#序号 / 文件名子串 / all"},
+                                       "reason": {"type": "string",
+                                                  "description": "用户的质疑理由（若有）"}},
+                         "required": ["targets"]},
+    },
 ]
 
 # Runtime limits centralized in config.py (AGENT_MAX_ROUNDS / AGENT_MAX_TOKEN).
@@ -636,7 +654,9 @@ def _agent_system(topic, api_key):
         "You are a READ-ONLY code-review Q&A assistant in a Feishu topic. The user's "
         "message is @-addressed to you.\n"
         "You can ONLY call the read-only tools: get_status / get_findings / "
-        "generate_patch_preview / answer.\n"
+        "generate_patch_preview / answer / deep_dive / challenge.\n"
+        "deep_dive(targets) 深入分析指定发现(#序号/文件名/all); challenge(targets,reason) "
+        "复核指定发现(成立/存疑/不成立)。两者都只读。\n"
         "HARD RULE: You have NO write, push, merge, close, or edit ability — never "
         "claim you pushed, merged, applied, closed, or started anything. If the user "
         "asks you to actually change code / push / create an MR / close the topic, "
@@ -730,6 +750,149 @@ _COMMAND_FIRST_WORDS |= {
     "预览", "预览补丁", "patch预览",
     "应用并提交", "确认提交", "push并建mr",
 }
+
+
+# ── A) 可扩展命令注册表 ────────────────────────────────────────────────
+# 每条命令通过 @command(*关键词, guarded=..., requires_findings=...) 注册一个 handler。
+# handler 统一签名:
+#     handler(ctx)  -> int
+# ctx = {key, topic, all_findings, findings_status, render_id, workspace, state_file,
+#        app_id, app_secret, actor, api_key, base_url, model, low, word, arg}
+# 这样加一个新交互 = 写一个 handler + 一行 @command 注册, 不再改 interact() 主函数。
+_HANDLER_REGISTRY = {}     # word -> (fn, needs_findings, guarded)
+
+
+def command(*words, needs_findings=True, guarded=None):
+    """Register a handler for one or more command keywords (extensible table)."""
+    def _reg(fn):
+        for w in words:
+            if w:  # guard empty-string keyword
+                _HANDLER_REGISTRY[w] = (fn, needs_findings, guarded)
+                _COMMAND_FIRST_WORDS.add(w)
+        return fn
+    return _reg
+
+
+def _dispatch_command(ctx):
+    """Look up a registered handler by the leading word; returns its rc, or None if
+    no command matched (caller falls through to operation-guard / agent loop)."""
+    entry = _HANDLER_REGISTRY.get(ctx["word"])
+    if not entry:
+        return None
+    fn, needs_findings, _g = entry
+    if needs_findings and not (ctx.get("all_findings") or ctx.get("findings_status") == "ok"):
+        # findings missing/failed handled inside each handler; pass through
+        pass
+    return fn(ctx)
+
+
+# 现有 11 条命令迁到注册表(结构A): 每个 handler 薄封装原 _cmd_* / _finalize 路径。
+# 统一 ctx 注入, 不改变原行为; 新增命令复用同样的 @command 注册即可。
+def _register_builtin_commands():
+    import config as _c  # noqa: F401  (already imported at module top as _config)
+    C = _config.CMD
+
+    @command("1", "补丁", "生成补丁", "修复")
+    def _h_fix_patch(ctx):
+        return _cmd_fix_patch(ctx["key"], ctx["topic"], ctx["all_findings"],
+                              ctx["render_id"], ctx["workspace"], ctx["state_file"],
+                              ctx["app_id"], ctx["app_secret"], ctx["actor"])
+
+    @command("2", "重新审查", "重审", "review", "重新review")
+    def _h_rereview(ctx):
+        _cmd_rereview(ctx["key"], ctx["topic"], ctx["state_file"], ctx["render_id"],
+                      ctx["app_id"], ctx["app_secret"], ctx["actor"])
+        return 0
+
+    @command("3", "解释")
+    def _h_explain(ctx):
+        low = ctx["low"] or ""
+        rest = low.strip()[1:].strip() if low.strip().startswith("3") else low.strip()[2:].strip()
+        answer = _answer_question(rest or "请解释当前发现", ctx["all_findings"],
+                                  ctx["api_key"], ctx["base_url"], ctx["model"])
+        _finalize(ctx["key"], answer, ctx["render_id"], [], ctx["state_file"],
+                  ctx["app_id"], ctx["app_secret"])
+        return 0
+
+    @command(*C["close"], guarded="close_topic")
+    def _h_close(ctx):
+        return _cmd_close(ctx["key"], ctx["topic"], ctx["state_file"], ctx["render_id"],
+                          ctx["app_id"], ctx["app_secret"], ctx["actor"],
+                          workspace=ctx["workspace"])
+
+    @command(*C["mr"])
+    def _h_mr(ctx):
+        text = _generate_mr_card(ctx["topic"], ctx["all_findings"], ctx["workspace"],
+                                 ctx["key"], state_file=ctx["state_file"])
+        _finalize(ctx["key"], text, ctx["render_id"], [], ctx["state_file"],
+                  ctx["app_id"], ctx["app_secret"])
+        return 0
+
+    @command("预览", "预览补丁", "patch预览")
+    def _h_preview(ctx):
+        text = _render_patch_preview(ctx["topic"], ctx["all_findings"], ctx["api_key"],
+                                     ctx["base_url"], ctx["model"], ctx["workspace"])
+        _finalize(ctx["key"], text, ctx["render_id"], [], ctx["state_file"],
+                  ctx["app_id"], ctx["app_secret"])
+        return 0
+
+    @command(*C["guidance"])
+    def _h_guidance(ctx):
+        text = _generate_fix_guidance(ctx["topic"], ctx["all_findings"], ctx["api_key"],
+                                      ctx["base_url"], ctx["model"], ctx["workspace"])
+        _finalize(ctx["key"], text, ctx["render_id"], [], ctx["state_file"],
+                  ctx["app_id"], ctx["app_secret"])
+        return 0
+
+    @command(*C["optimize"], guarded="auto_edit")
+    def _h_optimize(ctx):
+        return _cmd_optimize(ctx["key"], ctx["topic"], ctx["all_findings"], ctx["render_id"],
+                             ctx["workspace"], ctx["state_file"], ctx["app_id"],
+                             ctx["app_secret"], ctx["actor"])
+
+    @command(*C["autofix"], guarded="auto_edit")
+    def _h_autofix(ctx):
+        return _cmd_auto_edit(ctx["key"], ctx["topic"], ctx["all_findings"], ctx["render_id"],
+                              ctx["workspace"], ctx["state_file"], ctx["app_id"],
+                              ctx["app_secret"], ctx["actor"])
+
+    @command("应用并提交", "确认提交", "push并建mr")
+    def _h_apply_submit(ctx):
+        text = _build_patch_preview_target(ctx["all_findings"], "all")
+        _finalize(ctx["key"], M("apply_submit_pending") + text[:400], ctx["render_id"], [],
+                  ctx["state_file"], ctx["app_id"], ctx["app_secret"])
+        return 0
+
+    @command(*C["status"])
+    def _h_status(ctx):
+        _finalize(ctx["key"], _build_status_text(ctx["topic"]), ctx["render_id"], [],
+                  ctx["state_file"], ctx["app_id"], ctx["app_secret"])
+        return 0
+
+    # ── 交互增强(C3): 更新结论(guarded)——修订指定 findings 并重渲染方案C 卡 ──
+    @command("更新结论", "更新review结论", "修订结论", guarded="update_conclusion")
+    def _h_update_conclusion(ctx):
+        return _cmd_update_conclusion(ctx["key"], ctx["topic"], ctx["all_findings"],
+                                      ctx["render_id"], ctx["workspace"], ctx["state_file"],
+                                      ctx["app_id"], ctx["app_secret"], ctx["actor"], ctx["arg"])
+
+    @command("深入", "deepdive", "深入分析", needs_findings=True)
+    def _h_deep(ctx):
+        return _cmd_deep_dive(ctx["key"], ctx["topic"], ctx["all_findings"], ctx["render_id"],
+                              ctx["workspace"], ctx["state_file"], ctx["app_id"],
+                              ctx["app_secret"], ctx["actor"], ctx["arg"], ctx["api_key"],
+                              ctx["base_url"], ctx["model"])
+
+    @command("质疑", "challenge")
+    def _h_challenge(ctx):
+        return _cmd_challenge(ctx["key"], ctx["topic"], ctx["all_findings"], ctx["render_id"],
+                              ctx["workspace"], ctx["state_file"], ctx["app_id"],
+                              ctx["app_secret"], ctx["actor"], ctx["arg"], ctx["api_key"],
+                              ctx["base_url"], ctx["model"])
+
+
+_register_builtin_commands()
+
 
 
 def _strip_mention(text):
@@ -905,47 +1068,19 @@ def interact(args):
     # real command token is used for matching.
     cmd = _strip_mention(low)
     word = cmd.split()[0] if cmd else ""
-    if word in ("1", "补丁", "生成补丁", "修复"):
-        # Propose a fix patch for the findings (suggestion-based, staged for later).
-        return _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
-                              app_id, app_secret, actor)
-    if word in ("2", "重新审查", "重审", "review", "重新review"):
-        _cmd_rereview(key, topic, state_file, render_id, app_id, app_secret, actor)
-        return 0
-    if word in ("3", "解释"):
-        rest = low.strip()[1:].strip() if low.strip().startswith("3") else low.strip()[2:].strip()
-        answer = _answer_question(rest or "请解释当前发现", all_findings, api_key, base_url, model)
-        _finalize(key, answer, render_id, [], state_file, app_id, app_secret)
-        return 0
-    if word in CMD["close"]:
-        _cmd_close(key, topic, state_file, render_id, app_id, app_secret, actor, workspace=workspace)
-        return 0
-    if word in CMD["mr"]:
-        text = _generate_mr_card(topic, all_findings, workspace, key, state_file=state_file)
-        _finalize(key, text, render_id, [], state_file, app_id, app_secret)
-        return 0
-    if word in ("预览", "预览补丁", "patch预览"):
-        text = _render_patch_preview(topic, all_findings, api_key, base_url, model, workspace)
-        _finalize(key, text, render_id, [], state_file, app_id, app_secret)
-        return 0
-    if word in CMD["guidance"]:
-        text = _generate_fix_guidance(topic, all_findings, api_key, base_url, model, workspace)
-        _finalize(key, text, render_id, [], state_file, app_id, app_secret)
-        return 0
-    if word in CMD["optimize"]:
-        # 全自动: 改码→自动 push→创建/更新 MR (无需手动确认)
-        return _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
-                             app_id, app_secret, actor)
-    if word in CMD["autofix"]:
-        return _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
-                              app_id, app_secret, actor)
-    if word in ("应用并提交", "确认提交", "push并建mr"):
-        text = _build_patch_preview_target(all_findings, "all")
-        _finalize(key, M("apply_submit_pending") + text[:400], render_id, [], state_file, app_id, app_secret)
-        return 0
-    if word in CMD["status"]:
-        _finalize(key, _build_status_text(topic), render_id, [], state_file, app_id, app_secret)
-        return 0
+    # ── A) 数据驱动命令注册表路由(替换原 if 链) ──
+    ctx = {
+        "key": key, "topic": topic, "all_findings": all_findings,
+        "findings_status": findings_status, "render_id": render_id,
+        "workspace": workspace, "state_file": state_file,
+        "app_id": app_id, "app_secret": app_secret, "actor": actor,
+        "api_key": api_key, "base_url": base_url, "model": model,
+        "low": low, "word": word,
+        "arg": cmd[len(word):].strip() if cmd and word else "",
+    }
+    _dispatched = _dispatch_command(ctx)
+    if _dispatched is not None:
+        return _dispatched
 
     # ── 方案C (C4-3): operation-intent interception ────────────────────────
     # Nothing above matched a fixed command. If the message still looks like the
@@ -1016,8 +1151,9 @@ def _exec_tool(name, inp, topic, workspace, all_findings, findings_status,
                         f"{('：' + err[:80]) if err else ''}，因此暂无 findings。"
                         f"发起人可回复 `重新审查` 让 Jenkins 重跑。"), False
             return "（该话题审查通过，确实没有发现代码问题——无 findings。）", False
-        return "\n".join(f"- [{f.get('severity')}] {f.get('file')}: {f.get('issue','')}"
-                         for f in all_findings[:25]), False
+        # 带稳定序号, 便于用户用 `#N` 引用具体一条(深入/质疑/更新结论)。
+        return "\n".join(f"- [#{i}] [{f.get('severity')}] {f.get('file')}: {f.get('issue','')}"
+                         for i, f in _findings_indexed(all_findings[:25])), False
     if name == "generate_patch_preview":
         if not all_findings:
             if findings_status == "missing":
@@ -1044,6 +1180,36 @@ def _exec_tool(name, inp, topic, workspace, all_findings, findings_status,
     if name == "answer":
         q = (inp.get("question") or "").strip()
         return _answer_question(q or "请补充说明", all_findings, api_key, base_url, model), False
+    if name == "deep_dive":
+        # 只读: 对指定发现做更深入分析(不改结论)。不读真实文件(事件侧无 GitLab 凭证),
+        # 基于原 finding 的 issue/suggestion + LLM 推理给出根因/范围/更细建议。
+        targets = (inp.get("targets") or "all").strip()
+        picks, hint = resolve_findings(all_findings, targets)
+        if not picks:
+            return f"⚠️ 未解析到可深入的发现。{hint}\n可用 `#序号` / 文件名 / `all`。", False
+        _txt = "\n".join(
+            f"- [#{i}] {f.get('file')} [{f.get('severity')}]: {f.get('issue')} "
+            f"→ 建议 {f.get('suggestion')}".rstrip()
+            for i, f in _findings_indexed(all_findings) if f in picks)
+        _pr = (f"请对以下 {len(picks)} 条 review 发现做**更深入的针对性分析**(每条给出: "
+               f"可能根因、影响的代码范围/调用链、以及更具体的修复步骤)。仅作分析, 不改结论。\n\n{_txt}")
+        deep = _call_llm_simple(_pr, api_key, base_url, model, max_tokens=1200)
+        return f"🔍 深入分析（{targets}）：\n" + (deep or "（未能生成）"), False
+    if name == "challenge":
+        # 只读: 复核一条发现成立/存疑/不成立(不改结论)。
+        targets = (inp.get("targets") or "all").strip()
+        reason = (inp.get("reason") or "").strip()
+        picks, hint = resolve_findings(all_findings, targets)
+        if not picks:
+            return f"⚠️ 未解析到可质疑的发现。{hint}", False
+        _txt = "\n".join(
+            f"- [#{i}] {f.get('file')} [{f.get('severity')}]: {f.get('issue')} "
+            f"→ 建议 {f.get('suggestion')}".rstrip()
+            for i, f in _findings_indexed(all_findings) if f in picks)
+        _pr = (f"用户质疑以下 review 发现(reason: {reason or '未给出'})。请基于代码审查常识复核,"
+               f"并对每条给出结论: **成立 / 存疑 / 不成立** + 一句话依据。仅复核, 不改结论。\n\n{_txt}")
+        verdict = _call_llm_simple(_pr, api_key, base_url, model, max_tokens=900)
+        return f"⚖️ 复核（{targets}）：\n" + (verdict or "（未能生成）"), False
     if name == "close_topic":
         # guarded: only topic owner OR admin may close (policy.yaml: close_topic ->
         # approver admin_or_owner). Terminal side-effect — stops further processing.
@@ -2177,6 +2343,111 @@ def _select_findings(findings, target):
     return [f for f in findings if target in (f.get('file') or '').lower()]
 
 
+# ── 可引用 finding(B) ────────────────────────────────────────────────
+# findings 本身无 id。为让用户能按 "#3 / 文件名 / all / critical" 定位单条, 用
+# 稳定的位置序号 + 一个指纹(基于 file+issue)作 id。engine+game 拼接顺序固定,
+# 同一批 result 下序号稳定(重审会重新生成则序号随之变化, 可接受)。
+
+def _finding_id(finding, idx):
+    """1-based index-based id; fallback fingerprint if no index given."""
+    import hashlib
+    key = (str(finding.get("file") or "") + "|" + (str(finding.get("issue") or "")[:40])).\
+        encode("utf-8")
+    return "#" + str(idx), hashlib.sha1(key).hexdigest()[:6]
+
+
+def _findings_indexed(all_findings):
+    """Return a list of (idx, finding) with a stable 1-based positional index over
+    the ordered (engine then game) findings list."""
+    return list(enumerate(all_findings or [], start=1))
+
+
+def resolve_findings(all_findings, refs):
+    """Resolve a user's finding reference(s) to concrete findings.
+    refs: e.g. "#3", "#1,5", "scene_manager.cpp", "all", "critical".
+    Returns (resolved_findings, unresolved_hint). Never raises.
+    `all` = all critical/high (keeps old _select_findings(all) behavior for the
+    patch-preview path); explicitly numbered refs return exactly those."""
+    if not all_findings:
+        return [], "（无 findings）"
+    import re as _re
+    refs = (refs or "all").strip().lower()
+    if refs in ("all", "critical"):
+        return [f for f in all_findings
+                if (f.get('severity') or '').lower() in ("critical", "high")], ""
+    # numeric refs like "3" or "#3"
+    nums = _re.findall(r'#?(\d+)', refs)
+    if nums:
+        idx = {int(n) for n in nums}
+        out = [f for i, f in _findings_indexed(all_findings) if i in idx]
+        missing = [str(n) for n in sorted(idx) if n < 1 or n > len(all_findings)]
+        hint = f"（无第 {', '.join(missing)} 条）" if missing else ""
+        return out, hint
+    # file / substring match
+    sub = refs.lstrip("#").strip()
+    if not sub:
+        return [], "（引用为空，可用 `#序号` / 文件名 / all）"
+    return [f for f in all_findings if sub in (f.get('file') or '').lower()], \
+        "" if any(sub in (f.get('file') or '').lower() for f in all_findings) else f"（找不到包含 {sub} 的发现）"
+
+
+# ── 交互增强(C3): review 结论覆盖 + 重渲染 ─────────────────────────────
+# 底版 findings 不可变; 用户"更新结论"后, 在 topic.review_overrides 里记录修订,
+# 渲染时叠加成最终方案C 卡并原地 PATCH render_msg_id 那张卡。
+
+def apply_review_overrides(all_findings, overrides):
+    """Merge review_overrides (visible amendments) onto the immutable findings:
+      - by "#N": amend/reclassify/resolve that finding in place (returns a NEW list,
+        leaving the base dicts untouched so result_*.json stays intact).
+    Returns (merged_findings, applied_notes) where applied_notes describe what changed."""
+    base = [dict(f) for f in (all_findings or [])]
+    applied = []
+    for ov in (overrides or []):
+        action = (ov.get("action") or "amend").strip().lower()
+        ref = str(ov.get("ref") or "").strip()
+        idx = None
+        if ref.startswith("#"):
+            try:
+                idx = int(ref[1:])
+            except ValueError:
+                idx = None
+        if idx is not None and 1 <= idx <= len(base):
+            f = base[idx - 1]
+            if action == "resolve":
+                f["_resolved"] = True
+                applied.append(f"#{idx} 已关闭(resolve)")
+            elif action == "reclassify":
+                if ov.get("severity"):
+                    f["severity"] = ov["severity"]
+                applied.append(f"#{idx} 重新定级 -> {f.get('severity')}")
+            else:  # amend / add text
+                for k in ("issue", "suggestion", "severity"):
+                    if ov.get(k):
+                        f[k] = ov[k]
+                applied.append(f"#{idx} 已修订")
+        else:
+            # add a brand-new finding (action=='add', no ref)
+            if action == "add":
+                base.append({"file": ov.get("file") or "?", "severity": ov.get("severity") or "suggestion",
+                             "issue": ov.get("issue") or "(新增)", "suggestion": ov.get("suggestion") or ""})
+                applied.append(f"新增 {ov.get('file') or '?'}")
+            else:
+                applied.append(f"未定位 {ref or '(空引用)'}")
+    return base, applied
+
+
+def render_findings_with_overrides(topic, all_findings):
+    """Produce the final 方案C card text = findings + review_overrides, and update
+    topic.review_summary so later in-place re-renders (e.g. cmd_ci) don't clobber it."""
+    from code_reviewer import _build_markdown_from_findings
+    merged, applied = apply_review_overrides(all_findings,
+                                             (topic or {}).get("review_overrides") or [])
+    text = _build_markdown_from_findings(merged)
+    if applied:
+        text += "\n\n📝 结论修订：" + "；".join(applied)
+    return text
+
+
 def _confirm_patch_card(patch):
     d = patch.get("diff") or ""
     return "\n\n**待应用补丁（预览）：**\n" + (d[:600] if d else "（无具体补丁）") + \
@@ -2232,7 +2503,8 @@ PROTECTED_BRANCHES = {"main", "master", "dev", "develop", "release", "stage", "p
 DEFAULT_POLICY = {
     "agent": {
         "invoke_anyone": [
-            "get_status", "get_findings", "generate_patch_preview", "answer"],
+            "get_status", "get_findings", "generate_patch_preview", "answer",
+            "deep_dive", "challenge"],
         "guarded": {
             "re_review": {"approver": "topic_owner"},
             "apply_patch": {"approver": "topic_owner"},
@@ -2241,6 +2513,7 @@ DEFAULT_POLICY = {
             "push_remote": {"approver": "topic_owner", "branch": "{topic.review_branch}"},
             "push_fix_branch": {"approver": "topic_owner"},
             "rollback": {"approver": "topic_owner"},
+            "update_conclusion": {"approver": "topic_owner"},
         },
     },
     "lock": {"mode": "serial"},
@@ -3342,6 +3615,117 @@ def _close_topic_resources(topic, workspace=None):
     except Exception as _e:
         print(f"[close] local checkout cleanup error: {_e}", file=sys.stderr)
     return "（已释放：{}）".format("、".join(notes)) if notes else ""
+
+
+def _cmd_update_conclusion(key, topic, all_findings, render_id, workspace, state_file,
+                           app_id, app_secret, actor, arg=""):
+    """指令 `更新结论 <ref> <动作>`: 修订指定 findings 并把新的方案C 卡原地 PATCH 回
+    render_msg_id 那张卡。全量重审语义：先经 LLM 重新核对该 finding 的结论，把修订写进
+    topic.review_overrides(叠加层)，再重渲染。底版 result_*.json 不变(可回溯)。
+
+    用法示例:
+      更新结论 #2 降为 suggestion
+      更新结论 #3 关闭              (resolve)
+      更新结论 新增 scene.cpp issue=... suggestion=...
+    """
+    ok, why = _approve(key, topic, actor, "update_conclusion")
+    if not ok:
+        _proc_reply(key, topic, M("denied_why", why=why), render_id, state_file, app_id,
+                    app_secret, intent="更新审查结论", prefix="🛑")
+        return 0
+    arg = (arg or "").strip()
+    if not arg:
+        _proc_reply(key, topic,
+                    "用法：`更新结论 #2 降为 suggestion` / `更新结论 #3 关闭` / "
+                    "`更新结论 新增 <文件> @issue... @suggestion...`。",
+                    render_id, state_file, app_id, app_secret, intent="更新审查结论")
+        return 0
+    # 解析引用 + 动作
+    import re as _re
+    ref_m = _re.match(r'^(#?\d+)\s+(.*)$', arg)
+    action = ""
+    ref = ref_m.group(1) if ref_m else (arg if arg.startswith("新增") else "")
+    rest = ref_m.group(2) if ref_m else ""
+    if rest:
+        if "关闭" in rest or "resolve" in rest.lower():
+            action = "resolve"
+        elif "降" in rest or "suggestion" in rest.lower() or "改" in rest:
+            action = "amend"
+            sev = "suggestion" if ("suggestion" in rest.lower() or "建议" in rest) else \
+                  ("warning" if "warning" in rest.lower() or "警告" in rest else "critical")
+        else:
+            action = "amend"
+    elif arg.startswith("新增"):
+        action = "add"
+    # 干净地解析引用序号：ref 形如 "#3" 或 "3"
+    if ref:
+        _digits = ref.lstrip("#")
+        idx = int(_digits) if _digits.isdigit() and 1 <= int(_digits) <= (len(all_findings) or 1) else None
+    else:
+        idx = None
+    if idx is not None:
+        ref = f"#{idx}"
+    # 追加 override
+    ov = {"ref": ref, "action": action}
+    if action == "amend" and ref_m and ref_m.group(2):
+        ov["severity"] = sev
+        ov["note"] = rest
+    elif action == "add":
+        ov["file"] = (arg.split("新增", 1)[1] or "?").strip() or "?"
+        ov["issue"] = "由用户追加的补充发现"
+    overrides = list((topic or {}).get("review_overrides") or []) + [ov]
+    pipeline_state.set_topic_fields(state_file, key, review_overrides=overrides)
+    # 重渲染 + 原地更新卡(reuse cmd_ci precedent: review_summary + render_msg_id PATCH)
+    text = render_findings_with_overrides(topic, all_findings)
+    pipeline_state.set_topic_fields(state_file, key, review_summary=text)
+    render = topic.get("render_msg_id") or render_id
+    if render and app_id and app_secret:
+        _run_py("feishu_notifier.py", [
+            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", render, "--message-base64", _b64_str(text)])
+    _finalize(key, f"📝 已更新审查结论：{ov.get('action')} {ref or ''}\n请在话题卡上查看修订后的结论。若需撤销，可 `重新审查` 重新生成。",
+              render_id, [], state_file, app_id, app_secret)
+    return 0
+
+
+def _cmd_deep_dive(key, topic, all_findings, render_id, workspace, state_file,
+                   app_id, app_secret, actor, arg, api_key, base_url, model):
+    """指令 `深入 <ref>`: 与 agent 工具 deep_dive 同逻辑的直连入口(便捷使用)。"""
+    picks, hint = resolve_findings(all_findings, arg or "all")
+    if not picks:
+        _finalize(key, f"⚠️ 未解析到可深入的发现。{hint}\n可用 `#序号` / 文件名 / `all`。",
+                  render_id, [], state_file, app_id, app_secret)
+        return 0
+    _txt = "\n".join(f"- [#{i}] {f.get('file')} [{f.get('severity')}]: {f.get('issue')} "
+                     f"→ 建议 {f.get('suggestion')}".rstrip()
+                     for i, f in _findings_indexed(all_findings) if f in picks)
+    _pr = (f"请对以下 {len(picks)} 条 review 发现做更深入的针对性分析(每条给出: 可能根因、"
+           f"影响的代码范围/调用链、更具体的修复步骤)。仅分析, 不改结论。\n\n{_txt}")
+    deep = _call_llm_simple(_pr, api_key, base_url, model, max_tokens=1200)
+    _finalize(key, f"🔍 深入分析（{arg or 'all'}）：\n" + (deep or "（未能生成）"),
+              render_id, [], state_file, app_id, app_secret)
+    return 0
+
+
+def _cmd_challenge(key, topic, all_findings, render_id, workspace, state_file,
+                   app_id, app_secret, actor, arg, api_key, base_url, model):
+    """指令 `质疑 <ref> [理由]`: 与 agent 工具 challenge 同逻辑的直连入口。"""
+    parts = arg.split(None, 1) if arg else ["all"]
+    ref, reason = (parts[0], parts[1] if len(parts) > 1 else "")
+    picks, hint = resolve_findings(all_findings, ref)
+    if not picks:
+        _finalize(key, f"⚠️ 未解析到可质疑的发现。{hint}", render_id, [], state_file,
+                  app_id, app_secret)
+        return 0
+    _txt = "\n".join(f"- [#{i}] {f.get('file')} [{f.get('severity')}]: {f.get('issue')} "
+                     f"→ 建议 {f.get('suggestion')}".rstrip()
+                     for i, f in _findings_indexed(all_findings) if f in picks)
+    _pr = (f"用户质疑 review 发现(reason: {reason or '未给出'})。请复核并对每条给出结论: "
+           f"**成立 / 存疑 / 不成立** + 一句话依据。仅复核, 不改结论。\n\n{_txt}")
+    verdict = _call_llm_simple(_pr, api_key, base_url, model, max_tokens=900)
+    _finalize(key, f"⚖️ 复核（{ref}）：\n" + (verdict or "（未能生成）"),
+              render_id, [], state_file, app_id, app_secret)
+    return 0
 
 
 def _cmd_fix_patch(key, topic, all_findings, render_id, workspace, state_file,
