@@ -108,9 +108,9 @@ pipeline {
         PYTHON = sh(script: "which python3 2>/dev/null || which python 2>/dev/null || echo '/usr/bin/python3'", returnStdout: true).trim()
         SCRIPTS_DIR = "${env.WORKSPACE}/jenkins/scripts"
         CONFIG_FILE = "${env.WORKSPACE}/config.yaml"
-        // arch-D shared workspace: Jenkins (executor) and the event server (interaction)
-        // must use the SAME path so a topic's checkout + result files are consistent.
-        REVIEW_WORKSPACE = "/var/lib/report-server/daily/cr-workspace"
+        // arch-D shared workspace: same as config.yaml `paths.workspace` (single source).
+        // 若改 config.yaml 的 workspace，这里也保持一致（或按需用 env.REVIEW_WORKSPACE 覆盖）。
+        REVIEW_WORKSPACE = "${env.REVIEW_WORKSPACE ?: '/var/lib/report-server/daily/cr-workspace'}"
         LOCK_DIR = "/var/lib/report-server/daily/cr-locks"
         SCAN_RESULT_FILE = "${env.WORKSPACE}/scan_result.json"
         PARSED_INFO_FILE = "${env.WORKSPACE}/parsed_info.json"
@@ -119,24 +119,20 @@ pipeline {
         REVIEWED_STATE_FILE = "${env.WORKSPACE}/.codereview-feishu-state.json"   // Feishu scanner state (processed msg IDs)
         REVIEWED_MSG_IDS_FILE = "${env.HOME}/.codereview-processed-msg-ids.json" // Cross-build dedup of processed message IDs
         // Topic-level pipeline state record (survives builds; NOT touched by cleanup).
-        PIPELINE_STATE_FILE = "${env.HOME}/.codereview-pipeline-state.json"
+        // == config.yaml `paths.state_file`.
+        PIPELINE_STATE_FILE = "${env.PIPELINE_STATE_FILE ?: '/root/.codereview-pipeline-state.json'}"
 
         // GitLab token for HTTPS clone + MR branch detection
         GITLAB_TOKEN = "${env.GITLAB_TOKEN ?: ''}"
         GITLAB_USER = "gitlab-ci-token"
 
         // Feishu Bot API (for topic messages)
-        // NOTE: inject FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_CHAT_ID via
-        // Jenkins credentials (see docs/jenkins-credentials.md). The CHAT_ID
-        // fallback below is a documented hardcoded default.
         FEISHU_APP_ID = "${env.FEISHU_APP_ID ?: ''}"
         FEISHU_APP_SECRET = "${env.FEISHU_APP_SECRET ?: ''}"
-        // 正式环境群固定用 oc_e817, 避免外层 env 带旧 oc_254e 时兜底不生效。换群改这一行。
-        FEISHU_CHAT_ID = 'oc_e817ca07b9c71539e334b1701f2054b4'
-        // Fallback webhook — a live incoming-webhook URL is hardcoded here for
-        // resilience when the Bot API is unavailable (see docs/jenkins-credentials.md).
-        // Prefer injecting FEISHU_WEBHOOK_URL_OVERRIDE via Jenkins credentials.
-        FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: 'https://open.feishu.cn/open-apis/bot/v2/hook/f2ec1781-06d2-42c8-91b4-37616d973970'}"
+        // 正式群 chat_id：优先 env FEISHU_CHAT_ID；否则用 config.yaml feishu.chat_id 同值。
+        FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_e817ca07b9c71539e334b1701f2054b4'}"
+        // Fallback webhook — inject via FEISHU_WEBHOOK_URL_OVERRIDE credential if needed.
+        FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: ''}"
 
         // Jira credentials (injected via Jenkins global env or credentials)
         JIRA_HOST = "${env.JIRA_HOST ?: ''}"
