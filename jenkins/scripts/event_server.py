@@ -220,9 +220,13 @@ def on_p2_card_action_trigger(data):
         topic = str(value.get("topic", ""))
         print(f"[card] button click action={act} topic={topic} actor={actor}", flush=True)
         if act and topic and actor:
-            base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
-            _run_orchestrate(["action", "--key", topic, "--action", act,
-                              "--sender-id", actor] + base)
+            # 防抖动: 连点/飞书重发同一按钮 -> 丢弃重复(同一窗口内只执行一次)。
+            if not _claim_action(act, topic, actor):
+                print(f"[card] debounced duplicate click action={act} topic={topic}", flush=True)
+            else:
+                base = ["--pipeline-state-file", _state_file(), "--workspace", _workspace()]
+                _run_orchestrate(["action", "--key", topic, "--action", act,
+                                  "--sender-id", actor] + base)
         else:
             print(f"[card] incomplete button payload: action={act!r} topic={topic!r} actor={actor!r}",
                   file=sys.stderr)
@@ -397,6 +401,35 @@ def _claim_msg_id(msg_id):
             return False
         _SEEN_MSG_IDS.append(msg_id)
         return True
+
+
+# ── 防抖动: card/button clicks (Feishu may redeliver a card.action.trigger, and a
+#  user may double-click a button). The same (action, topic, actor) within the window
+#  is a duplicate —— drop it, so we don't enqueue 优化/re_review/apply_patch twice.
+_ACTION_DEBOUNCE_SEC = 10
+_ACTION_LAST = {}
+_ACTION_GUARD = threading.Lock()
+
+
+def _claim_action(action, topic, actor):
+    """Return True if this (action, topic, actor) is NOT a repeat within the debounce
+    window; False if it just ran (debounce — skip). Uses wall clock; in-process only
+    (a fresh bot process resets the window, acceptable for jitter)."""
+    try:
+        import time as _t
+        now = _t.monotonic()
+        key = (action, topic, actor)
+        with _ACTION_GUARD:
+            last = _ACTION_LAST.get(key)
+            _ACTION_LAST[key] = now
+            if last is not None and (now - last) < _ACTION_DEBOUNCE_SEC:
+                return False
+            # bound the dict
+            if len(_ACTION_LAST) > 5000:
+                _ACTION_LAST.clear()
+            return True
+    except Exception:
+        return True  # never fail-closed on debounce
 
 
 # Bound concurrent backend interact workers (方案 A): a flood of replies spawns

@@ -145,3 +145,40 @@ def test_autoclose_message_is_topic_specific_and_states_threshold(monkeypatch):
     assert "自动关闭" in m
     m2 = _autoclose_message({"jira_key": "EV-9"}, note="删除孤儿 fix 分支 foo")
     assert "已释放" in m2 and "foo" in m2
+
+
+# --- 防抖动: repeated 优化/按钮 -> 不重复入队 ---
+
+def test_edit_already_pending_when_agent_edit(monkeypatch):
+    import orchestrate as O
+    monkeypatch.setattr(O.pipeline_state, "get_topic",
+                        lambda s, k: {"pending": {"action": "agent_edit"}, "pending_patch": {}})
+    assert O._edit_already_pending("/s", "k") is True
+
+
+def test_edit_already_pending_when_staged(monkeypatch):
+    import orchestrate as O
+    monkeypatch.setattr(O.pipeline_state, "get_topic",
+                        lambda s, k: {"pending": {}, "pending_patch": {"state": "staged_agent_edit"}})
+    assert O._edit_already_pending("/s", "k") is True
+
+
+def test_edit_already_pending_false_when_idle(monkeypatch):
+    import orchestrate as O
+    monkeypatch.setattr(O.pipeline_state, "get_topic",
+                        lambda s, k: {"pending": {}, "pending_patch": {}})
+    assert O._edit_already_pending("/s", "k") is False
+
+
+def test_card_action_debounce(monkeypatch):
+    """Feishu redelivery / double-click of the same button must run once."""
+    import event_server as es
+    from event_server import _claim_action, _ACTION_GUARD, _ACTION_LAST
+    _ACTION_LAST.clear()
+    with _ACTION_GUARD:
+        pass
+    assert _claim_action("optimize", "t1", "u1") is True      # first: allowed
+    assert _claim_action("optimize", "t1", "u1") is False     # repeat in window: dropped
+    # different action or topic -> allowed
+    assert _claim_action("re_review", "t1", "u1") is True
+    assert _claim_action("optimize", "t2", "u1") is True

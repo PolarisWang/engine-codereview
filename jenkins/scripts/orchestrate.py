@@ -1835,6 +1835,24 @@ def _agent_edit_all(topic, all_findings, api_key, base_url, workspace=None, mode
     return ok_diffs, failed, branch, checkout, None, checkout_sha
 
 
+def _edit_already_pending(state_file, key):
+    """防抖动: True if the topic already has an in-flight edit that would collide with a
+    new 优化/改码 — either a pending agent_edit / agent_edit_confirm action, or a staged
+    change set awaiting confirm. Prevents repeated button clicks from enqueueing two
+    auto-edits (which produced duplicate MRs / lost push state earlier)."""
+    try:
+        t = pipeline_state.get_topic(state_file, key) or {}
+        pend = t.get("pending") or {}
+        if pend.get("action") in ("agent_edit", "agent_edit_confirm"):
+            return True
+        pp = t.get("pending_patch") or {}
+        if pp.get("state") in ("staged_agent_edit", "pending"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
                    app_id, app_secret, actor=""):
     """指令 `改码/自动修复`: enqueue an agent_edit intent for the Jenkins executor,
@@ -1850,6 +1868,12 @@ def _cmd_auto_edit(key, topic, all_findings, render_id, workspace, state_file,
     if not _find_claude():
         _proc_reply(key, topic,
                     "⚠️ 无法执行自动改码：未在本机找到 claude CLI（自动改码需 `claude` 可执行）。",
+                    render_id, state_file, app_id, app_secret, intent="自动改码")
+        return 0
+    # 防抖动(优化/按钮连点): 已有待执行的改码或已 staged 待确认 -> 不再重复入队。
+    if _edit_already_pending(state_file, key):
+        _proc_reply(key, topic,
+                    "⏳ 已有待执行的自动改码/待确认修改，正在处理中。请稍候或先 `@确认`/`@撤销`。",
                     render_id, state_file, app_id, app_secret, intent="自动改码")
         return 0
     pipeline_state.set_pending(state_file, key, "agent_edit", patch={"actor": actor})
@@ -1876,6 +1900,12 @@ def _cmd_optimize(key, topic, all_findings, render_id, workspace, state_file,
     if not _find_claude():
         _proc_reply(key, topic,
                     "⚠️ 无法执行优化：未在本机找到 claude CLI（自动修复需 `claude` 可执行）。",
+                    render_id, state_file, app_id, app_secret, intent="优化")
+        return 0
+    # 防抖动(优化/按钮连点): 已有待执行改码或待确认 -> 不重复入队, 避免重复改码/建MR。
+    if _edit_already_pending(state_file, key):
+        _proc_reply(key, topic,
+                    "⏳ 已有待执行的自动改码/待确认修改，正在处理中。请稍候或先 `@确认`/`@撤销`。",
                     render_id, state_file, app_id, app_secret, intent="优化")
         return 0
     pipeline_state.set_topic_fields(state_file, key, auto_confirm=True)
