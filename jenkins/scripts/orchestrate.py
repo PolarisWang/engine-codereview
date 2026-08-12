@@ -1444,6 +1444,49 @@ def _ensure_checkout(topic, workspace):
         return None, f"clone err: {e}"
 
 
+def _ensure_checkout_preserve(topic, workspace):
+    """Locate THIS topic's per-topic checkout WITHOUT resetting/cleaning it,
+    preserving the working-tree edits that _agent_edit_all wrote (agent_edit →
+    staged_agent_edit → agent_edit_confirm runs across separate consume ticks.)
+
+    Root cause of "创建MR失败 / fix 分支无改动": the confirm step used _ensure_checkout,
+    which does fetch + reset --hard origin/{src} + clean -fdx, WIPING _agent_edit_all's
+    working-tree edits. The stored-diff replay then failed (context mismatch) and the
+    old code silently pushed an empty branch → fix branch == review tip → no MR.
+
+    With per-topic isolation, the same per-topic dir (`{repo}-review/{slug}`) is shared
+    between edit and confirm, so we can safely REUSE it in place: the edits are still in
+    the working tree/index, and `git commit` picks them up directly. Only clone if the
+    dir is missing (rare — edit should have created it)."""
+    import subprocess as _sp
+    src = topic.get("review_branch") or topic.get("base_branch") or ""
+    mr_url = topic.get("mr_url") or ""
+    import jira_parser as _jp
+    pp, _ = _jp.parse_gitlab_mr_url(mr_url) if "merge_requests" in mr_url else (None, None)
+    if not pp:
+        return None, "no mr project path"
+    repo_name = pp.rstrip("/").split("/")[-1]
+    dest = _checkout_dir_for(workspace, repo_name, topic)
+    if os.path.isdir(os.path.join(dest, ".git")):
+        # PRESERVE working tree + index (the staged diffs). Do NOT fetch/reset/clean.
+        return dest, None
+    # Not present: clone it fresh (edited branch state is gone anyway).
+    tok = _env("GITLAB_TOKEN")
+    if not tok:
+        return None, "no GITLAB_TOKEN for checkout"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    _askpass = os.path.join(SCRIPTS_DIR, "git_askpass.sh")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS=_askpass,
+               CR_GITLAB_USER=_env("GITLAB_USER", "gitlab-ci-token"),
+               CR_GITLAB_TOKEN=tok)
+    r = _sp.run(["git", "clone", "--quiet", "--single-branch", "--branch", src,
+                 "--depth", "2", f"https://gitlab.booming-inc.com/{pp}.git", dest],
+                capture_output=True, text=True, env=env, timeout=600)
+    if r.returncode != 0 or not os.path.isdir(os.path.join(dest, ".git")):
+        return None, f"checkout clone failed: {r.stderr[:200]}"
+    return dest, None
+
+
 def _git_apply_check(checkout, diff_text):
     """Run `git apply --check` on a diff. Returns (ok, err)."""
     import subprocess as _sp, tempfile
@@ -1829,7 +1872,10 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
         _proc_reply(key, topic, M("denied_why", why=why),
                     render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
         return 0
-    checkout, err = _ensure_checkout(topic, workspace)
+    # 根因修复: 确认阶段必须复用 _agent_edit_all 留下的工作树(不改写), 否则
+    # _ensure_checkout 的 reset+clean 会清掉已生成的改动, 重放 diff 又失败 →
+    # 空提交 → push 空分支 → MR"无改动"创建失败。
+    checkout, err = _ensure_checkout_preserve(topic, workspace)
     if err:
         _proc_reply(key, topic, M("confirm_checkout_fail", err=err),
                     render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
@@ -2594,7 +2640,8 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             return False, f"agent_edit_confirm: protected branch {branch}"
         import subprocess as _sp2
         _git_env = _auth_git_env({"LC_ALL": "C"})
-        checkout, err = _ensure_checkout(topic, workspace)
+        # 根因修复: 复用 _agent_edit_all 留下的工作树(不改写), 避免 reset+clean 清掉改动
+        checkout, err = _ensure_checkout_preserve(topic, workspace)
         if err:
             pipeline_state.clear_pending(state_file, key)
             _proc_reply(key, topic, M("confirm_checkout_fail", err=err), render, state_file, app_id, app_secret)

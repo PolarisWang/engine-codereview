@@ -17,7 +17,6 @@ from orchestrate import (
     _repo_name_from_checkout, _list_checkout_dirs, _disk_free_bytes,
 )
 
-
 def test_slug_is_deterministic_and_branch_scoped():
     topic = {"review_branch": "feature/lod_framework_optimization_P2_test1",
              "message_id": "om_x1"}
@@ -73,3 +72,40 @@ def test_list_checkout_dirs_counts_only_git_dirs(tmp_path):
 def test_disk_free_bytes_reports_positive(tmp_path):
     free = _disk_free_bytes(str(tmp_path))
     assert free > 0                      # the filesystem reports real free space
+
+
+def test_ensure_checkout_preserve_reuses_dir_and_keeps_working_tree(monkeypatch, tmp_path):
+    """Root-cause regression: confirm must reuse the per-topic dir WITHOUT resetting so
+    _agent_edit_all's working-tree edits survive (no reset => no lost edits => no
+    replay-fail => no "fix 分支无改动" MR-create failure)."""
+    import subprocess
+    from orchestrate import _ensure_checkout_preserve
+    wb = str(tmp_path / "w")
+    t = {"review_branch": "feature/lod",
+         "mr_url": "https://gitlab.booming-inc.com/g/proj/chaos-cb-2/-/merge_requests/7"}
+    dir1 = _checkout_dir_for(wb, "chaos-cb-2", t)
+    # pre-create the per-topic dir as if _agent_edit_all left it (with a working-tree edit)
+    os.makedirs(os.path.join(dir1, ".git"))
+    edit = os.path.join(dir1, "a.cpp")
+    open(edit, "w", encoding="utf-8").write("//working edit from agent_edit\n")
+
+    git_commands = []
+    def fake_run(cmd, **kw):
+        # _ensure_checkout_preserve must NOT issue fetch/reset/clean on a present dir
+        git_commands.append(cmd)
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    out, err = _ensure_checkout_preserve(t, wb)
+    assert err is None
+    assert out == dir1
+    # No destructive resync issued (would wipe the working-tree edit)
+    joined = " ".join(" ".join(c) for c in git_commands)
+    assert "reset" not in joined and "fetch" not in joined and "clean" not in joined
+    # The working-tree edit is still present
+    assert os.path.isfile(edit) and "working edit" in open(edit, encoding="utf-8").read()
+
