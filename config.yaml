@@ -210,3 +210,18 @@ commands:
   deep_dive: ["深入", "deepdive", "深入分析"]
   challenge: ["质疑", "challenge"]
   update_conclusion: ["更新结论", "更新review结论", "修订结论"]
+  release: ["发布", "发布版本", "发布release", "release"]
+
+# ── 版本发布（受控，仅用户对话 `@机器人 发布` 触发） ──
+release:
+  enabled: true
+  # 是否用 LLM 把分组版 release note 润色成官方中文（false=纯分组）。
+  note_llm: true
+  # 本周期 feat 提交数达到该值则 minor+1；默认 patch+1。大版本仅当用户显式 `发布大版本`。
+  minor_if_feat_ge: 3
+  # 发布后发往的群；空则用 feishu.chat_id / env FEISHU_CHAT_ID。
+  chat_id: ""
+
+notify:
+  # 版本发布是否自动挂在 deploy/cron 上（false=仅用户对话触发）。保持 false。
+  release_hook: false
