@@ -25,6 +25,7 @@ import re
 # Shared helpers: config.yaml loading, Jira pattern, HTTP with retry
 from common import load_config, JIRA_URL_PATTERN, http_request
 from common import get_claude_config, get_workspace_config
+from common import c_claude_model, c_claude_base_url, c_gitlab_host
 
 # Resolve git path explicitly (agent may not have it on PATH)
 GIT_PATH = shutil.which("git") or "/usr/bin/git"
@@ -148,8 +149,7 @@ def load_config(repo_type=None):
     skill_instr = _load_skill_review_instructions(repo_type)
     return {
         "claude": {
-            "model": cfg.get("model")
-                     or os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+            "model": c_claude_model(),
             "max_tokens": cfg.get("max_tokens", 8192),
             "review_instructions": skill_instr          # 优先 use skill(你要求)
                                    or cfg.get("review_instructions")
@@ -229,7 +229,7 @@ def ssh_to_https(repo_url):
 
 def gitlab_api_get(path, token):
     """Make a GitLab API GET request (with retry)."""
-    url = f"https://gitlab.booming-inc.com/api/v4/{path.lstrip('/')}"
+    url = f"https://{c_gitlab_host()}/api/v4/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     resp = http_request("GET", url, headers=headers)
     if resp is None:
@@ -776,7 +776,7 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
     if not api_key:
         return {"summary": "ANTHROPIC_AUTH_TOKEN not set", "findings": [], "severity_counts": {}}
 
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    base_url = c_claude_base_url()
     model = config["claude"]["model"]
     max_output_tokens = config["claude"]["max_tokens"]
     system_prompt = config["claude"]["review_instructions"] \

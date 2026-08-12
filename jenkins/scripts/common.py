@@ -198,6 +198,69 @@ def get_workspace_config():
     return load_config().get("workspace", {})
 
 
+# ── 方案B 中央配置访问器：单一事实源 config.yaml，敏感/部署点可用 env 覆盖 ──
+# 优先级：config.yaml 值 > env > 代码默认。secret(app_id/secret/token) 只在 env。
+
+def _env(key, default=""):
+    return os.environ.get(key, default)
+
+
+def get_paths():
+    """Return the paths: block {workspace, state_file, reviewed_msg_ids}. 'workspace'
+    falls back to workspace.base_dir (kept in sync)."""
+    cfg = load_config()
+    p = cfg.get("paths") or {}
+    if not p.get("workspace"):
+        p["workspace"] = (cfg.get("workspace") or {}).get("base_dir", "")
+    return p
+
+
+def c_workspace(env_key="REVIEW_WORKSPACE"):
+    """Resolve the review workspace: env(REVIEW_WORKSPACE) > paths.workspace >
+    workspace.base_dir > default cr-workspace."""
+    return _env(env_key, "") or get_paths().get("workspace", "") or "/var/lib/report-server/daily/cr-workspace"
+
+
+def c_state_file():
+    """Resolve the shared topic state file: env(PIPELINE_STATE_FILE) > paths.state_file."""
+    return _env("PIPELINE_STATE_FILE", "") or get_paths().get("state_file", "") \
+        or "/root/.codereview-pipeline-state.json"
+
+
+def c_reviewed_msg_ids_file():
+    return _env("REVIEWED_MSG_IDS_FILE", "") or get_paths().get("reviewed_msg_ids", "") \
+        or os.path.expanduser("~/.codereview-processed-msg-ids.json")
+
+
+def c_gitlab_host():
+    """Resolve the GitLab API host: env(GITLAB_HOST) > gitlab.host."""
+    return _env("GITLAB_HOST", "") or (load_config().get("gitlab") or {}).get("host", "") \
+        or "gitlab.booming-inc.com"
+
+
+def c_feishu_chat_id():
+    """Resolve the target Feishu chat id: env(FEISHU_CHAT_ID) > feishu.chat_id."""
+    return _env("FEISHU_CHAT_ID", "") or (load_config().get("feishu") or {}).get("chat_id", "")
+
+
+def c_feishu_bot_name():
+    return _env("FEISHU_BOT_NAME", "") or (load_config().get("feishu") or {}).get("bot_name", "")
+
+
+def c_feishu_bot_open_id():
+    return _env("FEISHU_BOT_OPEN_ID", "") or (load_config().get("feishu") or {}).get("bot_open_id", "")
+
+
+def c_claude_model():
+    cl = load_config().get("claude", {})
+    return cl.get("model") or _env("ANTHROPIC_MODEL", "") or "deepseek-v4-flash"
+
+
+def c_claude_base_url():
+    cl = load_config().get("claude", {})
+    return cl.get("base_url") or _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+
+
 # ── HTTP with retry (shared by all external API callers) ────────────────────
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}

@@ -57,17 +57,15 @@ def _config():
 
 
 def _state_file():
-    cfg = _config()
-    return cfg.get("event", {}).get("state_file") or \
-        os.environ.get("PIPELINE_STATE_FILE", "/root/.codereview-pipeline-state.json")
+    # 方案B: 统一从 config.yaml paths.state_file / env PIPELINE_STATE_FILE 解析
+    return common.c_state_file()
 
 
 def _workspace():
     # arch-D shared workspace: the interaction layer and the Jenkins executor must
     # read/write the SAME workspace so a topic's checkout + result files are
-    # consistent across processes. Default to the persistent shared volume.
-    # Explicit env (REVIEW_WORKSPACE) wins for manual override.
-    return os.environ.get("REVIEW_WORKSPACE", "/var/lib/report-server/daily/cr-workspace")
+    # consistent across processes. Default to paths.workspace (or REVIEW_WORKSPACE).
+    return common.c_workspace()
 
 
 app = None
@@ -524,8 +522,8 @@ def _is_bot_directed(text, mentions):
     lo = (text or "").strip().lower()
     if lo.startswith("@"):
         return True            # @-mention (Feishu shows any @ as @_user_N) -> directed
-    bot_name = (os.environ.get("FEISHU_BOT_NAME") or "").strip().lstrip("@").lower()
-    bot_open_id = (os.environ.get("FEISHU_BOT_OPEN_ID") or "").strip()
+    bot_name = (common.c_feishu_bot_name() or "").strip().lstrip("@").lower()
+    bot_open_id = (common.c_feishu_bot_open_id() or "").strip()
     for m in (mentions or []):
         name = (m.get("name") or "").lstrip("@").lower()
         if bot_name and name == bot_name:

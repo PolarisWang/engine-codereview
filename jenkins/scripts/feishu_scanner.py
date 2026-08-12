@@ -24,6 +24,7 @@ import time
 
 # Shared helpers: Jira URL pattern, HTTP with retry
 from common import JIRA_URL_PATTERN, MR_URL_PATTERN, http_request
+from common import c_feishu_chat_id
 
 
 # ── Feishu API helpers ───────────────────────────────────────────────────────
@@ -84,8 +85,7 @@ def main():
     parser = argparse.ArgumentParser(description="Scan Feishu group for Jira URLs")
     parser.add_argument("--app-id", default=os.environ.get("FEISHU_APP_ID", ""))
     parser.add_argument("--app-secret", default=os.environ.get("FEISHU_APP_SECRET", ""))
-    parser.add_argument("--chat-id", default=os.environ.get("FEISHU_CHAT_ID",
-                        "oc_e817ca07b9c71539e334b1701f2054b4"))
+    parser.add_argument("--chat-id", default=c_feishu_chat_id())
     parser.add_argument("--jira-host", default=os.environ.get("JIRA_HOST", ""))
     parser.add_argument("--state-file", default="/tmp/codereview-feishu-state.json")
     parser.add_argument("--pipeline-state-file", default="",

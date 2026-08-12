@@ -43,10 +43,36 @@ projects:
 # Repository mirror dir (where Jenkins clones repos for review)
 # ============================================================
 workspace:
-  base_dir: /data/codereview/workspace
+  # 实际运行工作区（与 paths.workspace 一致；= Jenkinsfile REVIEW_WORKSPACE）
+  base_dir: /var/lib/report-server/daily/cr-workspace
   cache_repos: true   # reuse local clones, fetch instead of clone
   # 方案B: 剩余磁盘低于该字节数(默认2GiB)时禁止新建 checkout 目录, 改为复用/拒绝。
   # disk_free_min_bytes: 2147483648
+
+# ============================================================
+# 路径（方案B 单一事实源：所有脚本从这读 workspace / state_file，避免各处硬编码漂移）
+# ============================================================
+paths:
+  # review 工作区（checkout + result 文件）。== workspace.base_dir == 运行时的实际值。
+  workspace: /var/lib/report-server/daily/cr-workspace
+  # 共享 topic 状态文件。事件侧 / Jenkins / orchestrate 全部读这一处。
+  state_file: /root/.codereview-pipeline-state.json
+  # 历史已处理消息 ID 文件（legacy dedup）。
+  reviewed_msg_ids: /root/.codereview-processed-msg-ids.json
+
+# ============================================================
+# GitLab（非敏感配置；token/user 仍是 secret，走 env）
+# ============================================================
+gitlab:
+  host: gitlab.booming-inc.com          # API 基址；域名/IP 变更只改这一处
+
+# ============================================================
+# 飞书（非敏感配置；app_id/app_secret/webhook 仍是 secret，走 env）
+# ============================================================
+feishu:
+  chat_id: oc_e817ca07b9c71539e334b1701f2054b4   # 正式环境目标群（改一处生效）
+  bot_name: ""                                    # 可选：@ 精确匹配的机器人名
+  bot_open_id: ""                                 # 可选：机器人 open_id（@-gate 用）
 
 # ============================================================
 # Real-time event subscription server (topic interaction)
@@ -66,6 +92,8 @@ event:
 # ============================================================
 claude:
   model: deepseek-v4-flash
+  # LLM API 基址（非敏感；空则走 env ANTHROPIC_BASE_URL / 默认 https://api.anthropic.com）
+  base_url: ""
   max_tokens: 8192
   review_instructions: |
     You are a senior game engine engineer reviewing a merge request.
