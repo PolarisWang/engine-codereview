@@ -52,10 +52,11 @@ def test_route_returns_fast_and_spawns_single_interact(monkeypatch):
     monkeypatch.setattr("event_server._workspace", lambda: "/ws")
     monkeypatch.setattr("event_server._resolve_topic_key", lambda s, p: "om_parent")
 
-    # First delivery.
-    _route("om_msg1", "om_parent", "MR单", "ou_1")
+    # First delivery. Use an @-directed reply (@MR单 = command word) so the @-gate
+    # lets it through; a plain "MR单" (no @) would now be ignored (see gate test).
+    _route("om_msg1", "om_parent", "@MR单", "ou_1")
     # Simulate Feishu redelivering the SAME event (same msg_id) right away.
-    _route("om_msg1", "om_parent", "MR单", "ou_1")
+    _route("om_msg1", "om_parent", "@MR单", "ou_1")
     # Give background workers a moment to (try) to run — dedup should have made the
     # second a no-op, so only one worker ever calls _run_orchestrate.
     time.sleep(0.3)
@@ -66,3 +67,27 @@ def test_route_returns_fast_and_spawns_single_interact(monkeypatch):
     # The interact arg carries the correct topic key + reply.
     assert "interact" in calls[0][0]
     assert "om_msg1" in calls[0]
+
+
+def test_route_ignores_reply_not_directed_at_bot(monkeypatch):
+    """@-gate: a threaded reply that does NOT @ the bot (plain chat in the card
+    thread) must NOT spawn interact — prevents spamming when users chat with each
+    other. Only @-directed replies (mention/command-keyword prefix) are handled."""
+    calls = []
+    monkeypatch.setattr("event_server._run_orchestrate",
+                        lambda args: calls.append(args) or 0)
+    monkeypatch.setattr("event_server._state_file", lambda: "/state/path")
+    monkeypatch.setattr("event_server._workspace", lambda: "/ws")
+    monkeypatch.setattr("event_server._resolve_topic_key", lambda s, p: "om_parent")
+
+    # Plain chat, no @ -> ignored entirely.
+    _route("om_x1", "om_parent", "这个改法好像不太对", "ou_1", mentions=[])
+    assert calls == [], "bot must NOT reply to non-@ chat"
+    # @ + command keyword -> handled.
+    _route("om_x2", "om_parent", "@优化", "ou_2", mentions=[])
+    time.sleep(0.1)
+    assert len(calls) == 1, "bot SHOULD reply to @-command"
+    # @ of ANOTHER user (mention name != bot, no @-command) -> ignored.
+    _route("om_x3", "om_parent", "@李四 这里呢", "ou_3", mentions=[{"name": "李四"}])
+    time.sleep(0.1)
+    assert len(calls) == 1, "mentioning another user must NOT trigger bot"

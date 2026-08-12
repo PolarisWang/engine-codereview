@@ -36,6 +36,26 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
+# @ 前缀命令词：带 @ 且首词命中这些词 = 用户确实在指 bot(如 `@优化`/`@确认`/`@关键`)。
+# 与 orchestrate._COMMAND_FIRST_WORDS 对齐；这里单独的本地集合避免 event_server 反向依赖 orchestrate。
+_BOT_CMD_WORDS = {
+    "优化", "自动优化", "优化代码", "优化并提交",
+    "改码", "自动修改", "自动修复", "autofix", "改码并提交",
+    "指引", "修改指引", "怎么改",
+    "mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单",
+    "状态", "/状态", "status",
+    "关闭", "关闭话题",
+    "深入", "deepdive", "深入分析",
+    "质疑", "challenge",
+    "更新结论", "更新review结论", "修订结论",
+    "1", "补丁", "生成补丁", "修复",
+    "2", "重新审查", "重审", "review", "重新review",
+    "3", "解释",
+    "4",
+    "预览", "预览补丁", "patch预览",
+    "应用并提交", "确认提交", "push并建mr",
+}
+
 try:
     from flask import Flask, request, jsonify
     _HAS_FLASK = True
@@ -203,7 +223,8 @@ def _handle_message_event(event):
     sender = event.get("sender", {}) or {}
     sender_id = (sender.get("sender_id") or {}).get("user_id", "") \
         if isinstance(sender.get("sender_id"), dict) else sender.get("sender_id", "")
-    _route(msg_id, parent_id, text, sender_id)
+    mentions = []   # webhook dict-shape doesn't carry parsed mentions here
+    _route(msg_id, parent_id, text, sender_id, mentions)
 
 
 def on_p2_card_action_trigger(data):
@@ -295,7 +316,9 @@ def _sender_id_of(sender):
 
 def _lark_message_to_route(lark_message):
     """Map a lark-oapi ws P2ImMessageReceiveV1.message onto the routing fields.
-    Returns (msg_id, parent_id, chat_type, text, sender_id) or None if not group/text."""
+    Returns (msg_id, parent_id, chat_type, text, sender_id, mentions) or None if
+    not group/text. `mentions` is a list of {key,id,id_type,name} for any Feishu
+    @-mentions in the message (used to require the bot be @-ed before replying)."""
     try:
         msg_type = getattr(lark_message, "message_type", "") or ""
         chat_type = getattr(lark_message, "chat_type", "") or ""
@@ -307,17 +330,24 @@ def _lark_message_to_route(lark_message):
         if not sender_id:
             print("[event] WARN: no sender_id extracted from message (guarded actions "
                   "like re_review/apply/close will be denied)", flush=True)
+        text = ""
+        mentions = []
         if msg_type == "text":
             cd = json.loads(raw_content) if isinstance(raw_content, str) else (raw_content or {})
             text = (cd or {}).get("text", "")
+            # Feishu text mentions: [{"key":"@_user_1","id":{"open_id":"ou_.."},"name":".."}]
+            for m in (cd or {}).get("mentions") or []:
+                mid = (m.get("id") or {}) or {}
+                mentions.append({
+                    "key": m.get("key", ""), "name": m.get("name", ""),
+                    "open_id": mid.get("open_id", ""), "id": mid,
+                })
         elif msg_type == "post":
             text = _post_text(raw_content)
-        else:
-            text = ""
     except Exception as e:
         print(f"[event] parse lark message failed: {e}", file=sys.stderr)
         return None
-    return msg_id, parent_id, chat_type, text, sender_id
+    return msg_id, parent_id, chat_type, text, sender_id, mentions
 
 
 def _post_text(raw_content):
@@ -352,10 +382,11 @@ def on_p2_im_message_receive(data):
         routed = _lark_message_to_route(message)
         if not routed:
             return
-        msg_id, parent_id, chat_type, text, _ = routed
+        msg_id, parent_id, chat_type, text, _sender2, mentions = routed
+        sender_id = sender_id or _sender2
         if chat_type != "group":
             return
-        _route(msg_id, parent_id, text, sender_id)
+        _route(msg_id, parent_id, text, sender_id, mentions)
     except Exception as e:
         print(f"[event] ws handler error: {e}", file=sys.stderr)
 
@@ -497,7 +528,39 @@ def _spawn_interact(topic_key, reply_text, reply_msg_id, sender_id):
     threading.Thread(target=_work, daemon=True).start()
 
 
-def _route(msg_id, parent_id, text, sender_id=""):
+def _is_bot_directed(text, mentions):
+    """True if a threaded reply is directed at THIS bot (user @-ed it), so the bot
+    only replies when addressed and stays silent when users chat among themselves.
+
+    Heuristic (Feishu): a reply is bot-directed if
+      - it starts with '@' AND that first token is a known command keyword
+        (e.g. `@优化`, `@确认` — the existing @-command path), or
+      - the message carries a mention whose name/id matches the configured bot
+        (FEISHU_BOT_NAME / FEISHU_BOT_OPEN_ID) — the precise signal when available.
+    Otherwise (plain threaded chat, no @-to-bot) the bot should NOT reply."""
+    t = (text or "").strip()
+    lo = t.lower()
+    bot_name = (os.environ.get("FEISHU_BOT_NAME") or "").strip().lstrip("@").lower()
+    bot_open_id = (os.environ.get("FEISHU_BOT_OPEN_ID") or "").strip()
+    # 1) @ + known command keyword -> definitely directed at bot
+    if lo.startswith("@") and lo.split():
+        head = lo.split()[0].lstrip("@")
+        if head in _BOT_CMD_WORDS:
+            return True
+    # 2) mention name/id matches configured bot
+    for m in (mentions or []):
+        name = (m.get("name") or "").lstrip("@").lower()
+        if bot_name and name == bot_name:
+            return True
+        if bot_open_id and (m.get("open_id") or "").lower() == bot_open_id.lower():
+            return True
+    # 3) text starts with configured bot name (e.g. `@CodeReviewBot ...`)
+    if bot_name and (lo.lstrip("@").startswith(bot_name)):
+        return True
+    return False
+
+
+def _route(msg_id, parent_id, text, sender_id="", mentions=None):
     """Shared single-link routing.
 
     - New topic (no parent, has Jira URL): NOT reviewed here. The event server
@@ -508,6 +571,10 @@ def _route(msg_id, parent_id, text, sender_id=""):
     - Reply / @bot on an existing topic: route to interact (only needs FEISHU +
       ANTHROPIC env, which the event server has). Same-topic replies are
       serialized via a per-topic lock, taken in the background worker.
+
+    @-gate: a threaded reply only spawns interact if it's DIRECTED at the bot
+    (_is_bot_directed) — so a user who chats with others inside the review card's
+    thread (without @-ing the bot) is NOT spammed with a bot reply.
     """
     if not parent_id:
         if _is_jira_topic(text):
@@ -517,6 +584,10 @@ def _route(msg_id, parent_id, text, sender_id=""):
             print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
         print(f"[event] REPLY {msg_id} to parent {parent_id}: {text[:80]} sender={sender_id}", flush=True)
+        # 防干扰: 没 @ bot 的普通闲聊(即使落在 card 线程下) 不回复。
+        if not _is_bot_directed(text, mentions):
+            print(f"[event] ignore reply not directed at bot {msg_id}", flush=True)
+            return
         # 方案 B: Feishu redelivers a slow/unacked EVENT as the SAME msg_id. Dedup
         # here so a retry can't spawn a second interact.
         if not _claim_msg_id(msg_id):
