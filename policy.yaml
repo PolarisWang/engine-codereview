@@ -16,6 +16,8 @@ agent:
     - get_findings
     - generate_patch_preview
     - answer
+    - deep_dive
+    - challenge
 
   # 受控动作：需确认门控，且只有 topic 发起人可批准
   guarded:
@@ -57,6 +59,10 @@ agent:
     # 关闭话题（终止生命周期）。发起人或 admins 列表中的管理员可触发。
     close_topic:
       approver: "admin_or_owner"
+
+    # 更新审查结论（人工修订 findings 并重渲染方案C 卡）—— 写"结论"
+    update_conclusion:
+      approver: "topic_owner"
 
 # 并发
 lock:

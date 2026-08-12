@@ -54,6 +54,9 @@ CMD = {
     "mr": ["mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单"],
     "status": ["状态", "/状态", "status"],
     "close": ["4", "关闭", "关闭话题"],
+    "deep_dive": ["深入", "deepdive", "深入分析"],
+    "challenge": ["质疑", "challenge"],
+    "update_conclusion": ["更新结论", "更新review结论", "修订结论"],
 }
 
 

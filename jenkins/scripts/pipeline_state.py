@@ -476,6 +476,11 @@ def _topic_default(message_id, jira_key, project, jira_url, mode, build_number,
         # concatenated branch name, so a same-named MR owned by someone else is
         # never closed/its branch never deleted.
         "fix_mr_iids": [],
+        # 交互增强(C3/更新结论): 可持久化的 review 结论覆盖。原始 findings 只存于
+        # result_*.json(不可变底版); 这里是"人工修订叠加层", 渲染时合并到方案C 卡。
+        # 元素形如 {"ref":"#3"或file,"action":"amend|reclassify|resolve|add",
+        #            "severity"?,"issue"?,"suggestion"?,"note"?}
+        "review_overrides": [],
     }
 
 

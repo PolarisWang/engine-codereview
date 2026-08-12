@@ -13,7 +13,8 @@ import pytest
 
 from orchestrate import AGENT_TOOLS, _looks_like_operation
 
-READ_ONLY = {"get_status", "get_findings", "generate_patch_preview", "answer"}
+READ_ONLY = {"get_status", "get_findings", "generate_patch_preview", "answer",
+             "deep_dive", "challenge"}
 WRITE_TOOLS = {"re_review", "close_topic", "apply_patch"}
 
 
