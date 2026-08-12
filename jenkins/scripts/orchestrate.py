@@ -1690,15 +1690,22 @@ def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_
             break
     if not needle:
         return None, "", False, "no locator token in issue"
-    content = open(p, encoding="utf-8", errors="ignore").read()
+    # NOTE: read/write must PRESERVE the file's original line endings. Game-engine
+    # source is often CRLF; if we read as text and rewrite joined with "\n", every
+    # line loses its "\r" -> the WHOLE file diffs as changed ("encode变了, 全部文件
+    # 都有 diff" — seen on MR 7099 where a 177-line file showed all lines modified).
+    raw = open(p, "rb").read()
+    have_crlf = b"\r\n" in raw
+    content = raw.decode("utf-8", errors="replace")
     (start, end), ctx = _locate_context(content, needle)
     if ctx is None:
         return None, "", False, f"locator '{needle}' not found in file"
+    newline = "\r\n" if have_crlf else "\n"   # keep the file's own newline style
     prev_bad = ""
     for rnd in range(max_rounds):
         sysp = ("You fix a bug in a file. I show the RELEVANT window of the file. "
                 "Output EXACTLY:\n@@START@@\n<verbatim corrected full window (everything from the window, with the fix applied)>\n@@END@@\n"
-                "Preserve all other lines byte-for-byte; only change the buggy part. No other text.")
+                "Preserve all other lines byte-for-byte (including whitespace); only change the buggy part. No other text.")
         prompt = (f"FILE: {file}\nRELEVANT WINDOW:\n```\n{ctx}\n```\n\nISSUE: {issue[:400]}\n\n"
                   f"Round {rnd+1}. Output @@START@@...@@END@@ (corrected window).")
         if prev_bad:
@@ -1712,16 +1719,28 @@ def _agent_edit_one(topic, file, issue, api_key, base_url, checkout, model=EDIT_
             prev_bad = "no @@START@@ block"
             continue
         new_window = m.group(1).strip("\n")
-        new_content = content.split("\n"); new_content[start:end] = new_window.split("\n")
-        new_content = "\n".join(new_content)
-        if new_content == content:
+        # operate on lines WITHOUT the trailing \r so the window math is clean,
+        # then re-attach the file's own newline style on write (preserves CRLF).
+        content_lines = [l[:-1] if l.endswith("\r") else l for l in content.split("\n")]
+        _orig_normal = "\n".join(content_lines)          # CRLF-stripped baseline
+        had_trailing_nl = content_lines[-1:] == [""]     # original ended with a newline
+        new_lines = [l[:-1] if l.endswith("\r") else l for l in new_window.split("\n")]
+        content_lines[start:end] = new_lines
+        # preserve trailing newline exactly as the original had it: a file that ended
+        # with "\n" (or "\r\n") must keep it, or git diffs the final line too.
+        if had_trailing_nl and content_lines[-1:] != [""]:
+            content_lines.append("")
+        elif not had_trailing_nl and content_lines[-1:] == [""]:
+            content_lines.pop()
+        new_content = newline.join(content_lines)
+        if new_content == _orig_normal:
             prev_bad = "no change produced"
             continue
         # apply to working tree only (not committed): ensure the file is clean
-        # first, then write the corrected window. The orphaned checkout -- file and
-        # .__bak backup below were dead code — drop them.
+        # first, then write the corrected window with the file's ORIGINAL newline
+        # style (CRLF if it had CRLF) — otherwise the whole file diffs as changed.
         _sp.run(["git", "-C", checkout, "checkout", "--", file], capture_output=True, text=True, timeout=60)
-        open(p, "w", encoding="utf-8").write(new_content)
+        open(p, "w", encoding="utf-8", newline="").write(new_content)
         d = _sp.run(["git", "-C", checkout, "diff", "--", file], capture_output=True, text=True, timeout=60)
         return file, d.stdout, True, None
     return None, "", False, "max rounds without an applyable edit"
