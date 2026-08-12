@@ -583,39 +583,39 @@ def _build_markdown_from_findings(findings, meta=None):
          "suggestion": len(groups["suggestion"])}
     total = sum(c.values())
 
-    # Trim lengths (characters). These bound how much prose lands in the group card
-    # (方案C: 言简意赅 — keep the point, drop the padding).
-    ISSUE_LIM, FIX_LIM, SUMMARY_LIM, STRENGTH_LIM = 48, 34, 92, 60
+    # (方案C更新: 不截断字符 —— 显示完整 issue/suggestion/summary/strengths。
+    #  仅当某严重度条数过多时按 MAX_FINDINGS_PER_SEV 封顶，并明确标注剩余条数，绝不静默截断。)
+    MAX_FINDINGS_PER_SEV = 20
 
     parts = [f"🔍 Code Review — {total} 项 ({c['critical']} 必改)"]
-    # Summary: one line
+    # Summary: 完整
     if meta.get("summary"):
-        parts.append(f"Summary：{_one_line(meta['summary'], SUMMARY_LIM)}")
-    # Strengths: one compact line (fallback: omit)
+        parts.append(f"Summary：{meta['summary']}")
+    # Strengths: 完整（至多 3 条）
     if meta.get("strengths"):
-        strengths = [_one_line(s, STRENGTH_LIM) for s in meta["strengths"][:3]]
-        strength_line = "；".join(s for s in strengths if s).strip("。；")
-        if strength_line:
-            parts.append(f"✅ {strength_line}")
-    # Architecture & Performance -> folded straight into findings (one-liners below),
-    # no separate verbose section.
+        strengths = [s for s in meta["strengths"][:3] if s]
+        if strengths:
+            parts.append("✅ " + "；".join(strengths))
+    # Architecture & Performance -> folded straight into findings (full below).
 
-    # Findings by severity (compact; each finding = one clipped line).
+    # Findings by severity (每条完整显示)。
     for k, label in (("critical", "blocking"), ("warning", "important"), ("suggestion", "nit")):
         if not groups[k]:
             continue
         emoji, tag, rank = groups[k][0]["_tag"]
         parts.append(f"{emoji} {tag} ({len(groups[k])})")
-        for f in groups[k][:10]:                       # cap per-severity lines for brevity
-            issue = _one_line(f.get("issue"), ISSUE_LIM)
-            fix = _one_line(f.get("suggestion"), FIX_LIM)
-            # 只用最短文件名(basename), 不用完整路径 —— 完整路径太长会被截断丢信息
+        shown = groups[k][:MAX_FINDINGS_PER_SEV]
+        for f in shown:
+            issue = (f.get("issue") or "").strip()
+            fix = (f.get("suggestion") or "").strip()
             fname = os.path.basename((f.get("file") or "").strip().rstrip("/")) or (f.get("file") or "?")
-            desc = f"{_one_line(fname, 48)}: {issue}"
+            desc = f"{fname}: {issue}"
             if fix:
                 desc += f" → {fix}"
             cat = (f.get("category") or "").strip()
             parts.append(f"· [{cat}] {desc}" if cat else f"· {desc}")
+        if len(groups[k]) > MAX_FINDINGS_PER_SEV:
+            parts.append(f"  （该级别共 {len(groups[k])} 条，已显示 {MAX_FINDINGS_PER_SEV} 条，其余见完整报告）")
 
     # Count line (compact)
     parts.append(f"📊 🔴{c['critical']} / 🟡{c['warning']} / 🟢{c['suggestion']}")
