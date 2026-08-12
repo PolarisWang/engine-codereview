@@ -34,6 +34,12 @@ GIT_PATH = shutil.which("git") or "/usr/bin/git"
 DEFAULT_REVIEW_INSTRUCTIONS = """
 You are a senior game engine engineer reviewing a merge request. Provide concise findings in Chinese.
 
+## 真实审查约束（必须遵守）
+- 只审查 **diff 中实际出现的 `+`/`-` 代码行**；只引用 diff/该文件中**真实存在**的函数/符号/变量。
+- **禁止编造**：diff 里没有的变更、不存在的函数名、未改动的代码块，不得作为 finding。
+- 若某处虽有改动但无真实问题，**不要为了凑数编造问题**；可无 finding。
+- 引用方法名时务必与该文件实际代码一致（例如确认真实方法名，而非相近词）。
+
 ## Review Focus
 1. Logic correctness and potential bugs
 2. Memory safety and resource leaks
@@ -492,6 +498,42 @@ def _split_diff_by_files(diff_text):
     return blocks
 
 
+def _diff_block_has_real_changes(block):
+    """True if a per-file diff block contains at least one '+'/'-' CONTENT line that
+    isn't pure whitespace/empty and isn't a header (diff --git / --- / +++ / @@ / slash-N).
+    i.e. a real code change, not just EOL/whitespace or path/hunk markers. Used to drop
+    files that appear in changed_files but have no actual text change — otherwise the
+    model tends to invent findings on them (e.g. it fabricated 'tryClimb() 把...改为...'
+    on an unchanged climbing block)."""
+    for line in block.splitlines():
+        if not line:
+            continue
+        if line.startswith(("\\ No newline", "diff --git", "--- a/", "+++ b/", "@@")):
+            continue
+        if (line.startswith("+") or line.startswith("-")) and line[1:].strip() != "":
+            return True
+    return False
+
+
+def _sanitize_diff_blocks(blocks):
+    """Given per-file diff blocks, return (kept_blocks, dropped_files). Drops any file
+    block with no real content change (#3), so only genuinely-changed files reach the
+    model. `dropped_files` are returned so callers can note/skip them in findings."""
+    kept, dropped = [], []
+    for b in blocks:
+        if _diff_block_has_real_changes(b):
+            kept.append(b)
+        else:
+            # record the file path for callers
+            path = ""
+            for line in b.splitlines():
+                if line.startswith("+++ b/"):
+                    path = line[6:].strip()   # '+++ b/xxx' -> 'xxx'
+                    break
+            dropped.append(path or "(unknown)")
+    return kept, dropped
+
+
 def _group_into_batches(blocks, max_batch_chars):
     """
     Group file blocks into batches, each staying under max_batch_chars
@@ -784,8 +826,26 @@ def review_with_claude(diff_info, config, project, issue_key, repo_type):
 
     # Split into per-file blocks and group into batches
     blocks = _split_diff_by_files(diff_text)
+    # 方案#3: 过滤掉「出现在 changed_files 但无真实 +/- 内容」的文件块(如某文件在 diff 里 0
+    # 行实际改动), 避免模型在这些文件上编造 finding。同时把 dropped 文件从 changed_files 里移除。
+    blocks, dropped_files = _sanitize_diff_blocks(blocks)
+    if dropped_files:
+        print(f"[review] dropped {len(dropped_files)} no-real-change file block(s): {dropped_files[:5]}...", flush=True)
     if not blocks:
         blocks = [diff_text]
+    if dropped_files:
+        all_files = diff_info.get("changed_files") or []
+        drop_leaf = {p.rsplit("/", 1)[-1] for p in dropped_files if p}
+        keep = []
+        for f in all_files:
+            path = f.split("\t", 1)[-1] if "\t" in f else f   # strip 'M\t' prefix
+            leaf = path.rsplit("/", 1)[-1]
+            # drop if this changed-file's basename matches any dropped-file basename
+            # (no-real-change block was dropped; don't list it as a changed file).
+            if leaf in drop_leaf:
+                continue
+            keep.append(f)
+        diff_info["changed_files"] = keep
     batches = _group_into_batches(blocks, max_batch_chars)
 
     # Defensive: even batches over budget get truncated per-batch, but cap the
@@ -838,6 +898,8 @@ Review the code in this part. For each finding, provide:
 
 At the end of THIS part, give a count of each severity level for the findings in this part.
 
+只审查上面 diff 中真实出现的 `+`/`-` 行与真实函数；引用不存在的函数/未改动代码即视为编造，应避免。若无真实问题则无 finding。
+
 IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
         else:
             user_prompt = f"""Project: {project} ({repo_type} repository)
@@ -861,6 +923,8 @@ Please review this code change. For each finding, provide:
 - **Suggestion**: how to fix it
 
 At the end, provide a summary with count of each severity level.
+
+只审查上面 diff 中真实出现的 `+`/`-` 行与真实函数/符号；引用不存在的函数或未改动代码即编造，应避免。若无真实问题则无 finding。
 
 IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most critical issues only."""
 
