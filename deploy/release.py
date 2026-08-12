@@ -122,9 +122,9 @@ def main():
     tag = f"v{version}"
     note = rn.build_note(ver, commits)
 
-    # LLM 润色成官方中文（可选；失败/无凭证自动退回分组版）。
-    # 小发布(≤2 提交)直接用分组 ters 版即可，避免 LLM 把一个提交拆出多个重复小节的噪音。
-    if rel.get("note_llm") and len(commits) > 2:
+    # LLM 润色成官方中文（可选；失败/无凭证自动退回分组版）。小发布也润色（prompt 已限制
+    # 不重复 scope/不拆多小节），只是结果更简洁中文。仅当 `note_llm` 开启。
+    if rel.get("note_llm") and len(commits) >= 1:
         polished = _polish_release_note(version, commits)
         if polished:
             note = polished
