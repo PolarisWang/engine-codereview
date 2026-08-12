@@ -1876,30 +1876,67 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
                 capture_output=True, text=True, timeout=60, env=_git_env)
         _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
                           capture_output=True, text=True, timeout=60, env=_git_env)
-        if _commit.returncode != 0:
-            _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
-            if "nothing to commit" in _commit_out:
-                # tree is clean relative to HEAD on the fix branch -> replay stored diffs
-                import tempfile
-                for d in files:
-                    diff = d.get("diff") or ""
-                    if not diff:
-                        continue
-                    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
-                        _f.write(diff)
-                        _pf = _f.name
-                    _ap = _sp.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
-                                  timeout=60, env=_git_env)
+        _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
+        if _commit.returncode != 0 and "nothing to commit" in _commit_out:
+            # tree was clean relative to the fix-branch HEAD: a later process's
+            # _ensure_checkout reset+clean wiped the working-tree edits made by
+            # _agent_edit_all, so re-apply the STORED diffs. Must check every apply's
+            # rc — a silent apply failure => empty commit => we'd push a no-change
+            # branch, and _create_or_get_mr then reports "fix 分支无改动" / MR create
+            # fails (the bug under investigation). Fail loudly instead of pushing air.
+            import tempfile
+            apply_errs = []
+            for d in files:
+                diff = d.get("diff") or ""
+                if not diff:
+                    apply_errs.append("(empty diff)")
+                    continue
+                with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                    _f.write(diff)
+                    _pf = _f.name
+                try:
+                    _ap = _sp.run(["git", "-C", checkout, "apply", "--3way", _pf],
+                                  capture_output=True, text=True, timeout=60, env=_git_env)
+                    if _ap.returncode != 0:
+                        apply_errs.append((d.get("file") or "?") + ": " +
+                                          ((_ap.stderr or _ap.stdout) or "apply failed").strip()[:120])
+                finally:
                     try:
                         os.unlink(_pf)
                     except OSError:
                         pass
-                _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
-                _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                                  capture_output=True, text=True, timeout=60, env=_git_env)
+            if apply_errs:
+                # Any stored diff failed to re-apply: do NOT push an empty/partial
+                # branch. Report clearly and keep the change set for manual @改码 retry.
+                pipeline_state.set_pending(state_file, key, "agent_edit",
+                                           patch={"actor": actor, "branch": branch})
+                _proc_reply(key, topic,
+                            "⛔ 确认阶段重放自动改码失败（工作树被复用的 checkout 复位清空后，"
+                            f"无法重新应用以下改动）：\n" + "\n".join("· " + e for e in apply_errs[:5]) +
+                            "\n\n请重新回复 `优化` 生成新的修复。",
+                            render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+                return 0
+            _sp.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
+            _commit = _sp.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                              capture_output=True, text=True, timeout=60, env=_git_env)
         if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
             _proc_reply(key, topic, M("confirm_commit_fail", err=(_commit.stderr or _commit.stdout)[:200]), render, state_file, app_id, app_secret)
             return 0
+        # Safety net: verify a real fix commit exists on the fix branch (HEAD advanced
+        # past the R1 base). If HEAD is still on checkout_sha, no fix landed — refuse to
+        # push a no-change branch (which previously caused MR creation to fail with
+        # "fix 分支相对 <target> 无改动").
+        if expected_sha:
+            _after = _sp.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=30, env=_git_env)
+            if ((_after.stdout or "").strip() or "") == (expected_sha or "").strip():
+                pipeline_state.set_pending(state_file, key, "agent_edit",
+                                           patch={"actor": actor, "branch": branch})
+                _proc_reply(key, topic,
+                            "⛔ 没有可推送的自动改码（修复提交未生成，分支仍停留在基线）。"
+                            "请重新回复 `优化` 生成新的修复。",
+                            render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+                return 0
         push = _sp.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                        capture_output=True, text=True, timeout=180, env=_git_env)
         if push.returncode != 0:
@@ -2594,31 +2631,64 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                      capture_output=True, text=True, timeout=60, env=_git_env)
             _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
                                capture_output=True, text=True, timeout=60, env=_git_env)
-            if _commit.returncode != 0:
-                _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
-                if "nothing to commit" in _commit_out:
-                    # replay the staged diffs into the (possibly reset) tree
-                    import tempfile as _tf
-                    for d in files:
-                        diff = d.get("diff") or ""
-                        if not diff:
-                            continue
-                        with _tf.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
-                            _f.write(diff)
-                            _pf = _f.name
-                        _sp2.run(["git", "-C", checkout, "apply", _pf], capture_output=True, text=True,
-                                 timeout=60, env=_git_env)
+            _commit_out = (_commit.stdout or "") + (_commit.stderr or "")
+            if _commit.returncode != 0 and "nothing to commit" in _commit_out:
+                # replay the staged diffs into the (possibly reset) tree. Check every
+                # apply's rc — a silent apply failure => empty commit => we'd push a
+                # no-change branch and MR creation then fails with "fix 分支无改动"
+                # (the bug under investigation). Fail loudly instead.
+                import tempfile as _tf
+                apply_errs = []
+                for d in files:
+                    diff = d.get("diff") or ""
+                    if not diff:
+                        apply_errs.append("(empty diff)")
+                        continue
+                    with _tf.NamedTemporaryFile("w", suffix=".patch", delete=False) as _f:
+                        _f.write(diff)
+                        _pf = _f.name
+                    try:
+                        _ap = _sp2.run(["git", "-C", checkout, "apply", "--3way", _pf],
+                                       capture_output=True, text=True, timeout=60, env=_git_env)
+                        if _ap.returncode != 0:
+                            apply_errs.append((d.get("file") or "?") + ": " +
+                                              ((_ap.stderr or _ap.stdout) or "apply failed").strip()[:120])
+                    finally:
                         try:
                             os.unlink(_pf)
                         except OSError:
                             pass
-                    _sp2.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
-                    _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
-                                       capture_output=True, text=True, timeout=60, env=_git_env)
+                if apply_errs:
+                    pipeline_state.set_pending_patch(state_file, key, None)
+                    pipeline_state.clear_pending(state_file, key)
+                    _proc_reply(key, topic,
+                                "⛔ 确认阶段重放自动改码失败（工作树被复用的 checkout 复位清空后，"
+                                f"无法重新应用改动）：\n" + "\n".join("· " + e for e in apply_errs[:5]) +
+                                "\n\n请重新回复 `优化` 生成新的修复。",
+                                render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+                    return False, f"agent_edit_confirm: replay apply failed"
+                _sp2.run(["git", "-C", checkout, "add", "-A"], capture_output=True, text=True, timeout=60, env=_git_env)
+                _commit = _sp2.run(["git", "-C", checkout, "commit", "-m", f"[codereview-agent] auto-fix {key} ({len(files)} files)"],
+                                   capture_output=True, text=True, timeout=60, env=_git_env)
             if _commit.returncode != 0 and "nothing to commit" not in ((_commit.stdout or "") + (_commit.stderr or "")):
                 pipeline_state.clear_pending(state_file, key)
                 _proc_reply(key, topic, M("confirm_commit_fail", err=(_commit.stderr or _commit.stdout)[:200]), render, state_file, app_id, app_secret)
                 return False, f"agent_edit_confirm: commit failed"
+            # Safety net: verify a real fix commit exists (HEAD advanced past the R1
+            # base). If HEAD is still on checkout_sha, no fix landed — refuse to push a
+            # no-change branch (previously caused MR creation to fail with
+            # "fix 分支相对 <target> 无改动").
+            if expected_sha:
+                _after = _sp2.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, timeout=30, env=_git_env)
+                if ((_after.stdout or "").strip() or "") == (expected_sha or "").strip():
+                    pipeline_state.set_pending_patch(state_file, key, None)
+                    pipeline_state.clear_pending(state_file, key)
+                    _proc_reply(key, topic,
+                                "⛔ 没有可推送的自动改码（修复提交未生成，分支仍停留在基线）。"
+                                "请重新回复 `优化` 生成新的修复。",
+                                render, state_file, app_id, app_secret, intent="确认并推送修复分支", prefix="🛑")
+                    return False, "agent_edit_confirm: no fix commit created"
             push = _sp2.run(["git", "-C", checkout, "push", "origin", f"HEAD:{branch}"],
                             capture_output=True, text=True, timeout=300, env=_git_env)
             if push.returncode != 0:

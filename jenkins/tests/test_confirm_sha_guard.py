@@ -49,11 +49,17 @@ def _mock_confirm(monkeypatch, topic, head_sha):
     as _sp` inside the function, so we patch the real subprocess.run."""
     import subprocess
     calls = []
+    nonlocal_commit_happened = {"yes": False}
 
     def fake_sp_run(cmd, **kw):
         calls.append(cmd)
         c = " ".join(cmd)
         if "rev-parse" in c and "HEAD" in c:
+            # The R1 pre-commit check returns the baseline; my post-commit safety-net
+            # check (verifying HEAD actually advanced) returns an ADVANCED head once a
+            # commit was observed, so a successful replay+commit reaches push/MR-create.
+            if nonlocal_commit_happened["yes"]:
+                return _R(stdout="AAAA1112")  # HEAD advanced past baseline
             return _R(stdout=head_sha)
         if "checkout" in c and "-B" in c:
             return _R()
@@ -62,11 +68,12 @@ def _mock_confirm(monkeypatch, topic, head_sha):
         if "add" in c and "-A" in c:
             return _R()
         if "commit" in c:
+            nonlocal_commit_happened["yes"] = True
             return _R(stdout="nothing to commit")  # force replay branch if reached
         if "apply" in c:
             return _R()
         if "push" in c:
-            return _R(stderr="push-not-expected")
+            return _R()
         return _R()
 
     monkeypatch.setattr("orchestrate._ensure_checkout", lambda topic, ws: ("/fake/co", None))
@@ -75,6 +82,42 @@ def _mock_confirm(monkeypatch, topic, head_sha):
     monkeypatch.setattr("orchestrate._update_card_text", lambda *a, **k: None)
     monkeypatch.setattr("orchestrate.pipeline_state.set_pending_patch", lambda *a, **k: None)
     # Block _create_or_get_mr so it never actually runs if we somehow reach push+MR.
+    monkeypatch.setattr("orchestrate._create_or_get_mr",
+                        lambda *a, **k: (None, "", "", "blocked"))
+    return calls
+
+
+def _mock_confirm_no_advance(monkeypatch, head_sha):
+    """Like _mock_confirm but HEAD NEVER advances even after a commit — simulating the
+    bug where replay/commit produces no fix commit (empty apply). Verifies the confirm
+    refuses to push a no-change branch."""
+    import subprocess
+    calls = []
+
+    def fake_sp_run(cmd, **kw):
+        calls.append(cmd)
+        c = " ".join(cmd)
+        if "rev-parse" in c and "HEAD" in c:
+            return _R(stdout=head_sha)   # always baseline; HEAD does not advance
+        if "checkout" in c and "-B" in c:
+            return _R()
+        if "config" in c:
+            return _R()
+        if "add" in c and "-A" in c:
+            return _R()
+        if "commit" in c:
+            return _R(stdout="nothing to commit")
+        if "apply" in c:
+            return _R()                   # apply "succeeds" but HEAD still no-advance
+        if "push" in c:
+            return _R()
+        return _R()
+
+    monkeypatch.setattr("orchestrate._ensure_checkout", lambda topic, ws: ("/fake/co", None))
+    monkeypatch.setattr(subprocess, "run", fake_sp_run)
+    monkeypatch.setattr("orchestrate._approve", lambda *a, **k: (True, "approved"))
+    monkeypatch.setattr("orchestrate._update_card_text", lambda *a, **k: None)
+    monkeypatch.setattr("orchestrate.pipeline_state.set_pending_patch", lambda *a, **k: None)
     monkeypatch.setattr("orchestrate._create_or_get_mr",
                         lambda *a, **k: (None, "", "", "blocked"))
     return calls
@@ -105,6 +148,18 @@ def test_confirm_proceeds_when_head_matches(monkeypatch):
     # It passes the guard; later it would hit commit("nothing to commit") -> replay ->
     # push. We assert the guard did not short-circuit at R1 (i.e. it got past the early
     # return). Concretely: _approved was reached and we attempted commit/push.
-    # Because the fake returns "nothing to commit", it proceeds to replay (apply) then
-    # push. Assert a push git command appears.
+    # Because the fake returns "nothing to commit" but then HEAD ADVANCES (mock), it
+    # proceeds to replay -> push. Assert a push git command appears.
     assert any("push" in c for c in calls)
+
+
+def test_confirm_refuses_push_when_head_does_not_advance(monkeypatch):
+    """Regression: the MR-create failure. When the replay/commit produces NO fix commit
+    (HEAD stays on the baseline after 'nothing to commit' + empty apply), we must NOT
+    push a no-change branch (which previously landed on GitLab as the review tip and
+    made _create_or_get_mr report 'fix 分支无改动' / MR create fail)."""
+    calls = _mock_confirm_no_advance(monkeypatch, head_sha="AAAA1111")
+    rc = _cmd_confirm_agent_edit("om_1", _make_topic(), [], "/state", "/ws", "app", "secret", actor="u1")
+    assert rc == 0
+    # Must NOT have pushed (and thus not created an MR) — HEAD never advanced.
+    assert not any("push" in c for c in calls)
