@@ -129,13 +129,21 @@ def gitlab_search_issue_mrs(project_path, issue_key, token):
         for m in data or []:
             src = m.get("source_branch", "")
             title = m.get("title", "") or ""
-            if issue_key in src or issue_key in title:
-                if gitlab_branch_exists(project_path, src, token):
-                    out.append({
-                        "branch": src,
-                        "target_branch": m.get("target_branch", ""),
-                        "iid": m.get("iid"),
-                    })
+            if not (issue_key in src or issue_key in title):
+                continue
+            # Skip the bot's OWN fix MRs: review must bind to the original dev review
+            # MR/branch, not a bot-generated fix branch. Fix branches carry our `-fix-`
+            # suffix and/or the bot's "Fix <key>: code review fixes" title. Binding to a
+            # fix MR drags old/previous fix commits into the new review ("老提交带进来").
+            if ("-fix-" in src) or title.startswith(f"Fix {issue_key}: code review fixes") \
+               or (title or "").startswith("[codereview-agent]"):
+                continue
+            if gitlab_branch_exists(project_path, src, token):
+                out.append({
+                    "branch": src,
+                    "target_branch": m.get("target_branch", ""),
+                    "iid": m.get("iid"),
+                })
         return out
     except Exception:
         return []

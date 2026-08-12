@@ -2034,6 +2034,7 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
                     intent="确认并推送修复分支", prefix="🛑")
         return 0
     out_lines = []
+    outcomes = pending.get("repo_outcomes") or {}
     for r in results:
         if r["ok"] and r["murl"]:
             out_lines.append("✅ **自动改码已推送** `" + r["branch"] + "`（" + r["repo"] + "，" +
@@ -2042,6 +2043,17 @@ def _cmd_confirm_agent_edit(key, topic, all_findings, state_file, workspace, app
                             "- 本次修复 MR：" + r["murl"])
         else:
             out_lines.append("⚠️ " + r["repo"] + " 修复 MR 未创建（" + (r["mrnote"] or "未知") + "）")
+    # 未提交修复的仓库也要明确提示（"没提"不能静默）——告诉用户该仓库无发现/无需修复/处理失败。
+    done = {r["repo"] for r in results}
+    for repo, oc in sorted(outcomes.items()):
+        if repo in done:
+            continue
+        if oc == "no_findings":
+            out_lines.append("💤 " + repo + "：本次审查无发现，无需修复")
+        elif oc == "no_fix":
+            out_lines.append("💤 " + repo + "：有发现但未能自动生成修复（可手动处理）")
+        elif oc == "error":
+            out_lines.append("⚠️ " + repo + "：修复处理失败")
     out_lines.append("- 原评审 MR：" + (topic.get("mr_url") or "") +
                      "\n\n> 修复 MR 由机器人创建，请到 GitLab 自行 review 后合并；`4` 可关闭话题（会连带关闭本轮 fix 分支的 OPEN MR）。")
     _finalize(key, "\n".join(out_lines), render, [], state_file, app_id, app_secret)
@@ -2607,25 +2619,32 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         # 有改动的仓库各得到一个修复 MR。findings 已按仓库分开(_eng_f/_gam_f)。
         repo_findings = {"engine": _eng_f or [], "game": _gam_f or []}
         staged_repos = []          # list of {repo, branch, files, checkout_sha}
+        repo_outcomes = {}         # {repo: "fix" | "no_findings" | "no_fix" | "error"}
         merged_failed = []
         for repo in ("engine", "game"):
             rf = repo_findings.get(repo) or []
             if not rf:
+                repo_outcomes[repo] = "no_findings"   # reviewed clean -> nothing to fix
                 continue
             try:
                 ok_diffs, failed, branch, _co, err, checkout_sha = _agent_edit_all(
                     topic, rf, api_key, base_url, workspace, repo=repo)
             except Exception as e:
+                repo_outcomes[repo] = "error"
                 pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail", str(e))
                 pipeline_state.clear_pending(state_file, key)
                 _proc_reply(key, topic, M("edit_err", msg=str(e)[:200]), render, state_file, app_id, app_secret)
                 return False, f"agent_edit error: {e}"
             if err:
+                repo_outcomes[repo] = "error"
                 merged_failed.append(f"{repo}: {err}")
                 continue
             if ok_diffs:
+                repo_outcomes[repo] = "fix"
                 staged_repos.append({"repo": repo, "branch": branch,
                                      "files": ok_diffs, "checkout_sha": checkout_sha})
+            else:
+                repo_outcomes[repo] = "no_fix"
             merged_failed.extend((f"{repo}: {ff}" for ff in (failed or [])))
         if not staged_repos:
             pipeline_state.append_approval(state_file, key, act, "auto_edit", "", "fail",
@@ -2638,7 +2657,8 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
             "file": "all", "target": "agent_edit",
             "state": "staged_agent_edit",
             "diff": "", "created_at": "now",
-            "repos": staged_repos,      # list of {repo, branch, files, checkout_sha}
+            "repos": staged_repos,                  # list of {repo, branch, files, checkout_sha}
+            "repo_outcomes": repo_outcomes,         # {repo: fix|no_findings|no_fix|error}
         })
         pipeline_state.append_approval(state_file, key, act, "auto_edit",
                                        ",".join(r["branch"] for r in staged_repos), "ok",
@@ -2718,6 +2738,7 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                         intent="确认并推送修复分支", prefix="🛑")
             return False, "agent_edit_confirm: failed for " + str(hard_fail[0])
         out_lines = []
+        outcomes = pp.get("repo_outcomes") or {}
         for r in results:
             if r["ok"] and r["murl"]:
                 out_lines.append("✅ **自动改码已推送** `" + r["branch"] + "`（" + r["repo"] + "，" +
@@ -2726,6 +2747,16 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                                 "- 本次修复 MR：" + r["murl"])
             else:
                 out_lines.append("⚠️ " + r["repo"] + " 修复 MR 未创建（" + (r["mrnote"] or "未知") + "）")
+        done = {r["repo"] for r in results}
+        for repo, oc in sorted(outcomes.items()):
+            if repo in done:
+                continue
+            if oc == "no_findings":
+                out_lines.append("💤 " + repo + "：本次审查无发现，无需修复")
+            elif oc == "no_fix":
+                out_lines.append("💤 " + repo + "：有发现但未能自动生成修复（可手动处理）")
+            elif oc == "error":
+                out_lines.append("⚠️ " + repo + "：修复处理失败")
         out_lines.append("- 原评审 MR：" + (topic.get("mr_url") or "") +
                          "\n\n> 请到 GitLab 人工核对后合并；也可 `4` 关闭话题（同时关闭本轮 fix 分支的 OPEN MR）。")
         _finalize(key, "\n".join(out_lines), render, [], state_file, app_id, app_secret)
