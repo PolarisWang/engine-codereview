@@ -1277,11 +1277,22 @@ def _repo_name_from_checkout(checkout):
 
 
 def _list_checkout_dirs(workspace, repo_name):
-    """List existing per-topic checkout subdir paths for a repo pool (dirs only)."""
+    """List existing per-topic checkout subdir paths for a repo pool.
+
+    Only counts dirs that are REAL per-topic checkouts (contain a `.git`).
+    A legacy pre-方案B pool had the whole repo tree flat at {repo}-review/, so its
+    top-level content dirs (_source/, _content/, ...) are NOT per-topic checkouts
+    and must be ignored — otherwise the open-dir ceiling is miscounted (18 'dirs'
+    when only 1 is a real checkout) and 优化/改码 wrongly refuses on an existing
+    pool. Per-topic slug subdirs always contain `.git` (they're git-clone targets)."""
     pool = os.path.join(workspace, f"{repo_name}-review")
     try:
-        return [os.path.join(pool, n) for n in os.listdir(pool)
-                if os.path.isdir(os.path.join(pool, n))]
+        out = []
+        for n in os.listdir(pool):
+            d = os.path.join(pool, n)
+            if os.path.isdir(d) and os.path.isdir(os.path.join(d, ".git")):
+                out.append(d)
+        return out
     except FileNotFoundError:
         return []
     except OSError:

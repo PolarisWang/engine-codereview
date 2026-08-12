@@ -50,15 +50,24 @@ def test_repo_name_from_checkout_both_layouts():
     assert _repo_name_from_checkout("/w/chaos-cb-2-review") == "chaos-cb-2"
 
 
-def test_list_checkout_dirs_counts_only_dirs(tmp_path):
+def test_list_checkout_dirs_counts_only_git_dirs(tmp_path):
+    # Regression: legacy pools have the whole repo tree flat at {repo}-review/, whose
+    # content dirs (_source/ etc.) have NO .git and MUST NOT be counted as per-topic
+    # checkouts (this caused the open-dir ceiling to miscount 18 when only 1 was real,
+    # wrongly refusing 优化/改码). Count only dirs that are real checkouts (have .git).
     repo = "chaos-cb-2"
     pool = tmp_path / f"{repo}-review"
-    (pool / "feature_lod").mkdir(parents=True)
-    (pool / "feature_mempool").mkdir()
+    # real per-topic checkouts (git-clone targets) -> have .git
+    (pool / "feature_lod" / ".git").mkdir(parents=True)
+    (pool / "feature_mempool" / ".git").mkdir(parents=True)
+    # legacy flat repo CONTENT dirs -> no .git, must be ignored
+    (pool / "_source").mkdir()
+    (pool / "_content").mkdir()
     (pool / "not_a_dir").write_text("x")
     dirs = _list_checkout_dirs(str(tmp_path), repo)
-    assert len(dirs) == 2
+    assert len(dirs) == 2                                  # only the 2 real checkouts
     assert all(os.path.isdir(d) and os.path.basename(d).startswith("feature_") for d in dirs)
+    assert all(not os.path.basename(d).startswith("_") for d in dirs)  # no legacy content dirs
 
 
 def test_disk_free_bytes_reports_positive(tmp_path):
