@@ -87,7 +87,9 @@ def test_route_ignores_reply_not_directed_at_bot(monkeypatch):
     _route("om_x2", "om_parent", "@优化", "ou_2", mentions=[])
     time.sleep(0.1)
     assert len(calls) == 1, "bot SHOULD reply to @-command"
-    # @ of ANOTHER user (mention name != bot, no @-command) -> ignored.
-    _route("om_x3", "om_parent", "@李四 这里呢", "ou_3", mentions=[{"name": "李四"}])
+    # @机器人/any @-mention (Feishu renders both bot & other as @_user_N) -> handled.
+    # Feishu shows ANY @ as `@_user_N`, and in a card thread a leading '@' is the
+    # user addressing the bot, so we treat '@'-prefixed as directed.
+    _route("om_x3", "om_parent", "@机器人 收到消息了吗", "ou_3", mentions=[{"name": "机器人"}])
     time.sleep(0.1)
-    assert len(calls) == 1, "mentioning another user must NOT trigger bot"
+    assert len(calls) == 2, "an @-mention should be handled (can't distinguish bot vs other by text)"

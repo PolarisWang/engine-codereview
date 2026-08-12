@@ -36,26 +36,6 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
-# @ 前缀命令词：带 @ 且首词命中这些词 = 用户确实在指 bot(如 `@优化`/`@确认`/`@关键`)。
-# 与 orchestrate._COMMAND_FIRST_WORDS 对齐；这里单独的本地集合避免 event_server 反向依赖 orchestrate。
-_BOT_CMD_WORDS = {
-    "优化", "自动优化", "优化代码", "优化并提交",
-    "改码", "自动修改", "自动修复", "autofix", "改码并提交",
-    "指引", "修改指引", "怎么改",
-    "mr", "生成mr", "出mr单", "mr单", "更新mr", "更新mr单",
-    "状态", "/状态", "status",
-    "关闭", "关闭话题",
-    "深入", "deepdive", "深入分析",
-    "质疑", "challenge",
-    "更新结论", "更新review结论", "修订结论",
-    "1", "补丁", "生成补丁", "修复",
-    "2", "重新审查", "重审", "review", "重新review",
-    "3", "解释",
-    "4",
-    "预览", "预览补丁", "patch预览",
-    "应用并提交", "确认提交", "push并建mr",
-}
-
 try:
     from flask import Flask, request, jsonify
     _HAS_FLASK = True
@@ -529,34 +509,32 @@ def _spawn_interact(topic_key, reply_text, reply_msg_id, sender_id):
 
 
 def _is_bot_directed(text, mentions):
-    """True if a threaded reply is directed at THIS bot (user @-ed it), so the bot
-    only replies when addressed and stays silent when users chat among themselves.
+    """True if a threaded reply is directed at the bot, so the bot only replies when
+    addressed and stays silent when users chat among themselves.
 
-    Heuristic (Feishu): a reply is bot-directed if
-      - it starts with '@' AND that first token is a known command keyword
-        (e.g. `@优化`, `@确认` — the existing @-command path), or
-      - the message carries a mention whose name/id matches the configured bot
-        (FEISHU_BOT_NAME / FEISHU_BOT_OPEN_ID) — the precise signal when available.
-    Otherwise (plain threaded chat, no @-to-bot) the bot should NOT reply."""
-    t = (text or "").strip()
-    lo = t.lower()
+    Feishu renders ANY @-mention as an `@_user_N` placeholder in the message text (not
+    the bot's display name), so in a review-card thread a reply starting with '@' IS
+    the user addressing someone (usually the bot or `@优化`-style). To keep the common
+    `@机器人 …` case working while still ignoring plain non-@ small-talk, we treat a
+    leading '@' as bot-directed. We ALSO accept:
+      - '@' + a known command keyword (@优化/@MR单/@确认/...)
+      - mentions matching configured FEISHU_BOT_NAME / FEISHU_BOT_OPEN_ID
+      - text starting with the configured bot name
+    A reply with NO leading '@' (flat chat, no mention) is NOT handled (no reply)."""
+    lo = (text or "").strip().lower()
+    if lo.startswith("@"):
+        return True            # @-mention (Feishu shows any @ as @_user_N) -> directed
     bot_name = (os.environ.get("FEISHU_BOT_NAME") or "").strip().lstrip("@").lower()
     bot_open_id = (os.environ.get("FEISHU_BOT_OPEN_ID") or "").strip()
-    # 1) @ + known command keyword -> definitely directed at bot
-    if lo.startswith("@") and lo.split():
-        head = lo.split()[0].lstrip("@")
-        if head in _BOT_CMD_WORDS:
-            return True
-    # 2) mention name/id matches configured bot
     for m in (mentions or []):
         name = (m.get("name") or "").lstrip("@").lower()
         if bot_name and name == bot_name:
             return True
         if bot_open_id and (m.get("open_id") or "").lower() == bot_open_id.lower():
             return True
-    # 3) text starts with configured bot name (e.g. `@CodeReviewBot ...`)
-    if bot_name and (lo.lstrip("@").startswith(bot_name)):
+    if bot_name and lo.lstrip("@").startswith(bot_name):
         return True
+    # a command keyword without '@' (e.g. plain "优化")? No — require @ (per user: no @ = no reply)
     return False
 
 
