@@ -43,8 +43,8 @@ MSG = {
     "interact_hint": "🤖 **下一步操作**\n- `优化`：自动修复关键问题 → 推送分支 → 建/更新 MR\n- `关闭`/`4`：关闭话题",
     "confirm_no_pending": "⛔ 当前没有待确认的自动修改。请先回复 `优化` 生成修改。",
     "close_confirmed": "🔒 本话题已关闭，不再处理。",
-    "autoclose_reason": "{days}天无新回复自动关闭",
-    "autoclose_notice": "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
+    "autoclose_reason": "{hours}小时无新回复自动关闭",
+    "autoclose_notice": "🔒 话题 {label} 因 {hours}小时无新回复，已自动关闭。如需重新审查可新开话题。",
 }
 # 命令词(方案C): 集中到 config.yaml commands:, 这里仅默认值。
 CMD = {
@@ -82,6 +82,8 @@ def load_config_merged(path=None):
     llm = cfg.get("claude") or {}
     if life.get("idle_close_days") is not None:
         IDLE_CLOSE_DAYS = int(life["idle_close_days"])
+    if life.get("auto_close_hours") is not None:
+        AUTO_CLOSE_HOURS = int(life["auto_close_hours"])
     if life.get("auto_close_mr") is not None:
         AUTO_CLOSE_MR = bool(life["auto_close_mr"])
     if concurrency.get("max_reviews") is not None:

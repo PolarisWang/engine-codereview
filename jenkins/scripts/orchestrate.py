@@ -669,6 +669,22 @@ def _refresh_last_user_activity(state_file, key):
     return False
 
 
+def _autoclose_message(topic, note=""):
+    """Build a CORRECT, topic-specific group notice for an auto-close. States the real
+    idle threshold (AUTO_CLOSE_HOURS小时), identifies the topic (jira key / short id) so
+    the group knows WHICH topic was closed, and appends what was released (note)."""
+    hrs = AUTO_CLOSE_HOURS
+    if hrs >= 24:
+        window = f"{hrs/24:.0f}天" if hrs % 24 == 0 else f"{hrs}小时"
+    else:
+        window = f"{hrs}小时"
+    label = (topic or {}).get("jira_key") or (topic or {}).get("message_id") or ""
+    msg = f"🔒 话题 {label} 因 {window} 无新回复，已自动关闭。如需重新审查可新开话题。"
+    if note:
+        msg += f"\n（已释放：{note}）"
+    return msg
+
+
 def _should_auto_close(topic, now_ts=None):
     """R7: whether a topic is due for lazy auto-close (idle > IDLE_CLOSE_DAYS and
     not already CLOSED). Applies to ANY non-CLOSED phase — including DONE/FAILED —
@@ -816,10 +832,9 @@ def interact(args):
                 except Exception as _e:
                     print(f"[autoclose] cleanup resources error: {_e}", file=sys.stderr)
             pipeline_state.close_topic(state_file, key, closed_by="auto",
-                                       reason=MSG.get("autoclose_reason", "{hours}小时无新回复自动关闭").format(hours=AUTO_CLOSE_HOURS))
+                                       reason=f"{AUTO_CLOSE_HOURS}小时无新回复自动关闭")
             pipeline_state.set_topic_fields(state_file, key, phase="CLOSED")
-            _finalize(key, MSG.get("autoclose_notice") or "🔒 本话题长时间无新回复，已自动关闭。如需重新审查请新开话题。",
-                      render_id, [], state_file, app_id, app_secret)
+            _finalize(key, _autoclose_message(topic), render_id, [], state_file, app_id, app_secret)
             return 0
 
     eng_findings, gam_findings, findings_status = _load_findings(workspace, key)
@@ -2888,9 +2903,7 @@ def run_autoclose(state_file, workspace, app_id, app_secret, lock_dir=None, chat
                     _run_py("feishu_notifier.py", [
                         "reply-message", "--app-id", app_id, "--app-secret", app_secret,
                         "--chat-id", chat_id, "--message-id", key,
-                        "--message-base64",
-                        _b64_str((MSG.get("autoclose_notice") or "🔒 已自动关闭") +
-                                 (("（" + note + "）") if note else ""))])
+                        "--message-base64", _b64_str(_autoclose_message(t, note))])
         except Exception as e:
             print(f"[autoclose] close {key[:20]} err: {e}", file=sys.stderr)
             closed[key] = (False, str(e))

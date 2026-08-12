@@ -69,7 +69,9 @@ def test_idle_uses_last_user_activity_not_updated_at():
     assert _should_auto_close(t, now_ts=NOW2) is True
 
 
-def test_fresh_user_activity_not_idle():
+def test_fresh_user_activity_not_idle(monkeypatch):
+    # Pin a 48h window so "1 hour ago" is genuinely fresh (config default may be 1h).
+    monkeypatch.setattr("orchestrate.AUTO_CLOSE_HOURS", 48)
     NOW2 = time.time()
     t = {"phase": "DONE",
          "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 5 * 86400)),
@@ -102,9 +104,44 @@ def test_legacy_no_created_at_falls_back_to_updated_at():
     assert _should_auto_close(t, now_ts=NOW2) is True  # 缺 created_at -> 兜底 updated_at
 
 
-def test_has_last_user_activity_still_priority():
+def test_has_last_user_activity_still_priority(monkeypatch):
+    monkeypatch.setattr("orchestrate.AUTO_CLOSE_HOURS", 48)
     NOW2 = time.time()
     t = {"phase": "DONE",
          "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 5 * 86400)),
          "last_user_activity": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW2 - 3600))}  # 用户1h前
     assert _should_auto_close(t, now_ts=NOW2) is False  # 用户活动优先, 不算 idle
+
+
+# --- auto_close_hours wiring + correct group notice ---
+
+def test_config_wires_auto_close_hours_to_one():
+    # config.yaml sets auto_close_hours: 1; it must now be read (was ignored, stuck at 48)
+    from config import AUTO_CLOSE_HOURS
+    assert AUTO_CLOSE_HOURS == 1
+
+
+def test_should_auto_close_uses_auto_close_hours_threshold(monkeypatch):
+    from orchestrate import _should_auto_close
+    import time as _t
+    monkeypatch.setattr("orchestrate.AUTO_CLOSE_HOURS", 1)  # 1h window
+    now = _t.time()
+    # 2h idle (last_user_activity 2h ago) under a 1h window -> due
+    t = {"phase": "DONE",
+         "last_user_activity": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(now - 2 * 3600))}
+    assert _should_auto_close(t, now_ts=now) is True
+    # 30min idle -> not due under 1h
+    t2 = {"phase": "DONE",
+          "last_user_activity": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(now - 1800))}
+    assert _should_auto_close(t2, now_ts=now) is False
+
+
+def test_autoclose_message_is_topic_specific_and_states_threshold(monkeypatch):
+    from orchestrate import _autoclose_message
+    monkeypatch.setattr("orchestrate.AUTO_CLOSE_HOURS", 1)
+    m = _autoclose_message({"jira_key": "CB2N-25256"})
+    assert "CB2N-25256" in m
+    assert "1小时" in m
+    assert "自动关闭" in m
+    m2 = _autoclose_message({"jira_key": "EV-9"}, note="删除孤儿 fix 分支 foo")
+    assert "已释放" in m2 and "foo" in m2
