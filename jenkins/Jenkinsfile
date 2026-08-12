@@ -129,8 +129,10 @@ pipeline {
         // Feishu Bot API (for topic messages)
         FEISHU_APP_ID = "${env.FEISHU_APP_ID ?: ''}"
         FEISHU_APP_SECRET = "${env.FEISHU_APP_SECRET ?: ''}"
-        // 正式群 chat_id：优先 env FEISHU_CHAT_ID；否则用 config.yaml feishu.chat_id 同值。
-        FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_e817ca07b9c71539e334b1701f2054b4'}"
+        // 正式群 chat_id 固定用 oc_e817（== config.yaml feishu.chat_id）。
+        // 注意：不能用 `${env.FEISHU_CHAT_ID ?: ...}` —— 外层 Jenkins env 仍带旧 oc_254e，
+        // 会让 `?:` 兜底不生效（扫描扫旧群）。换群改这一行 + config.yaml feishu.chat_id。
+        FEISHU_CHAT_ID = 'oc_e817ca07b9c71539e334b1701f2054b4'
         // Fallback webhook — inject via FEISHU_WEBHOOK_URL_OVERRIDE credential if needed.
         FEISHU_WEBHOOK_URL = "${env.FEISHU_WEBHOOK_URL_OVERRIDE ?: ''}"
 
