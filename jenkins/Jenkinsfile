@@ -131,7 +131,7 @@ pipeline {
         // fallback below is a documented hardcoded default.
         FEISHU_APP_ID = "${env.FEISHU_APP_ID ?: ''}"
         FEISHU_APP_SECRET = "${env.FEISHU_APP_SECRET ?: ''}"
-        FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_254e95f0687245b9df82ab8bf823ca54'}"
+        FEISHU_CHAT_ID = "${env.FEISHU_CHAT_ID ?: 'oc_e817ca07b9c71539e334b1701f2054b4'}"
         // Fallback webhook — a live incoming-webhook URL is hardcoded here for
         // resilience when the Bot API is unavailable (see docs/jenkins-credentials.md).
         // Prefer injecting FEISHU_WEBHOOK_URL_OVERRIDE via Jenkins credentials.
