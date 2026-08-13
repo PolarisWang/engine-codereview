@@ -763,6 +763,27 @@ def _read_file_content(path):
         return None
 
 
+def _lex_file_symbols(content):
+    """对文件内容 pygments lex,返回 {identifier: count} (仅 Name token)"""
+    from pygments.lexers.c_cpp import CLexer
+    if not content:
+        return {}
+    from pygments import lex
+    counts = {}
+    lexer = CLexer()
+    try:
+        for ttype, value in lex(content, lexer):
+            from pygments.token import Name
+            if ttype not in Name:
+                continue
+            s = value.strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s) and len(s) >= 2 and len(s) <= 96:
+                counts[s] = counts.get(s, 0) + 1
+    except Exception:
+        pass
+    return counts
+
+
 def _build_repo_union_text(repo_dir, changed_files):
     """把全部变更文件内容并集为一份文本,作为"符号是否真实存在"的子串判据的语料。
 
@@ -920,6 +941,222 @@ def _post_validate_findings(findings, diff_info):
             kept.append(f)
 
     return kept, traces
+
+
+# ── 阶段1.5: 结论可信度分层(确定 keep/drop + 存疑降 warn,无人工复核) ──────────
+# 目标: 把"语义推断型"结论(锁/循环边界/off-by-one)与"客观可证事实"(垃圾文件/符号缺失)
+# 区分开。确定不成立/误报的 drop,拿不准的降 warn。全部确定性规则,不调第二个 LLM。
+# 复用: stage-1 symbol_check(符号真伪) + changed_files + diff +/- 行。
+
+# 垃圾/误提交文件启发词
+_GARBAGE_FILE_MARKERS = ("is not recognized as", "not recognized as", "operable program",
+                         "internal or external command", "cannot find the path",
+                         "未被识别为", "不是内部或外部命令")
+
+
+def _looks_like_garbage(rel_path, content):
+    """确定性判"是否为误提交的垃圾文件"。
+    要么文件名含 '('(shell 重定向残留,如 *.cpp(40),铁证),
+    要么内容完全不像是源码(纯 shell 错误 / 无任何 C++ 标识符)。"""
+    if not rel_path:
+        return False
+    if "(" in os.path.basename(rel_path):
+        return True
+    if content is None:
+        return False   # 读不到不算垃圾(避免误判)
+    c = content or ""
+    # 明确 shell 错误文本
+    for mark in _GARBAGE_FILE_MARKERS:
+        if mark in c:
+            return True
+    # 内容非空但没有任何 C/C++ 标识符/关键字 → 极可能是垃圾
+    if c.strip() and not _lex_file_symbols(c):
+        # 再确认确实不是合法纯注释文件(允许只有注释的头)
+        stripped = re.sub(r"//.*|/\*.*?\*/|#.*", "", c, flags=re.S).strip()
+        if not stripped:
+            return False   # 只是注释 → 不算垃圾
+        return True
+    return False
+
+
+# 存疑话术(真正的"拿不准/待核实"),用于 warn 降级。避开"若/可能/如果"等几乎所有 finding
+# 都会天然带的条件词 —— 否则 warn 击穿 80% 以上(实测 CB2N-27312: 30/37),指标无区分度。
+_HEDGE_MARKERS = ("建议确认", "需确认", "需要确认", "是否存在", "建议核实", "待确认",
+                  "无法确定", "未能确定", "建议进一步", "需进一步", "尚需", "存疑",
+                  "不确定", "需要人工", "仍需核实", "无法证明")
+
+
+def _is_hedged(txt):
+    low = (txt or "").lower()
+    return any(h in low for h in _HEDGE_MARKERS)
+
+
+# ── A-3: 文本冲突判定(把 finding 的"硬断言"与真实代码比对, 矛盾即误报) ──────────
+# 只在 finding 用了"明确硬否定"(函数 X 无锁/未修改/未加锁/删除了 foo)时才开枪; 且
+# 用真实源码逐字核实该断言是否被推翻。命中 -> drop(客观误报)。任何模糊表述/拿不准 ->
+# 绝不动(宁 keep/warn 不误删)。这是判定"误报"的唯一有判别力的判据。
+_LOCK_TOKENS = ("CMP_SCOPE_SHARED_LOCK", "CMP_SCOPE_EXCLUSIVE_LOCK", "CMP_SCOPE_SPINLOCK",
+                "std::lock_guard", "std::unique_lock", "mutex", "SpinLock", "spin_lock",
+                "AcquireRwLock", "AcquireTrimShared", "m_lock", "lua_lock",
+                "LockGuard", "AutoLock", "ScopedLock", "Relock", r"\.lock(")
+
+# 硬否定句式: 明确断言某符号"无锁/未被修改/未加X/未使用"。捕获符号名。
+_HARD_NEG_RE = re.compile(
+    r"([A-Za-z_]\w{2,})\s*(?:仍无锁|无锁|未加锁|不加锁|没有锁|未被修改|未修改|未加保护|未加任何锁"
+    r"|不携带锁|未使用任何锁|未受保护|未加同步|无任何锁保护)", re.IGNORECASE)
+
+
+def _function_body(content, sym):
+    """近似提取源码里符号 sym 的【函数定义体】片段。
+
+    A-3 用: 判断该函数体内是否真含锁宏。刻意跳过"调用点"(如 `x = GetBlockSize( ... )`),
+    只认**定义处**(`Type Class::sym(...) {` 或 `Type sym(...) {`)。找不到/无法配平 -> None(不判冲突)。
+    """
+    if not content or not sym:
+        return None
+    start = 0
+    while True:
+        idx = content.find(sym, start)
+        if idx < 0:
+            return None
+        # 前一个非空白字符: 定义通常前面是 `::`(成员)或返回类型/行首; 调用点前多是 `= ( . , >`
+        before = ""
+        j = idx - 1
+        while j >= 0 and content[j] in " \t":
+            j -= 1
+        if j >= 0:
+            before = content[j]
+        # 定义: 前面是 `::`(成员定义) 或 字母数字/下划线(返回类型紧贴) 或 行首
+        if before in ("=", "(", ")", ".", ",", ">", "-"):
+            is_def_like = False          # 明显是调用点/赋值/成员访问
+        else:
+            is_def_like = True           # ::(定义) / 返回类型 / 行首空白
+        # 符号后必须是 '(' (函数)
+        k = idx + len(sym)
+        while k < len(content) and content[k] in " \t":
+            k += 1
+        if k >= len(content) or content[k] != "(":
+            is_def_like = False
+        if not is_def_like:
+            start = idx + 1
+            continue
+        # 找函数体首 '{'
+        open_b = content.find("{", k)
+        if open_b < 0:
+            return None
+        depth = 0
+        i = open_b
+        n = len(content)
+        while i < n:
+            c = content[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    line_start = content.rfind("\n", 0, idx) + 1
+                    return content[line_start:i + 1]
+            i += 1
+        return None
+
+
+
+def _A3_assertion_conflicts(txt, file, repo_dir):
+    """A-3 文本冲突判定。Returns (conflicts: bool, evidence: str).
+
+    对 finding 里每个"硬否定函数命题"(sym 无锁/未被修改), 取该函数体真实源码片段,
+    若片段里含锁宏 -> finding 断言被源码推翻 -> conflict(误报, drop)。
+    找不到函数体 / 源码读不到 / 无锁宏 -> 不判冲突(宁 keep 不误删)。
+    """
+    if not (file and repo_dir):
+        return False, ""
+    content = _read_file_content(os.path.join(repo_dir, file))
+    if not content:
+        return False, ""
+    for m in _HARD_NEG_RE.finditer(txt):
+        sym = m.group(1)
+        body = _function_body(content, sym)
+        if body is None:
+            continue
+        for lock in _LOCK_TOKENS:
+            if lock in body:
+                return True, f"finding 断言 `{sym}` 无锁/未被修改, 但源码 {sym} 函数体内含锁宏 {lock} -> 断言与代码矛盾"
+    return False, ""
+
+
+
+def _classify_confidence(finding, changed_files, repo_dir):
+    """对单条 finding 做结论可信度分层,返回 ('keep'|'drop'|'warn', reason)。
+
+    - drop: 客观确定不成立/误报(垃圾文件的错误断言 / 核心符号确不在变更集)
+    - keep: 客观可证为真的 / 明确关键改动 / 无需降级的正式分析
+    - warn: 存疑(显式猜测话术,或纯风格/性能建议,无确凿缺陷主张),降级展示
+    不调用 LLM,不人工复核。任何不确定性 → 宁 keep 不误杀、宁 warn 不误删。
+    """
+    f = finding or {}
+    txt = (f.get("issue") or "") + "\n" + (f.get("suggestion") or "")
+    file = (f.get("file") or "").strip()
+
+    # A-1 垃圾文件: finding 明确指认垃圾文件本身 -> 客观为真 -> keep
+    if file:
+        content = _read_file_content(os.path.join(repo_dir, file)) if repo_dir else None
+        if _looks_like_garbage(file, content):
+            low = txt.lower()
+            if any(k in low for k in ("垃圾", "rm", "删除", "清理", "误提交", "garbage", "废")):
+                return "keep", "指向确定的误提交垃圾文件, 客观事实"
+            # 否则(在垃圾文件上硬造别的 bug) -> drop(垃圾文件本无代码可审)
+            return "drop", "指向的 file 本身是误提交垃圾文件, 无有效代码可审"
+
+    # A-3 文本冲突: finding 硬断言"函数 X 无锁/未修改/删除了 foo", 但真实源码推翻它 -> 误报, drop
+    if repo_dir and file:
+        conflict, ev = _A3_assertion_conflicts(txt, file, repo_dir)
+        if conflict:
+            return "drop", f"误报: {ev}"
+
+    # B hedge → warn(显式猜测话术)
+    if _is_hedged(txt):
+        return "warn", "存疑: 使用了可能/若/建议确认等猜测话术, 结论需以真代码核对"
+
+    # C 纯风格/性能建议、无确凿缺陷主张 → warn(不算确定问题, 保留)
+    sev = (f.get("severity") or "").strip().lower()
+    cat = (f.get("category") or "").strip().lower()
+    if sev in ("suggestion", "info", "note", "low", "nit", "minor") and cat == "quality":
+        return "warn", "纯风格/性能建议, 非确定缺陷"
+
+    # 其余(明确 critical/warning 且非猜测话术的正式分析) → keep
+    return "keep", "正式分析, 保留(语义是否成立以 diff/真代码为准, 不作客观删除)"
+
+
+def _apply_confidence(findings, diff_info):
+    """对全量 findings 应用(阶段1.5)结论可信度分层。
+
+    返回 (kept, notes)。
+      - keep: 保留, finding["confidence"]="keep"
+      - drop: 从返回里移除(进 notes["drop"] 供 vault 溯源),不再出现在 report
+      - warn: 保留, finding["confidence"]="warn", severity 不升
+    """
+    repo_dir = (diff_info or {}).get("repo_dir")
+    changed_files = [(f.split("\t", 1)[-1] if "\t" in f else f) for f in
+                     ((diff_info or {}).get("changed_files") or [])]
+    kept = []
+    notes = {"drop": [], "warn": 0}
+    for f in (findings or []):
+        verdict, reason = _classify_confidence(f, changed_files, repo_dir)
+        if verdict == "drop":
+            f = dict(f)
+            f["confidence"] = "drop"
+            f["_confidence_reason"] = reason
+            notes["drop"].append(f)          # 进 vault,不进 report
+            continue
+        f = dict(f)
+        if verdict == "warn":
+            f["confidence"] = "warn"
+            f["_confidence_reason"] = reason
+            notes["warn"] += 1
+        else:
+            f["confidence"] = "keep"
+        kept.append(f)
+    return kept, notes
 
 
 def _verify_flags(kept_findings, traces, diff_info, api_key, base_url, model, max_output_tokens):
@@ -1138,7 +1375,15 @@ def _build_markdown_from_findings(findings, meta=None):
             if fix:
                 desc += f" → {fix}"
             cat = (f.get("category") or "").strip()
-            parts.append(f"· [{cat}] {desc}" if cat else f"· {desc}")
+            # 结论可信度角标(阶段1.5): confidence==warn 的语义推断型结论, 标注存疑、勿作确定结论
+            conf = (f.get("confidence") or "").strip()
+            warn_note = ""
+            prefix = "·"
+            if conf == "warn":
+                prefix = "⚠️"
+                warn_note = "（存疑，结论可能不成立）"
+            head = f"{prefix} [{cat}] {desc}{warn_note}" if cat else f"{prefix} {desc}{warn_note}"
+            parts.append(head)
         if len(groups[k]) > MAX_FINDINGS_PER_SEV:
             parts.append(f"  （该级别共 {len(groups[k])} 条，已显示 {MAX_FINDINGS_PER_SEV} 条，其余见完整报告）")
 
@@ -1485,12 +1730,26 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
         except Exception as e:
             print(f"[review] stage-2 verify skipped: {e}", flush=True)   # 保守: 保留原状
 
+    # 阶段1.5: 结论可信度分层(确定 keep/drop + 存疑降 warn,无人工复核)。
+    # 在阶段0/1/2 的基础上,把"语义推断型"结论与"客观可证事实"区分: 确定不成立/误报的 drop,
+    # 拿不准(hedging/架构质量推断)的降 warn,客观为真的 keep。任何不确定宁 warn 不误杀。
+    try:
+        kept_findings, conf_notes = _apply_confidence(kept_findings, diff_info)
+    except Exception as e:
+        conf_notes = {"drop": [], "warn": 0}
+        print(f"[review] confidence layer skipped: {e}", flush=True)
+    conf_dropped = len(conf_notes.get("drop") or [])
+    conf_warned = conf_notes.get("warn") or 0
+    # confidence-drop 也进 verification.vault 供溯源(不改阶段1 的 traces,单独记)
+    conf_vault = {"dropped": conf_notes.get("drop") or [], "warned_count": conf_warned}
+
     drop_n = sum(1 for t in traces if t["decision"] == "drop")
     flag_n = sum(1 for t in traces if t["decision"] == "flag")
     keep_n = sum(1 for t in traces if t["decision"] == "keep")
     verification_block = {
         "vault": traces,
         "counts": {"kept": keep_n, "flagged": flag_n, "dropped": drop_n},
+        "confidence": conf_vault,
         "dropped_decision": "symbol absent in changed-file union, non-macro; "
                             "confirmed by stage-2 re-verify when flagged",
         "repo_dir_available": bool(diff_info.get("repo_dir")),
@@ -1502,16 +1761,19 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
     if drop_n:
         print(f"[review] anti-fab verified: dropped {drop_n} fabricated finding(s), "
               f"flagged {flag_n}, kept {keep_n}", flush=True)
+    if conf_dropped or conf_warned:
+        print(f"[review] confidence: dropped {conf_dropped} objective-false / "
+              f"warned {conf_warned} speculative finding(s)", flush=True)
 
     # 关键: severity_counts 必须与【最终 kept_findings】一致,不能用批次聚合的 `total`。
-    # 否则阶段1/2 过滤(drop 掉某些 finding)之后,severity_counts 会残留被删 finding 的计数,
+    # 否则阶段1/2/1.5 过滤(drop 掉某些 finding)之后,severity_counts 会残留被删 finding 的计数,
     # 造成"卡片显示 0 critical / 但 summary 说 2 critical"的自相矛盾(ENG-32269 命中的 bug)。
     # 也顺带修掉"某批次走文本回退 _count_severities 造成的计数与结构化 findings 不一致"的旧问题。
     final_counts = _findings_counts(kept_findings)
 
-    # 若阶段1/2 真正删除了 finding(drop_n>0), 卡片文案也必须按 kept_findings 重建,
-    # 否则卡片仍显示被删的编造 finding。仅在确有 drop 时重建,避免每次多花一次渲染。
-    if drop_n > 0:
+    # 若阶段1/2/1.5 真正删除了 finding(drop_n>0 或 conf_dropped>0), 卡片文案必须按 kept_findings
+    # 重建,否则卡片仍显示被删的 finding。仅在确有 drop 时重建,避免每次多花一次渲染。
+    if drop_n > 0 or conf_dropped > 0:
         final_text = _build_markdown_from_findings(kept_findings, meta=agg_meta)
 
     return {
