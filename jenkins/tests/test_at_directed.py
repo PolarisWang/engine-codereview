@@ -1,0 +1,58 @@
+"""Regression tests for the @-gate fix: a thread reply is bot-directed ONLY when the
+'@' targets the bot or a command keyword — NOT when the user @-mentions another human.
+
+Bug: `_is_bot_directed` treated ANY text starting with '@' as bot-directed, so
+`@其他用户 …` (at a human) wrongly triggered a bot reply inside the review card's thread.
+"""
+import pytest
+from event_server import _is_bot_directed
+
+
+def test_at_other_user_not_directed():
+    """@ 一个人类用户(非 bot) → 不应触发 bot 回复(核心回归)."""
+    assert _is_bot_directed("@张三 你看下这个", []) is False
+    assert _is_bot_directed("@李四 能不能改一下", []) is False
+
+
+def test_at_command_keyword_directed():
+    assert _is_bot_directed("@优化", []) is True
+    assert _is_bot_directed("@改码", []) is True
+    assert _is_bot_directed("@指引 修复所有问题", []) is True
+    assert _is_bot_directed("@重新审查", []) is True
+
+
+def test_at_command_with_punctuation():
+    assert _is_bot_directed("@优化！", []) is True
+    assert _is_bot_directed("@改码，谢谢", []) is True
+
+
+def test_plain_text_not_directed():
+    # 无 @, 纯文字(即使落在 card 线程) → 不回复
+    assert _is_bot_directed("优化", []) is False
+    assert _is_bot_directed("这个逻辑有问题", []) is False
+
+
+def test_at_bot_by_open_id_directed(monkeypatch):
+    # mentions 里明确指向 bot(open_id) → 应触发(前提: 配置好 FEISHU_BOT_OPEN_ID)
+    monkeypatch.setattr("common.c_feishu_bot_open_id", lambda: "ou_bot_123")
+    mentions = [{"open_id": "ou_bot_123", "name": "代码审查机器人"}]
+    assert _is_bot_directed("@代码审查机器人 看看这个", mentions) is True
+
+
+def test_at_bot_by_name_directed(monkeypatch):
+    monkeypatch.setattr("common.c_feishu_bot_name", lambda: "代码审查机器人")
+    mentions = [{"open_id": "ou_xyz", "name": "代码审查机器人"}]
+    assert _is_bot_directed("@代码审查机器人 优化一下", mentions) is True
+
+
+def test_at_other_user_when_bot_identity_set(monkeypatch):
+    # 即使配置了 bot 身份, @ 别的用户也不应触发(mentions 里不是 bot)
+    monkeypatch.setattr("common.c_feishu_bot_open_id", lambda: "ou_bot_123")
+    mentions = [{"open_id": "ou_human_a", "name": "张三"}]
+    assert _is_bot_directed("@张三 你看这个", mentions) is False
+
+
+
+def test_empty_text_not_directed():
+    assert _is_bot_directed("", []) is False
+    assert _is_bot_directed(None, None) is False

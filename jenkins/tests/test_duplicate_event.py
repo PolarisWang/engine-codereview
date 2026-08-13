@@ -87,9 +87,12 @@ def test_route_ignores_reply_not_directed_at_bot(monkeypatch):
     _route("om_x2", "om_parent", "@优化", "ou_2", mentions=[])
     time.sleep(0.1)
     assert len(calls) == 1, "bot SHOULD reply to @-command"
-    # @机器人/any @-mention (Feishu renders both bot & other as @_user_N) -> handled.
-    # Feishu shows ANY @ as `@_user_N`, and in a card thread a leading '@' is the
-    # user addressing the bot, so we treat '@'-prefixed as directed.
-    _route("om_x3", "om_parent", "@机器人 收到消息了吗", "ou_3", mentions=[{"name": "机器人"}])
+    # @ + command keyword (uppercase MR / multi-word) -> handled (case-insensitive).
+    _route("om_x3", "om_parent", "@MR单 看下", "ou_3", mentions=[])
     time.sleep(0.1)
-    assert len(calls) == 2, "an @-mention should be handled (can't distinguish bot vs other by text)"
+    assert len(calls) == 2, "bot SHOULD reply to @MR单 (a @-command keyword)"
+
+    # @ other human (no command keyword, mentions not the bot) -> NOT directed.
+    _route("om_x4", "om_parent", "@张三 你看这个", "ou_4", mentions=[{"name": "张三"}])
+    time.sleep(0.1)
+    assert len(calls) == 2, "bot must NOT reply to @-mention of another human"

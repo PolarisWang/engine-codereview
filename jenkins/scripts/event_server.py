@@ -506,34 +506,88 @@ def _spawn_interact(topic_key, reply_text, reply_msg_id, sender_id):
     threading.Thread(target=_work, daemon=True).start()
 
 
+# 命令触发词(keyword)集合 —— 从 config.yaml commands: 单一事实源构建(缓存)。
+# 用于 @-gate: 用户 `@优化`/`@改码`/`@指引`… 视为 bot-directed; 而 `@其他用户 …` 不是。
+_COMMAND_WORDS = None
+
+
+def _command_words():
+    global _COMMAND_WORDS
+    if _COMMAND_WORDS is None:
+        _COMMAND_WORDS = set()
+        for _lst in (_config().get("commands") or {}).values():
+            if isinstance(_lst, list):
+                _COMMAND_WORDS.update(w.lower() for w in _lst if isinstance(w, str))
+        # 固定操作词(与 orchestrate._COMMAND_FIRST_WORDS 追加集对齐)
+        _COMMAND_WORDS |= {"确认", "补丁", "预览", "应用并提交", "确认提交", "push并建mr",
+                           "重新审查", "重审", "解释"}
+    return _COMMAND_WORDS
+
+
+# 边界字符: 命令词后面紧跟这些字符才视为"该命令词就是触发词"(避免 `@状态机` 误命中 `状态`)
+_CMD_BOUNDARY = ("，", "。", "！", "？", ",", "!", "?", "、", "；", ";", " ", "\t", "/", "　")
+
+
+def _token_matches_command(token, words):
+    """token 是否命中某个命令词(大小写不敏感)。整串相等, 或以某命令词为前缀且前缀后紧跟边界字符。"""
+    if not token:
+        return False
+    t = token.lower()
+    if t in words:
+        return True
+    for w in words:
+        wl = w.lower()
+        if len(wl) < len(t) and t.startswith(wl) and t[len(wl): len(wl) + 1] in _CMD_BOUNDARY:
+            return True
+    return False
+
+
 def _is_bot_directed(text, mentions):
     """True if a threaded reply is directed at the bot, so the bot only replies when
     addressed and stays silent when users chat among themselves.
 
-    Feishu renders ANY @-mention as an `@_user_N` placeholder in the message text (not
-    the bot's display name), so in a review-card thread a reply starting with '@' IS
-    the user addressing someone (usually the bot or `@优化`-style). To keep the common
-    `@机器人 …` case working while still ignoring plain non-@ small-talk, we treat a
-    leading '@' as bot-directed. We ALSO accept:
-      - '@' + a known command keyword (@优化/@MR单/@确认/...)
-      - mentions matching configured FEISHU_BOT_NAME / FEISHU_BOT_OPEN_ID
-      - text starting with the configured bot name
-    A reply with NO leading '@' (flat chat, no mention) is NOT handled (no reply)."""
-    lo = (text or "").strip().lower()
-    if lo.startswith("@"):
-        return True            # @-mention (Feishu shows any @ as @_user_N) -> directed
+    IMPORTANT (fix): BEFORE, ANY message starting with '@' was treated as bot-directed,
+    so `@其他用户 …`(at a human, not the bot) wrongly triggered a bot reply. We now
+    require the '@' to actually target the bot or a command keyword:
+      1) leading '@' token is a KNOWN COMMAND KEYWORD  (@优化/@改码/@确认/@指引/@深入/...)
+      2) `mentions` list contains the bot  (open_id == FEISHU_BOT_OPEN_ID, or
+         name == FEISHU_BOT_NAME) — works once bot identity is configured
+      3) text (after stripping a leading '@') starts with the configured bot name
+    A leading '@' followed by some other user's name (a human mention) is NOT
+    bot-directed → no reply.
+    """
+    import re as _re
+    s = (text or "").strip()
+    if not s:
+        return False
     bot_name = (common.c_feishu_bot_name() or "").strip().lstrip("@").lower()
     bot_open_id = (common.c_feishu_bot_open_id() or "").strip()
+
+    # 1) leading '@' + command keyword -> directed (@优化 / @改码 ...)
+    if s.startswith("@"):
+        m2 = _re.match(r"^@([^\s]+)", s)
+        token = m2.group(1) if m2 else ""
+        # 匹配策略: token 整体等于某命令词; 或 token 以某命令词开头且紧随其后的字符是边界
+        # (中文标点 / 空格 / 逗号等)。这样 `@优化!`、`@改码,谢谢` 命中, 而 `@状态机`
+        # 不会误命中 `状态`(下个字符是普通字「机」)。
+        if _token_matches_command(token, _command_words()):
+            return True
+
+    # 2) mentions 里明确指向 bot(需配置好 bot_open_id / bot_name)
     for m in (mentions or []):
-        name = (m.get("name") or "").lstrip("@").lower()
-        if bot_name and name == bot_name:
+        if bot_open_id and (m.get("open_id") or "") == bot_open_id:
             return True
-        if bot_open_id and (m.get("open_id") or "").lower() == bot_open_id.lower():
+        if bot_name and (m.get("name") or "").strip().lstrip("@").lower() == bot_name:
             return True
-    if bot_name and lo.lstrip("@").startswith(bot_name):
+
+    # 3) 文本以 bot 名开头(去掉一个前导 @)
+    body = s[1:].lstrip() if s.startswith("@") else s
+    if bot_name and body.lower().startswith(bot_name):
         return True
-    # a command keyword without '@' (e.g. plain "优化")? No — require @ (per user: no @ = no reply)
+
+    # 其余(例如 `@其他用户 …`,或既非命令词也非 @bot) -> 不 bot-directed,不回复
     return False
+
 
 
 def _route(msg_id, parent_id, text, sender_id="", mentions=None):
