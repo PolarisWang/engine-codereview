@@ -178,14 +178,17 @@ def test_unresolvable_file_flags_not_drop():
 # ── stage2: _verify_flags merge ────────────────────────────────────────
 def _flag_traces():
     return [
+        # #0: 所有代码式符号都缺失 -> 可复核, 复核判 drop 才删
         {'trace_ref': 0, 'loc_state': 'resolved', 'decision': 'flag',
          'symbol_check': [{'token': 'tryStartClimb', 'present_in_changed_files': False},
-                          {'token': 'move_end', 'present_in_changed_files': True}],
+                          {'token': 'startRainbow', 'present_in_changed_files': False}],
          'decision_reason': 'flagA',
          'original': {'file': 'a.cpp', 'severity': 'warning', 'issue': '用 tryStartClimb 改了 offset',
                       'suggestion': '确认', 'category': None}},
+        # #1: 混合(部分符号缺失) -> 不可复核, 绝不 drop(跨文件/拼接错符号的真实 finding 保护)
         {'trace_ref': 1, 'loc_state': 'resolved', 'decision': 'flag',
-         'symbol_check': [{'token': 'tickMoveStateTransition', 'present_in_changed_files': True}],
+         'symbol_check': [{'token': 'tickMoveStateTransition', 'present_in_changed_files': True},
+                          {'token': 'PowerShell', 'present_in_changed_files': False}],
          'decision_reason': 'flagB',
          'original': {'file': 'b.cpp', 'severity': 'warning', 'issue': 'tickMoveStateTransition 重复',
                       'suggestion': '抽共用', 'category': None}},
@@ -198,18 +201,31 @@ def _stub_verify(verdicts, err=None):
     return _f
 
 
-def test_verify_flags_drop_only_when_verdict_and_absent(tmp_path):
+def test_verify_flags_drop_only_when_all_absent_and_verdict(tmp_path):
+    """#0(全符号缺失) 复核 drop -> 删; #1(混合) 不在复核范围, 保留."""
     traces = _flag_traces()
     kept_whole = [{**t['original'], 'trace_ref': t['trace_ref']} for t in traces]
-    # stub: #1->drop (absent sym, confirm), #2->keep
     cr._call_verify_batch = _stub_verify(
         [{'index': 1, 'verdict': 'drop', 'reason': 'tryStartClimb 无出处'},
          {'index': 2, 'verdict': 'keep', 'reason': '真实改动'}])
     final, tr = cr._verify_flags(kept_whole, traces, {}, 'K', 'U', 'M', 100)
+    # 只有 trace_ref 0 被 drop; 混合的 #1 保留
     assert [f['trace_ref'] for f in final] == [1]
     assert tr[0]['decision'] == 'drop'
     assert tr[1]['decision'] == 'flag'
     assert tr[0]['verification']['verdict'] == 'drop'
+
+
+def test_verify_flags_never_drops_mixed_present_absent(tmp_path):
+    """回归(阶段2 any→all): 混合 finding(有真实符号 + 个别 absent 如 PowerShell) 绝不能被复核 drop."""
+    traces = _flag_traces()
+    kept_whole = [{**t['original'], 'trace_ref': t['trace_ref']} for t in traces]
+    # 即便复核返回 drop, 混合的 #1 也不可复核(不在 verifyable) -> 不删
+    cr._call_verify_batch = _stub_verify(
+        [{'index': 1, 'verdict': 'drop', 'reason': 'x'}, {'index': 2, 'verdict': 'drop', 'reason': 'y'}])
+    final, tr = cr._verify_flags(kept_whole, traces, {}, 'K', 'U', 'M', 100)
+    # #1(混合) 保留; 只有 #0(全缺) 可能被删, 这里 stub index1 对 #0
+    assert 1 in [f['trace_ref'] for f in final], "混合finding绝不能被删"
 
 
 def test_verify_flags_never_drops_without_absent_symbol(tmp_path):

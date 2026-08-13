@@ -150,3 +150,50 @@ def test_function_body_treats_call_site_as_not_definition(tmp_path):
     body = cr._function_body(content, "GetBlockSize")
     assert body is not None
     assert "CMP_SCOPE_SHARED_LOCK" in body      # 取的是定义体, 不是调用点所在函数
+
+
+# ── 阶段0.5: 垃圾文件客观冻结(keep/drop), 后续阶段不再误删/重判 ─────────
+def test_objective_marker_detects_garbage_fact(tmp_path):
+    """垃圾文件(fact) 在阶段0.5 被冻结为 keep, 后续 _apply_confidence 不重判/不删."""
+    import code_reviewer as cr
+    rd = _mk_repo(tmp_path, {})
+    findings = [{"file": "lockingDynamicTlsfAllocator.cpp(40",
+                 "severity": "critical", "issue": "此垃圾文件需 git rm 清理",
+                 "suggestion": "rm + ignore", "category": "quality"}]
+    marked = cr._mark_objective_findings(findings, rd)
+    assert marked[0].get("_objective") is True
+    assert marked[0]["confidence"] == "keep"
+    # 后续 _apply_confidence 不重判/不删客观冻结项
+    kept, notes = cr._apply_confidence(marked, {"repo_dir": rd, "changed_files": []})
+    assert [f["confidence"] for f in kept] == ["keep"]
+    assert len(notes["drop"]) == 0
+    assert len(kept) == 1
+
+
+def test_objective_marker_drops_garbage_fake_bug(tmp_path):
+    """垃圾文件上硬造代码 bug -> 阶段0.5 冻结为 drop, 被移除."""
+    import code_reviewer as cr
+    rd = _mk_repo(tmp_path, {})
+    findings = [{"file": "lockingDynamicTlsfAllocator.cpp(41",
+                 "severity": "critical", "issue": "此文件存在锁竞争死锁",
+                 "suggestion": "加锁", "category": "architecture"}]
+    marked = cr._mark_objective_findings(findings, rd)
+    assert marked[0]["confidence"] == "drop"
+    kept, notes = cr._apply_confidence(marked, {"repo_dir": rd, "changed_files": ["lockingDynamicTlsfAllocator.cpp(41"]})
+    assert len(kept) == 0
+    assert len(notes["drop"]) == 1
+
+
+def test_objective_skip_frozen_in_verify_flags(tmp_path):
+    """客观 keep 的 finding 即使带 absent 符号, 阶段2 也不复核/drop 它(冻结)."""
+    import code_reviewer as cr
+    traces = [{'trace_ref': 0, 'loc_state': 'resolved', 'decision': 'flag',
+               'symbol_check': [{'token': 'PowerShell', 'present_in_changed_files': False},
+                                {'token': 'x', 'present_in_changed_files': False}],
+               'decision_reason': 'flag', 'original': {'file': 'x.cpp(40', 'issue': '清理垃圾'}}]
+    kept = [{'trace_ref': 0, '_objective': True, 'confidence': 'keep', 'file': 'x.cpp(40'}]
+    called = []
+    cr._call_verify_batch = lambda *a, **k: called.append(1) or ([], None)
+    final, _ = cr._verify_flags(kept, traces, {}, 'K', 'U', 'M', 100)
+    assert called == []          # 冻结项不进复核
+    assert [f['trace_ref'] for f in final] == [0]

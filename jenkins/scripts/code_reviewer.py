@@ -1085,6 +1085,42 @@ def _A3_assertion_conflicts(txt, file, repo_dir):
 
 
 
+def _objective_verdict(f, repo_dir):
+    """A-1 垃圾文件客观判定。返回 (verdict, reason)；非垃圾文件 -> ('keep_nonobjective', '')。
+
+    - 指向真实误提交垃圾文件且 finding 在讲清理/删除 -> ('keep', …) 客观为真
+    - 指向垃圾文件却硬造代码 bug -> ('drop', …) 客观为假(无代码可审)
+    其余(非垃圾文件) -> ('keep_nonobjective', '') 交给后续阶段判定。
+    """
+    file = (f.get("file") or "").strip()
+    if not file:
+        return "keep_nonobjective", ""
+    content = _read_file_content(os.path.join(repo_dir, file)) if repo_dir else None
+    if not _looks_like_garbage(file, content):
+        return "keep_nonobjective", ""
+    txt = ((f.get("issue") or "") + " " + (f.get("suggestion") or "")).lower()
+    if any(k in txt for k in ("垃圾", "rm", "删除", "清理", "误提交", "garbage", "废")):
+        return "keep", "指向确定的误提交垃圾文件, 客观事实"
+    return "drop", "指向的 file 本身是误提交垃圾文件, 无有效代码可审"
+
+
+def _mark_objective_findings(findings, repo_dir):
+    """阶段0.5: 把所有 A-1 垃圾文件客观事实先定死(_objective=True), 冻结 keep/drop。
+
+    必须在阶段1 符号检查/阶段2 复核之前跑——否则垃圾文件事实(如 ref5)会因某个符号
+    (如 `PowerShell`) 不在变更集而在后续阶段被误 drop。冻结后后续阶段不再重判它。"""
+    out = []
+    for f in (findings or []):
+        verdict, reason = _objective_verdict(f, repo_dir)
+        if verdict in ("keep", "drop"):
+            f = dict(f)
+            f["_objective"] = True
+            f["confidence"] = verdict
+            f["_confidence_reason"] = reason
+        out.append(f)
+    return out
+
+
 def _classify_confidence(finding, changed_files, repo_dir):
     """对单条 finding 做结论可信度分层,返回 ('keep'|'drop'|'warn', reason)。
 
@@ -1097,15 +1133,11 @@ def _classify_confidence(finding, changed_files, repo_dir):
     txt = (f.get("issue") or "") + "\n" + (f.get("suggestion") or "")
     file = (f.get("file") or "").strip()
 
-    # A-1 垃圾文件: finding 明确指认垃圾文件本身 -> 客观为真 -> keep
+    # A-1 垃圾文件: 复用 _objective_verdict(已在阶段0.5 提前定死; 此处为兜底以防未提前标记)
     if file:
-        content = _read_file_content(os.path.join(repo_dir, file)) if repo_dir else None
-        if _looks_like_garbage(file, content):
-            low = txt.lower()
-            if any(k in low for k in ("垃圾", "rm", "删除", "清理", "误提交", "garbage", "废")):
-                return "keep", "指向确定的误提交垃圾文件, 客观事实"
-            # 否则(在垃圾文件上硬造别的 bug) -> drop(垃圾文件本无代码可审)
-            return "drop", "指向的 file 本身是误提交垃圾文件, 无有效代码可审"
+        ov, oreason = _objective_verdict(f, repo_dir)
+        if ov in ("keep", "drop"):
+            return ov, oreason
 
     # A-3 文本冲突: finding 硬断言"函数 X 无锁/未修改/删除了 foo", 但真实源码推翻它 -> 误报, drop
     if repo_dir and file:
@@ -1141,6 +1173,13 @@ def _apply_confidence(findings, diff_info):
     kept = []
     notes = {"drop": [], "warn": 0}
     for f in (findings or []):
+        # 已由阶段0.5 冻结的客观判定(垃圾文件 keep/drop) -> 不再重判; 照原样归置
+        if f.get("_objective"):
+            if f.get("confidence") == "drop":
+                notes["drop"].append(f)
+            else:
+                kept.append(f)
+            continue
         verdict, reason = _classify_confidence(f, changed_files, repo_dir)
         if verdict == "drop":
             f = dict(f)
@@ -1173,16 +1212,24 @@ def _verify_flags(kept_findings, traces, diff_info, api_key, base_url, model, ma
 
     返回 (final_findings, traces_updated)。任何复核异常都不抛, 回退为"全部保留"。
     """
-    # 选可复核的 flag: decision==flag 且 loc_state==resolved 且 symbol_check 里确有 absent
+    # 选可复核的 flag: decision==flag 且 loc_state==resolved 且【所有】代码式符号都不在变更集。
+    # （与阶段1 的 drop 口径一致: absent==len(code_tokens)。用 any() 太松——真实 finding 常引用
+    #  1-2 个跨文件/拼接错的符号, 其余都是真实代码, 任一 absent 就交复核/可能 drop 会误杀
+    #  如 `Uninitialize 未释放 m_slabInfos`、垃圾文件 等真实 finding。）
+    # 已由阶段0.5 冻结的 _objective finding(垃圾文件事实) 不交复核, 不被 drop。
+    objective_refs = {f.get("trace_ref") for f in (kept_findings or []) if f.get("_objective")}
     verifyable = []
     for t in traces:
         if t["decision"] != "flag":
             continue
         if t["loc_state"] != "resolved":
             continue
-        has_absent = any(not c.get("present_in_changed_files") for c in (t.get("symbol_check") or []))
-        if not has_absent:
-            continue
+        if t["trace_ref"] in objective_refs:
+            continue          # 客观事实(垃圾文件)不交给复核
+        checks = t.get("symbol_check") or []
+        code_absent = [c for c in checks if not c.get("present_in_changed_files")]
+        if not code_absent or len(code_absent) != len(checks) or not checks:
+            continue          # 只复核"全部符号都缺失"的疑似编造
         verifyable.append(t)
 
     if not verifyable:
@@ -1245,16 +1292,17 @@ def _verify_flags(kept_findings, traces, diff_info, api_key, base_url, model, ma
     drop_trace_refs = set()
     for i, t in enumerate(verifyable, start=1):
         vd = by_idx.get(i, "unknown")
-        has_absent = any(not c.get("present_in_changed_files")
-                         for c in (t.get("symbol_check") or []))
+        checks = t.get("symbol_check") or []
+        # 只有【全部】代码式符号都缺失(content+include+非宏三样)且复核也判 drop 才真正删除
+        code_absent = [c for c in checks if not c.get("present_in_changed_files")]
+        all_absent = (checks and len(code_absent) == len(checks))
         reason = ""
         for v in verdicts:
             if str(v.get("index")) == str(i):
                 reason = v.get("reason") or ""
                 break
         t["verification"] = {"verdict": vd, "reason": reason}
-        # 关键: 只有"复核 drop 且 B 已标记存在 absent 符号" 才真正从 findings 移除
-        if vd == "drop" and has_absent:
+        if vd == "drop" and all_absent:
             drop_trace_refs.add(t["trace_ref"])
 
     final = [f for f in kept_findings if f.get("trace_ref") not in drop_trace_refs]
@@ -1705,6 +1753,13 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
     # 跨批次聚合: 用全部 findings + 聚合的 summary/strengths 重新渲染成完整 skill 模板,
     # 而非各批 "第 N/M 部分" 拼接(那会丢失聚合 meta 且 render 不完整)。
     final_text = _build_markdown_from_findings(all_findings, meta=agg_meta)
+
+    # 阶段0.5: 垃圾文件客观事实(keep/drop 冻结) 提前定死, 必须在阶段1/2 之前——
+    # 否则 ref5(垃圾文件)会因某符号(如 PowerShell)不在变更集而被后续阶段误 drop。
+    try:
+        all_findings = _mark_objective_findings(all_findings, diff_info.get("repo_dir") if diff_info else None)
+    except Exception as e:
+        print(f"[review] objective-marker skipped: {e}", flush=True)
 
     # 反编造 · 结构化防误杀(阶段0/1): 对全量 findings 做确定性校验,产出 keep/flag/drop
     # + 完整审计痕迹(verification.vault)。原始审查文本随 trace 保留,drop 的 finding 不进
