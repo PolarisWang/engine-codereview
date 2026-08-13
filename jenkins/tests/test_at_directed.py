@@ -87,3 +87,25 @@ def test_at_mention_that_is_bot_identity_directed(monkeypatch):
     mentions = [{"open_id": "ou_human", "name": "张三"},
                 {"open_id": "ou_bot_1", "name": "Chaos Code Review"}]
     assert _is_bot_directed("@张三 顺便 @下机器人", mentions) is True
+
+
+# ── regression: @-gate 命令词须含权威注册表(重新review / review) ─────────
+def test_at_command_words_include_review_words(monkeypatch):
+    """orchestrate._COMMAND_FIRST_WORDS 里有 review/重新review, @-gate 必须认 ——
+    否则 '@机器人重新review' 会被当成非 bot-directed 忽略(曾发生, MS-30918 群)."""
+    import event_server as es
+    es._COMMAND_WORDS = None
+    w = es._command_words()
+    assert "review" in w
+    assert "重新review" in w
+    assert "重新审查" in w
+
+
+def test_at_review_command_directed(monkeypatch):
+    import event_server as es
+    es._COMMAND_WORDS = None
+    # 用户 @机器人 重新review（Feishu 渲染成 @_user_1 重新review）
+    assert es._is_bot_directed("@_user_1 重新review", []) is True
+    assert es._is_bot_directed("@_user_1 review", []) is True
+    # 但 @某人类 + 非命令闲聊 仍不触发
+    assert es._is_bot_directed("@_user_1 你看下这个", []) is False

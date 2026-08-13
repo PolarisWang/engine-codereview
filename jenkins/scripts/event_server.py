@@ -516,6 +516,7 @@ def _command_words():
     if _COMMAND_WORDS is None:
         _COMMAND_WORDS = set()
         import re as _re
+        # ① config.yaml commands: 的单一事实源
         for _v in (_config().get("commands") or {}).values():
             if isinstance(_v, list):
                 _COMMAND_WORDS.update(w.lower() for w in _v if isinstance(w, str))
@@ -524,9 +525,18 @@ def _command_words():
                 # (如 '["优化", "自动优化"]') 而非真正 list —— 从这里把命令词拆出来。
                 _COMMAND_WORDS.update(t.lower() for t in _re.findall(r'"([^"]+)"', _v))
                 _COMMAND_WORDS.update(t.lower() for t in _re.findall(r"'([^']+)'", _v))
-        # 固定操作词(与 orchestrate._COMMAND_FIRST_WORDS 追加集对齐, 纯命令/编号不依赖列表解析)
-        _COMMAND_WORDS |= {"确认", "补丁", "预览", "应用并提交", "确认提交", "push并建mr",
-                           "重新审查", "重审", "解释", "1", "2", "3", "4"}
+        # ② 权威注册表: orchestrate._COMMAND_FIRST_WORDS（@command(...) 的完整命令词集）。
+        #    避免手维护子集与主管线漂移(曾漏掉 review/重新review -> @机器人重新review 被 @-gate 忽略)。
+        try:
+            import orchestrate as _orch
+            if hasattr(_orch, "_COMMAND_FIRST_WORDS"):
+                for w in _orch._COMMAND_FIRST_WORDS:
+                    if isinstance(w, str):
+                        _COMMAND_WORDS.add(w.lower())
+        except Exception as _e:
+            # orchestrate 不可导入(如测试环境)时退回手维护兜底, 不阻断
+            _COMMAND_WORDS |= {"确认", "补丁", "预览", "应用并提交", "确认提交", "push并建mr",
+                               "重新审查", "重审", "review", "重新review", "解释", "1", "2", "3", "4"}
     return _COMMAND_WORDS
 
 
