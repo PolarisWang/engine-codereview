@@ -160,6 +160,34 @@ def _alert_if_exhausted(state_file, topic, app_id="", app_secret=""):
 
 # ── the pipeline ────────────────────────────────────────────────────────────
 
+def _apply_repo_override(engine_repo, game_repo, mr_url):
+    """Given the project's configured engine_repo / game_repo and a GitLab MR URL,
+    return (engine_repo, game_repo) with the mr_url-based repo override applied.
+
+    只覆盖 ENGINE repo：当 MR 挂在与项目 engine_repo 不同的项目时（例 ENG-30314：
+    MR 在 chaos-cb-2 但 config 的 ENG.engine_repo=chaos.git），把 engine_repo 改为 MR
+    所在仓库，否则引擎 review 会去错误的仓库找分支 -> 空diff -> "无改动"。
+
+    GAME repo 绝不能被 mr_url 覆盖（方案A）：否则一个纯引擎 MR（如 CB2N-27312，MR 在
+    chaos-cb-2、分支是 mempool 引擎改动、游戏仓库根本不存在该分支）会把 game_repo 也
+    改成引擎仓库，导致"游戏 review 复用引擎 diff、冒充游戏 review"。游戏 review 必须走
+    真实游戏仓库——分支/改动不存在时 code_reviewer 置 branch_exists=False，_record_repo_state
+    记为 SKIPPED（无游戏改动）。
+    """
+    if not (mr_url and "merge_requests" in mr_url):
+        return engine_repo, game_repo
+    import jira_parser as _jp2
+    _mr_pp, _ = _jp2.parse_gitlab_mr_url(mr_url)
+    if not _mr_pp:
+        return engine_repo, game_repo
+    _mr_repo = f"git@gitlab.booming-inc.com:{_mr_pp}.git"
+    if not _jp2.repo_matches_mr_url(engine_repo, mr_url):
+        print(f"[orchestrate] MR repo ({_mr_pp}) != engine_repo; overriding engine_repo -> {_mr_repo}", flush=True)
+        engine_repo = _mr_repo
+    # game_repo 保持配置的真实游戏仓库；不因 MR 覆盖。
+    return engine_repo, game_repo
+
+
 def run(args):
     key = args.key
     mode = args.mode
@@ -321,20 +349,9 @@ def run(args):
     mr_url = info.get("mr_url", "") or ""
     mr_state = (mr_info or {}).get("state", "") or ""
     # 当有 MR URL 时，MR 所在仓库才是 review 实际要 clone 的（而非项目配置的 engine_repo/
-    # game_repo）。例如 ENG-30314 的 MR 建在 chaos-cb-2 上，但 config 里 ENG.engine_repo=chaos.git
-    # → bot 去 chaos.git 找分支 → 不存在 → 空diff → "无改动"。修复：从 mr_url 解析出真实仓库
-    # URL，覆盖不匹配的项目配置仓库。
-    if mr_url and "merge_requests" in mr_url:
-        import jira_parser as _jp2
-        _mr_pp, _ = _jp2.parse_gitlab_mr_url(mr_url)
-        if _mr_pp:
-            _mr_repo = f"git@gitlab.booming-inc.com:{_mr_pp}.git"
-            if not _jp2.repo_matches_mr_url(engine_repo, mr_url):
-                print(f"[orchestrate] MR repo ({_mr_pp}) != engine_repo; overriding engine_repo -> {_mr_repo}", flush=True)
-                engine_repo = _mr_repo
-            if not _jp2.repo_matches_mr_url(game_repo, mr_url):
-                print(f"[orchestrate] MR repo ({_mr_pp}) != game_repo; overriding game_repo -> {_mr_repo}", flush=True)
-                game_repo = _mr_repo
+    # game_repo）。只覆盖 ENGINE repo（见 _apply_repo_override / 方案A）；game_repo 保持配置的
+    # 真实游戏仓库，避免纯引擎 MR 把游戏 review 带成"复用引擎 diff 的假游戏 review"。
+    engine_repo, game_repo = _apply_repo_override(engine_repo, game_repo, mr_url)
     # arch: when an MR URL is known, the review branch MUST be the MR's real
     # source_branch (authoritative). The jira-guessed branch (bare issue name) is
     # unreliable and yields an empty diff (da39a3ee) when the real branch is
