@@ -56,3 +56,34 @@ def test_at_other_user_when_bot_identity_set(monkeypatch):
 def test_empty_text_not_directed():
     assert _is_bot_directed("", []) is False
     assert _is_bot_directed(None, None) is False
+
+
+# ── fix 1+2: command can be non-first token after an @mention prefix ──
+def test_at_mention_then_command_directed():
+    """核心回归(真实日志): `@_user_1 3 没有问题…`(Feishu 把 @ 渲染成 @_user_1, 命令 3 在第二位)
+    必须视为 bot-directed. 此前被错当成 '非bot' 忽略."""
+    assert _is_bot_directed("@_user_1 3 没有问题，lua脚本里面的字段名不轻易更改", [{
+        "open_id": "ou_zzz"}, {"open_id": "ou_1a4385da2771c92b5c05e8c08afe3b47"}]) is True
+    # mentions 里没有 bot 也行, 只要命令词出现在前导 @ 之后
+    assert _is_bot_directed("@_user_1 优化", []) is True
+    assert _is_bot_directed("@_user_1 @_user_2 改码 这个文件", []) is True
+
+
+def test_at_mention_then_casual_text_not_directed():
+    """@ 一个人类 + 非命令闲聊 -> 仍不回复(不能误触发)."""
+    assert _is_bot_directed("@_user_1 你看下这个", []) is False
+    assert _is_bot_directed("@张三 能不能改一下", []) is False
+
+
+def test_plain_command_no_at_not_directed():
+    """纯文本命令(无 @)仍不触发 —— 保留原有'无@不回复'语义, 避免闲聊词误触发."""
+    assert _is_bot_directed("3 没有问题", []) is False
+    assert _is_bot_directed("优化", []) is False
+
+
+def test_at_mention_that_is_bot_identity_directed(monkeypatch):
+    """① mentions 里任一 open_id 是 bot -> directed(不要求是首个 mention)."""
+    monkeypatch.setattr("common.c_feishu_bot_open_id", lambda: "ou_bot_1")
+    mentions = [{"open_id": "ou_human", "name": "张三"},
+                {"open_id": "ou_bot_1", "name": "Chaos Code Review"}]
+    assert _is_bot_directed("@张三 顺便 @下机器人", mentions) is True
