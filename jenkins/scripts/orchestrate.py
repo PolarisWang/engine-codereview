@@ -320,6 +320,21 @@ def run(args):
     game_repo = info.get("game_repo", "")
     mr_url = info.get("mr_url", "") or ""
     mr_state = (mr_info or {}).get("state", "") or ""
+    # 当有 MR URL 时，MR 所在仓库才是 review 实际要 clone 的（而非项目配置的 engine_repo/
+    # game_repo）。例如 ENG-30314 的 MR 建在 chaos-cb-2 上，但 config 里 ENG.engine_repo=chaos.git
+    # → bot 去 chaos.git 找分支 → 不存在 → 空diff → "无改动"。修复：从 mr_url 解析出真实仓库
+    # URL，覆盖不匹配的项目配置仓库。
+    if mr_url and "merge_requests" in mr_url:
+        import jira_parser as _jp2
+        _mr_pp, _ = _jp2.parse_gitlab_mr_url(mr_url)
+        if _mr_pp:
+            _mr_repo = f"git@gitlab.booming-inc.com:{_mr_pp}.git"
+            if not _jp2.repo_matches_mr_url(engine_repo, mr_url):
+                print(f"[orchestrate] MR repo ({_mr_pp}) != engine_repo; overriding engine_repo -> {_mr_repo}", flush=True)
+                engine_repo = _mr_repo
+            if not _jp2.repo_matches_mr_url(game_repo, mr_url):
+                print(f"[orchestrate] MR repo ({_mr_pp}) != game_repo; overriding game_repo -> {_mr_repo}", flush=True)
+                game_repo = _mr_repo
     # arch: when an MR URL is known, the review branch MUST be the MR's real
     # source_branch (authoritative). The jira-guessed branch (bare issue name) is
     # unreliable and yields an empty diff (da39a3ee) when the real branch is
