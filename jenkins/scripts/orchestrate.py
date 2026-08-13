@@ -188,6 +188,34 @@ def _apply_repo_override(engine_repo, game_repo, mr_url):
     return engine_repo, game_repo
 
 
+def _send_review_segments(reply_msg_id, segs, app_id, app_secret, chat_id, key, issue_key, project):
+    """把 review 结果写到群里的第一张卡, 处理多段(超长>45000字符)的情况。
+
+    方案A(修复 old bug): update-reply 把整张卡 PATCH 覆盖; 旧代码对每段依次 update-reply,
+    导致多段时每段各自覆盖、第一张卡只剩最后一段、前面的 review 全丢。
+    现改为:
+      - 首段(Seg0)用 update-reply 覆盖进度卡成 review 头部/完整结果(普通 review 只有 1 段 -> 单次, 不变)
+      - 后续段(Seg1..)用 reply-message 追加新消息(不覆盖, 完整保留)
+    返回 rc_all(0=全成功; 非0=有失败, 调用方据此记 FAILED 并 return 1)。
+    """
+    rc_all = 0
+    if segs:
+        rc, _, err = _run_py("feishu_notifier.py", [
+            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
+            "--message-id", reply_msg_id, "--message-base64", _b64_str(segs[0])])
+        if rc != 0:
+            rc_all = rc
+            _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'update reply failed: {err}')
+    for seg in segs[1:]:
+        rc, _, err = _run_py("feishu_notifier.py", [
+            "reply-message", "--app-id", app_id, "--app-secret", app_secret,
+            "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(seg)])
+        if rc != 0:
+            rc_all = rc
+            _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'append reply failed: {err}')
+    return rc_all
+
+
 def run(args):
     key = args.key
     mode = args.mode
@@ -430,14 +458,13 @@ def run(args):
     if reply_msg_id:
         # 方案D: 用 update-reply 把进度卡(reply_msg_id)刷新成最终 review 结果(不另发),
         # 这样 thread 里只有 1 条 review 结果卡(由进度卡演进), 不再出现"两条 review 结果"。
-        rc_all = 0
-        for seg in segs:
-            rc, _, err = _run_py("feishu_notifier.py", [
-                "update-reply", "--app-id", app_id, "--app-secret", app_secret,
-                "--message-id", reply_msg_id, "--message-base64", _b64_str(seg)])
-            if rc != 0:
-                rc_all = rc
-                _log('NOTIFY', 'FAILED', key, issue_key, project, '', f'update reply failed: {err}')
+        #
+        # 方案A(修复): update-reply 是把整张卡 PATCH 覆盖。旧代码对每段依次 update-reply,
+        # 导致超长 review(>45000字符, 分段)时每段各自覆盖, 第一张卡只剩最后一段、前面的
+        # review 全丢。现改为: 首段 update-reply(卡=review 头部), 后续段用 reply-message
+        # 追加新消息(不覆盖, 完整保留)。普通 review 只有 1 段 → 仍单次 update-reply 不变。
+        rc_all = _send_review_segments(
+            reply_msg_id, segs, app_id, app_secret, chat_id, key, issue_key, project)
         # 交互指引卡: review 结果后单独发一张, 教用户下一步(重点是 `优化` 自动改码+提MR)。
         if rc_all == 0:
             _run_py("feishu_notifier.py", [
