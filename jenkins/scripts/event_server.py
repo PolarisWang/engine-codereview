@@ -515,12 +515,18 @@ def _command_words():
     global _COMMAND_WORDS
     if _COMMAND_WORDS is None:
         _COMMAND_WORDS = set()
-        for _lst in (_config().get("commands") or {}).values():
-            if isinstance(_lst, list):
-                _COMMAND_WORDS.update(w.lower() for w in _lst if isinstance(w, str))
-        # 固定操作词(与 orchestrate._COMMAND_FIRST_WORDS 追加集对齐)
+        import re as _re
+        for _v in (_config().get("commands") or {}).values():
+            if isinstance(_v, list):
+                _COMMAND_WORDS.update(w.lower() for w in _v if isinstance(w, str))
+            elif isinstance(_v, str):
+                # PyYAML 缺失时 config.yaml 的 minimal 解析器把 list 项解析成一个字符串
+                # (如 '["优化", "自动优化"]') 而非真正 list —— 从这里把命令词拆出来。
+                _COMMAND_WORDS.update(t.lower() for t in _re.findall(r'"([^"]+)"', _v))
+                _COMMAND_WORDS.update(t.lower() for t in _re.findall(r"'([^']+)'", _v))
+        # 固定操作词(与 orchestrate._COMMAND_FIRST_WORDS 追加集对齐, 纯命令/编号不依赖列表解析)
         _COMMAND_WORDS |= {"确认", "补丁", "预览", "应用并提交", "确认提交", "push并建mr",
-                           "重新审查", "重审", "解释"}
+                           "重新审查", "重审", "解释", "1", "2", "3", "4"}
     return _COMMAND_WORDS
 
 
