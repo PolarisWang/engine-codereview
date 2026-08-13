@@ -1503,10 +1503,21 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
         print(f"[review] anti-fab verified: dropped {drop_n} fabricated finding(s), "
               f"flagged {flag_n}, kept {keep_n}", flush=True)
 
+    # 关键: severity_counts 必须与【最终 kept_findings】一致,不能用批次聚合的 `total`。
+    # 否则阶段1/2 过滤(drop 掉某些 finding)之后,severity_counts 会残留被删 finding 的计数,
+    # 造成"卡片显示 0 critical / 但 summary 说 2 critical"的自相矛盾(ENG-32269 命中的 bug)。
+    # 也顺带修掉"某批次走文本回退 _count_severities 造成的计数与结构化 findings 不一致"的旧问题。
+    final_counts = _findings_counts(kept_findings)
+
+    # 若阶段1/2 真正删除了 finding(drop_n>0), 卡片文案也必须按 kept_findings 重建,
+    # 否则卡片仍显示被删的编造 finding。仅在确有 drop 时重建,避免每次多花一次渲染。
+    if drop_n > 0:
+        final_text = _build_markdown_from_findings(kept_findings, meta=agg_meta)
+
     return {
         "summary": agg_meta.get("summary", ""),
         "review_text": final_text,
-        "severity_counts": total,
+        "severity_counts": final_counts,
         "findings": kept_findings,
         "error": first_error,   # non-None if at least one batch failed (partial results)
         "batches": num_batches,

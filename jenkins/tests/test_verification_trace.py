@@ -268,3 +268,30 @@ def test_verify_block_shape_present_when_call_ok():
     v = sample["review"]["verification"]
     assert set(v.keys()) >= {"vault", "counts", "dropped_decision", "repo_dir_available", "stage2_verify"}
     assert v["counts"]["dropped"] == 0
+
+
+# ── severity reconciliation after filtering ────────────────────────────
+def test_severity_counts_reconciled_to_kept_findings(tmp_path):
+    """修复 ENG-32269 类 bug: loss aggregation的 severity_counts 在过滤后必须重算自 kept_findings,
+    否则会出现"卡片显示 0 critical / 但 severity_counts.critical=已删除fabricated"的矛盾。"""
+    # 构造一个过滤前后 severity 不一致的场景: 原始 findings 含一个 fabricated critical(将被 drop),
+    # 修复后 severity_counts 必须只反映 kept(真实) findings。
+    repo = _make_repo(tmp_path, {
+        "_source/engine/mod/motor.cpp": "int getMoveEndOffsetParameter() { return 0; }\n",
+    })
+    cf = ["M\t_source/engine/mod/motor.cpp"]
+    findings = [
+        {"file": "motor.cpp", "severity": "critical",   # 编造: tryStartClimb 不存在
+         "issue": "在 `tryStartClimb` 里删除了提前返回, 应确认", "suggestion": "改"},
+        {"file": "motor.cpp", "severity": "warning",
+         "issue": "getMoveEndOffsetParameter 曲线捕获不一致", "suggestion": "抽共用"},
+    ]
+    diff_info = {"repo_dir": str(repo), "base_branch": "master",
+                 "branch": "br", "changed_files": cf}
+    kept, traces = cr._post_validate_findings(findings, diff_info)
+    # fabricated critical 被 drop(唯一 code-ish token 是 tryStartClimb)
+    assert [t["decision"] for t in traces] == ["drop", "keep"]
+    # 修复: severity_counts 按 kept 重算 → critical 应为 0, 只剩 1 个 warning
+    final_counts = cr._findings_counts(kept)
+    assert final_counts == {"critical": 0, "warning": 1, "suggestion": 0}, final_counts
+    assert len(kept) == 1
