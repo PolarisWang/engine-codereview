@@ -412,9 +412,15 @@ def run(args):
     if rev_texts:
         full_text = "\n\n".join(rev_texts)
     else:
+        # 把 MR state 注入 result, 供 _empty_review_reason 的 C 判据(已合并优先)使用
+        _eng_for_render = dict(eng_res or {})
+        _gam_for_render = dict(gam_res or {})
+        if mr_state:
+            _eng_for_render["mr_state"] = mr_state
+            _gam_for_render["mr_state"] = mr_state
         chunks = feishu_notifier.render_full_findings_text(
             issue_key, project, review_branch, base_branch, jira_url, mr_url,
-            eng_res or {}, gam_res or {},
+            _eng_for_render, _gam_for_render,
         )
         full_text = "\n\n".join(c for c in chunks if c).rstrip()
     # 全量 review 单条普通消息发出(≤45000字符); 超大才拆第二段。

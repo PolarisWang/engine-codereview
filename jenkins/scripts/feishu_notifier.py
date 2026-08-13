@@ -394,6 +394,66 @@ def _concise_findings(result, limit=4):
     return out
 
 
+def _empty_review_reason(engine_result, game_result):
+    """当 engine+game 都没有 findings 时, 判定"为什么没有可审内容"并给出人话提示。
+
+    C(优先): MR 已合并(merged) -> 直接报"已合并, 相对 base 无新增改动", 不再看其它判据
+             (避免与分支已删导致 branch_exists=False 冲突 —— GitLab merge 后常删源分支)。
+    A(兜底, 逐仓库): branch_missing / branch_merged / no_diff / error, 否则 clean。
+    合并时去重: 多仓库同因只写一遍; 只要有一个仓库 clean 且其它都无真实问题, 才说"未发现问题"。
+    返回用于空 findings 时的提示文本(可能多条, 用 \n 连接)。
+    """
+    def _mr_state(res):
+        return ((res or {}).get("mr_state") or "").strip().lower()
+
+    # C 优先: 任一仓库 MR 已合并
+    merged_bases = [res.get("base_branch") or "base" for res in (engine_result, game_result)
+                    if res and _mr_state(res) == "merged"]
+    if merged_bases:
+        base = merged_bases[0]
+        return (f"🚫 该分支的 MR 已合并进 `{base}`，相对该 base 没有新增改动，"
+                f"因此本次未产生 findings。如需审该段代码，请直接审 `{base}` 上当前实现。")
+
+    # A 兜底: 逐仓库归因
+    reasons = []
+    for label, res in (("引擎", engine_result), ("游戏", game_result)):
+        if not res:
+            reasons.append(f"{label}: 无 review 结果")
+            continue
+        r = res.get("review") or {}
+        if res.get("branch_exists") is False:
+            reasons.append(f"{label}：分支 `{res.get('branch')}` 在仓库中不存在(可能已删除/未推送)")
+        elif res.get("branch_merged"):
+            reasons.append(f"{label}：分支已合并到 `{res.get('base_branch')}`，无新改动")
+        elif not (res.get("changed_files") or []):
+            reasons.append(f"{label}：相对 `{res.get('base_branch')}` 无代码变更(改动可能已合并/分支无新提交)")
+        elif r.get("error"):
+            reasons.append(f"{label}：review 出错 — {r.get('error')}")
+        # 否则 = clean(无 findings 且无上述异常)
+
+    # 若两个仓库都是 clean → 真干净
+    clean = all(
+        res and res.get("review") and res.get("branch_exists") is not False
+        and not res.get("branch_merged")
+        and (res.get("changed_files") or [])
+        and not (res.get("review") or {}).get("error")
+        for res in (engine_result, game_result)
+    )
+    if clean:
+        return "✅ 未发现需要处理的代码问题。"
+    # 去重(按"去掉仓库前缀后的原因文本"), 同一原因多仓库只写一遍
+    seen = set()
+    compact = []
+    for line in reasons:
+        reason_tail = line.split("：", 1)[-1] if "：" in line else line
+        if reason_tail in seen:
+            continue
+        seen.add(reason_tail)
+        compact.append(line)
+    tip = "🚫 无可审内容，原因：\n" + "\n".join(compact) if compact else ""
+    return tip or "✅ 未发现需要处理的代码问题。"
+
+
 def build_summary_text(issue_key, project, review_branch, base_branch, jira_url, mr_url,
                        engine_result, game_result):
     """
@@ -433,7 +493,8 @@ def build_summary_text(issue_key, project, review_branch, base_branch, jira_url,
     if uniq:
         summary += "**关键发现：**\n" + "\n".join(uniq[:5]) + "\n\n"
     else:
-        summary += "✅ 未发现需要处理的代码问题。\n\n"
+        # 空 findings: 归因"为什么没可审内容"(已合并/分支缺失/无diff/出错/真干净)
+        summary += _empty_review_reason(engine_result, game_result) + "\n\n"
 
     if jira_url:
         summary += f"📎 {jira_url}"
@@ -504,7 +565,7 @@ def render_full_findings_text(issue_key, project, review_branch, base_branch, ji
         chunks.append(body)
     # 去掉空结论
     if not allf:
-        chunks[0] += "\n✅ 未发现需要处理的代码问题。"
+        chunks[0] += "\n" + _empty_review_reason(engine_result, game_result)
     return chunks
 
 
