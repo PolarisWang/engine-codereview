@@ -215,6 +215,79 @@ REVIEW_TOOLS = [{
 }]
 
 
+# ── 阶段2: 独立复核(自检回环)工具 ───────────────────────────────────────
+# 对 B 判定为 flag(存疑)的 finding, 用**另一个独立 LLM session**(同默认模型)做抗
+# 附和复核, 输出 verdicts。只有 B 的 symbol_check 已表明"符号在变更集不存在"且复核
+# 也判 drop 时才真正删除——否则 keep/unknown(保留 + 打标)。绝不让复核成为新的误杀源。
+VERIFY_TOOLS = [{
+    "name": "verdicts",
+    "description": (
+        "Return a verdict for each flagged finding. Each finding has a trace index. "
+        "Decide independently whether, based ONLY on the given evidence, the finding "
+        "references a real code change. Default to 'unknown' unless clearly justified."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer", "description": "1-based index into the given list."},
+                        "verdict": {"type": "string",
+                                    "enum": ["keep", "drop", "unknown"],
+                                    "description": ("keep=real finding, keep it; drop=clearly fabricated, "
+                                                    "referenced symbol does not exist; "
+                                                    "unknown=cannot decide, keep but mark.")},
+                        "reason": {"type": "string", "description": "one sentence, Chinese"},
+                    },
+                    "required": ["index", "verdict"],
+                }
+            }
+        },
+        "required": ["verdicts"]
+    },
+}]
+
+
+def _call_verify_batch(system_prompt, user_prompt, api_key, base_url, model, max_output_tokens):
+    """独立复核调用: 用 VERIFY_TOOLS 工具壳, 返回 (verdicts_list, error)。
+
+    verdicts_list: list[dict{index, verdict, reason}] 或 None(工具块缺失/失败)。
+    mirrors _call_llm_batch 的 HTTP 结构与超时/重试。
+    """
+    body = {
+        "model": model,
+        "max_tokens": max_output_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+        "tools": VERIFY_TOOLS,
+        "tool_choice": {"type": "any"},
+    }
+    payload = json.dumps(body).encode("utf-8")
+    result = http_request(
+        "POST", f"{base_url}/v1/messages",
+        raw_body=payload.decode("utf-8"),
+        headers={"Content-Type": "application/json", "x-api-key": api_key,
+                 "anthropic-version": "2023-06-01"},
+        timeout=180, retries=3, backoff=2.0,
+    )
+    if result is None:
+        return None, "LLM API request failed after retries"
+    verdicts = None
+    try:
+        for b in (result.get("content") or []):
+            if b.get("type") == "tool_use" and b.get("name") == "verdicts":
+                inp = b.get("input") or {}
+                if isinstance(inp.get("verdicts"), list):
+                    verdicts = inp["verdicts"]
+    except Exception:
+        return None, "parse error"
+    return verdicts, None
+
+
+
 def run_git(cmd, cwd, timeout=600):
     """Run a git command, return (returncode, stdout, stderr)."""
     result = subprocess.run(
@@ -556,6 +629,416 @@ def _group_into_batches(blocks, max_batch_chars):
     if cur:
         batches.append("\n".join(cur))
     return batches
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 反编造 · 结构化防误杀审计 (阶段0/1)
+# 目标: B 用确定性手段(pygments 词法 + checkout 真实 git diff)对每条 finding
+#       校验 file 定位与符号真实性,产出 keep/flag/drop 三态 + 完整审计痕迹
+#       (verification.vault),原始审查文本永不丢失,便于日后查误杀原因。
+# 原则: 宁可 flag(保留打角标/复核),不可误删真实 finding。
+# ──────────────────────────────────────────────────────────────────────────
+
+def _strip_diff_prefix(leaf_or_path):
+    """去掉 git diff 头的 'a/' / 'b/' 前缀,便于用 diff 里的返回路径匹配 finding.
+    e.g. 'a/_source/foo.cpp' -> '_source/foo.cpp'"""
+    if "/" in leaf_or_path:
+        head, rest = leaf_or_path.split("/", 1)
+        if head in ("a", "b"):
+            return rest
+    return leaf_or_path
+
+
+def _locate_finding_file(raw_file, changed_files):
+    """把 finding 的 file 定位为唯一完整相对路径。
+
+    Returns (path, status):
+      status ∈ {resolved, ambiguous, not_found, empty}
+    - raw_file 是空 → empty
+    - raw_file 完整且唯一命中 changed_files → resolved
+    - 否则按 basename 在 changed_files 里找(去 a/ b/ 前缀):
+        唯一 → resolved; 多个(client/server 同名)→ ambiguous; 0 → not_found
+    """
+    if not raw_file or not raw_file.strip():
+        return "", "empty"
+    raw = raw_file.strip()
+    # 先建 leaf→[fullpaths] 映射
+    leaf_map = {}
+    for cf in changed_files or []:
+        path = _strip_diff_prefix((cf.split("\t", 1)[-1] if "\t" in cf else cf).strip())
+        leaf_map.setdefault(os.path.basename(path), []).append(path)
+
+    # 1) 完整路径唯一命中
+    if raw in leaf_map and len(leaf_map[os.path.basename(raw)]) == 1:
+        return raw, "resolved"
+    # 2) 带 a/ b/ 前缀的完整路径
+    stripped = _strip_diff_prefix(raw)
+    if stripped in leaf_map and len(leaf_map[os.path.basename(stripped)]) == 1:
+        return stripped, "resolved"
+    # 3) basename 唯一命中
+    cands = leaf_map.get(os.path.basename(raw), [])
+    if len(cands) == 1:
+        return cands[0], "resolved"
+    if len(cands) > 1:
+        return "", "ambiguous"
+    return "", "not_found"
+
+
+def _normalize_findings_files(findings, changed_files):
+    """统一 finding.file 为唯一完整相对路径。
+
+    Returns (findings, trace_refs).
+    - 每条 finding 写入 finding["file"] 为完整路径(若 resolved),并在 finding["trace_ref"] 记录稳定下标。
+    - 非 resolved(empty/ambiguous/not_found)置 finding["_loc_state"],**不 drop**,交阶段1 flag。
+    """
+    out = []
+    trace_refs = []
+    for idx, f in enumerate(findings or []):
+        raw = f.get("file") or ""
+        path, status = _locate_finding_file(raw, changed_files)
+        f = dict(f)                      # 浅拷贝,避免污染调度缓存
+        f["trace_ref"] = idx             # 稳定下标(本次诊断会话内)
+        if status == "resolved":
+            f["file"] = path
+        else:
+            f["_loc_state"] = status     # empty/ambiguous/not_found
+        out.append(f)
+        trace_refs.append(idx)
+    return out, trace_refs
+
+
+# 渲染/计数路径白名单键 —— 除这些外,新加的 trace_ref/_loc_state 等键应被忽略。
+# _build_markdown_from_findings / _findings_counts 均用 .get() 读已知键,余键自然被忽略。
+_DISPLAY_FINDING_KEYS = ("file", "severity", "issue", "suggestion", "category", "line_number")
+
+
+# ── 阶段1: B 确定性诊断 + 审计痕迹(verification.vault) ────────────────────
+
+def _lex_identifiers(text):
+    """用 pygments 从一段自然语言+代码文本里抽标识符(Name token)。
+
+    只收 Name.* 类(排除 Comment / String / Operator / Punctuation),并过滤:
+      - 纯数字、过短(<2)、中文串、pygments 元字符;
+      - 常见英文 stopword / 中文连通词。
+    Returns: list[str] 去重后的标识符。
+    """
+    if not text:
+        return []
+    from pygments import lex
+    from pygments.lexers.c_cpp import CLexer
+    from pygments.token import Name
+    lexer = CLexer()
+    _STOPWIN = set("""the a an and or to of in on for with from as by if else return void int
+        float bool this nullptr true false const static class struct enum is are was were be been
+        has have had should would could do does did not no yes when while than that then there here
+        it its it's i we you they this thatthese""".split())
+    tokens = []
+    for ttype, value in lex(text, lexer):
+        if ttype not in Name:
+            continue
+        s = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s):
+            continue
+        if len(s) < 2 or len(s) > 96:
+            continue
+        if s in _STOPWIN:
+            continue
+        tokens.append(s)
+    seen = set()
+    out = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+
+def _read_file_content(path):
+    """读取文件内容(容 CRLF/编码),失败返回 None。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _build_repo_union_text(repo_dir, changed_files):
+    """把全部变更文件内容并集为一份文本,作为"符号是否真实存在"的子串判据的语料。
+
+    关键: code review 是对整个 MR 的审查,finding 常引用*其它*变更文件里的符号/fragment
+    (如 prose 里的 `move_end`、`biped` 是较长真标识符 `_SquadMotorMoveState_move_end` /
+    `BipedMotorDriver` 的子串)。因此"某 token 是否真实存在"用**子串出现在全变更文件
+    并集**来判,而不是精确 token 匹配 —— 精确匹配会把真实 fragment 误判为不存在而误杀。
+
+    返回 (union_text, repo_available)。repo 不可用 → (None, False)。
+    """
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return None, False
+    parts = []
+    for cf in changed_files or []:
+        path = (_strip_diff_prefix(cf.split("\t", 1)[-1] if "\t" in cf else cf)).strip()
+        if not path:
+            continue
+        content = _read_file_content(os.path.join(repo_dir, path))
+        if content:
+            parts.append(content)
+    return "\n".join(parts), True
+
+
+def _is_code_ish(token):
+    """是否"代码式"标识符: 含大写字母或下划线(CamelCase / snake_case / UPPER)。
+
+    纯小写单词(prose 词,如 bug/id/limit/driver)不算代码式 → 永不触发铁证 drop,
+    避免把 prose 词汇误判为"不存在的符号"而误杀。
+    """
+    return bool(re.search(r"[A-Z_]", token))
+
+
+def _token_present_in_union(union_text, token):
+    """token 是否作为子串出现在全变更文件并集文本里。union_text=None → 视为存在(不定)。"""
+    if union_text is None:
+        return True   # repo 不可用 → 保守视为存在,不 drop
+    return token in union_text
+
+
+def _post_validate_findings(findings, diff_info):
+    """对全量 findings 做 B 确定性诊断,产出 (kept_findings, traces)。
+
+    - 逐条产出 trace = {trace_ref, loc_state, original, symbol_check,
+                        decision, decision_reason, verification}
+    - decision ∈ {keep, flag, drop}; drop 仅当 finding 里所有"代码式"标识符
+      (含大写/下划线的 CamelCase|snake_case, 排除纯小写 prose 词)在**全变更文件并集**
+      里子串都不存在 → 铁证编造。
+    - 被 drop 的 finding 不进 kept_findings,但**完整 original+证据 留在 traces(→vault)**。
+    - repo_dir 缺失 → 全部降级 flag,不 drop(拿不到真实语料时忌误删)。
+    """
+    repo_dir = diff_info.get("repo_dir") if diff_info else None
+    base_branch = (diff_info.get("base_branch") or "") if diff_info else ""
+    branch = (diff_info.get("branch") or "") if diff_info else ""
+    changed_files = [(f.split("\t", 1)[-1] if "\t" in f else f) for f in
+                     (diff_info.get("changed_files") or [])] if diff_info else []
+
+    # 先做 file 唯一化(阶段0),拿到每条 finding 的最终 file / loc
+    findings_norm, _ = _normalize_findings_files(findings, changed_files)
+
+    repo_ok = bool(repo_dir) and os.path.isdir(repo_dir)
+    union_text, repo_available = _build_repo_union_text(repo_dir, changed_files) if repo_ok else (None, False)
+
+    kept = []
+    traces = []
+    for f in findings_norm:
+        raw = f.get("file") or ""
+        loc = f.get("_loc_state", "resolved")
+        trace = {
+            "trace_ref": f.get("trace_ref"),
+            "loc_state": loc,
+            "original": {
+                "file": raw,
+                "severity": f.get("severity"),
+                "issue": f.get("issue"),
+                "suggestion": f.get("suggestion"),
+                "category": f.get("category"),
+            },
+            "symbol_check": [],
+            "decision": "keep",
+            "decision_reason": "",
+            "verification": None,
+        }
+
+        # --- 定位不落实 → flag(绝不 drop) ---
+        if loc in ("empty", "not_found"):
+            trace["decision"] = "flag"
+            trace["decision_reason"] = f"file 无法定位(状态={loc}),可能 LLM 路径错误或歧义"
+            traces.append(trace)
+            kept.append(f)
+            continue
+        if loc == "ambiguous":
+            trace["decision"] = "flag"
+            trace["decision_reason"] = "basename 撞名,无法确定唯一文件,留待复核"
+            traces.append(trace)
+            kept.append(f)
+            continue
+
+        # --- repo 不可用 → 全 flag 不 drop ---
+        if not repo_ok:
+            trace["decision"] = "flag"
+            trace["decision_reason"] = "缺少可用 checkout(无法取变更文件语料),保守保留"
+            traces.append(trace)
+            kept.append(f)
+            continue
+
+        # --- B3: 代码式标识符是否存在(子串判据,全变更文件并集) ---
+        tokens = _lex_identifiers((f.get("issue") or "") + "\n" + (f.get("suggestion") or ""))
+        code_tokens = [t for t in tokens if _is_code_ish(t)]
+        code_tokens = [t for t in code_tokens if t not in _VERIFY_STOPWIN]
+
+        if not code_tokens:
+            # 没有可判代码式符号 → 无法证伪,保留
+            trace["decision_reason"] = "未抽取到代码式标识符(worded),无法证伪"
+            traces.append(trace)
+            kept.append(f)
+            continue
+
+        checks = []
+        absent = []      # 代码式标识符在并集里子串不存在 → 编造候选
+        for t in code_tokens:
+            present = _token_present_in_union(union_text, t)
+            checks.append({"token": t, "present_in_changed_files": present})
+            if not present:
+                absent.append(t)
+        trace["symbol_check"] = checks
+
+        if absent and len(absent) == len(code_tokens) and repo_available:
+            # 所有代码式标识符全都不存在(并非只有个别符号不存在) → 铁证编造(drop)。
+            # 保守方向: 只要 finding 引用到任何一个真实存在于变更集的符号,就保留,
+            # 避免因个别 token 在变更集外(头文件/依赖/未变更文件)而误杀真实 finding。
+            trace["decision"] = "drop"
+            trace["decision_reason"] = "引用的代码式符号全部(" + "、".join(
+                f"`{t}`" for t in absent[:5]) + ")在本 MR 变更文件中子串不存在 → 铁证编造"
+            traces.append(trace)
+            continue  # 不进 kept(drop)
+        elif absent and repo_available:
+            # 部分代码式符号缺(混合真实+疑似编造): 不整体 drop,保留 + 打标待复核
+            trace["decision"] = "flag"
+            trace["decision_reason"] = "部分代码式符号(" + "、".join(
+                f"`{t}`" for t in absent[:3]) + ")不在变更集,但其余符号真实存在,保留待复核"
+            traces.append(trace)
+            kept.append(f)
+            continue
+        elif absent and not repo_available:
+            trace["decision"] = "flag"
+            trace["decision_reason"] = "语料不可用,`" + "、".join(absent[:3]) + \
+                                       "` 无法跨文件核验,保守保留"
+            traces.append(trace)
+            kept.append(f)
+            continue
+        else:
+            trace["decision"] = "keep"
+            trace["decision_reason"] = "引用的代码式符号均在本 MR 变更文件中存在,保留"
+            traces.append(trace)
+            kept.append(f)
+
+    return kept, traces
+
+
+def _verify_flags(kept_findings, traces, diff_info, api_key, base_url, model, max_output_tokens):
+    """阶段2: 独立复核(自检回环)。对 B 判定为 flag 且 file 可定位的 finding,
+    用另一个独立 LLM session(同默认模型)做抗附和复核, 输出 verdicts 后合并。
+
+    规则(防误杀, 复核绝不成为新的误杀源):
+      - 只有 B 的 symbol_check 已有一条"该代码式符号在变更集不存在(absent)"的记录,
+        且独立复核也判 drop 时, 才真正 drop。
+      - 复核判 keep → 保留。
+      - 复核判 unknown / 复核调用失败 / 无 absent 记录的 flag → 保留 + 打标(不改 verdict)。
+      - 只处理 file 可定位(resolved)的 flag; 定位不实(empty/ambiguous/not_found)的
+        flag 不交复核(避免在无法确定文件时依赖复核误判)。
+
+    返回 (final_findings, traces_updated)。任何复核异常都不抛, 回退为"全部保留"。
+    """
+    # 选可复核的 flag: decision==flag 且 loc_state==resolved 且 symbol_check 里确有 absent
+    verifyable = []
+    for t in traces:
+        if t["decision"] != "flag":
+            continue
+        if t["loc_state"] != "resolved":
+            continue
+        has_absent = any(not c.get("present_in_changed_files") for c in (t.get("symbol_check") or []))
+        if not has_absent:
+            continue
+        verifyable.append(t)
+
+    if not verifyable:
+        return kept_findings, traces
+
+    if not api_key:
+        return kept_findings, traces
+
+    # 组装复核输入(一条 prompt, 一次调用; 证据取原 finding + B 的 symbol_check)
+    lines = []
+    for i, t in enumerate(verifyable, start=1):
+        o = t["original"]
+        lines.append(
+            f"[{i}] file: {o['file']}\n"
+            f"    severity: {o.get('severity')}\n"
+            f"    issue: {o.get('issue')}\n"
+            f"    suggestion: {o.get('suggestion')}\n"
+            f"    B检查: " + " ".join(
+                (("'"+c['token']+"' present" if c['present_in_changed_files']
+                  else "'"+c['token']+"' NOT-in-changed-files"))
+                for c in (t.get("symbol_check") or []))
+        )
+    prompt = (
+        "你是独立的 code review 复核员。下面是另一个 review session 对同一 MR diff 生成、"
+        "被初筛判为'存疑(flag)'的 finding, 以及自动校验器(B)对每个引用符号的检查结果。\n"
+        "请**只基于以下证据**、独立思考, 对每条给出 verdict:\n"
+        "  - keep   : 引用的代码式符号确实存在/确实是真实改动 → 保留。\n"
+        "  - drop   : 引用的代码式符号在本 MR 变更文件中完全不存在(B 已标 NOT-in-changed-files)",
+        "→ 判定为明显编造。\n"
+        "  - unknown: 证据不足、无法确定 → 保留并标 unknown。\n"
+        "**除非有确凿证据(尤其 B 的 NOT-in-changed-files 且该符号确实无出处), 否则默认 keep 或 unknown;"
+        " 不要臆测 diff 里没有的改动。不要新增 finding, 不扩大范围。**\n\n"
+        + "\n\n".join(lines)
+    )
+    sys_prompt = ("You are an independent code-review verifier. You only arbitrate whether "
+                  "each given finding references real changed code, based strictly on the "
+                  "provided evidence. Default to keep/unknown unless the evidence clearly "
+                  "shows fabrication. Reply in Chinese via the verdicts tool.")
+
+    try:
+        verdicts, err = _call_verify_batch(
+            sys_prompt, prompt, api_key, base_url, model, max_output_tokens)
+    except Exception as e:
+        err = f"verify call exception: {e}"
+        verdicts = None
+    if err or not verdicts:
+        # 复核失败/缺结果 → 全部保留(flag 保持, 不打 drop)
+        for t in verifyable:
+            t["verification"] = {"error": err or "no verdicts", "verdict": "unknown"}
+        return kept_findings, traces
+
+    # 合并 verdicts
+    by_idx = {}
+    for v in verdicts:
+        try:
+            by_idx[int(v.get("index"))] = v.get("verdict", "unknown").strip().lower()
+        except (TypeError, ValueError):
+            continue
+
+    drop_trace_refs = set()
+    for i, t in enumerate(verifyable, start=1):
+        vd = by_idx.get(i, "unknown")
+        has_absent = any(not c.get("present_in_changed_files")
+                         for c in (t.get("symbol_check") or []))
+        reason = ""
+        for v in verdicts:
+            if str(v.get("index")) == str(i):
+                reason = v.get("reason") or ""
+                break
+        t["verification"] = {"verdict": vd, "reason": reason}
+        # 关键: 只有"复核 drop 且 B 已标记存在 absent 符号" 才真正从 findings 移除
+        if vd == "drop" and has_absent:
+            drop_trace_refs.add(t["trace_ref"])
+
+    final = [f for f in kept_findings if f.get("trace_ref") not in drop_trace_refs]
+    for t in traces:
+        if t["trace_ref"] in drop_trace_refs:
+            t["decision"] = "drop"
+            t["decision_reason"] = (t["decision_reason"] + "[阶段2复核确认 drop]" if t["decision_reason"]
+                                    else "[阶段2复核确认 drop]")
+    return final, traces
+
+
+
+
+
+# 常见 stopword: 诊断复核时跳过,避免把普通英文动词当"符号"
+_VERIFY_STOPWIN = set("""the a an and or to of in on for with from as by is are was were be
+    been has have had do does did should would could not no when while than then this that
+    will shall can may must need use using used change changes changed add adds added remove
+    removes removed make makes made fix fixes fixed call calls called trigger triggers triggered
+    review reviews reviewed suggest suggests suggested confirm confirms confirmed ensure ensures
+    checked check checking""".split())
 
 
 def _normalize_severity(sev):
@@ -977,13 +1460,57 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
     # 跨批次聚合: 用全部 findings + 聚合的 summary/strengths 重新渲染成完整 skill 模板,
     # 而非各批 "第 N/M 部分" 拼接(那会丢失聚合 meta 且 render 不完整)。
     final_text = _build_markdown_from_findings(all_findings, meta=agg_meta)
+
+    # 反编造 · 结构化防误杀(阶段0/1): 对全量 findings 做确定性校验,产出 keep/flag/drop
+    # + 完整审计痕迹(verification.vault)。原始审查文本随 trace 保留,drop 的 finding 不进
+    # findings 但原文+证据留在 vault,便于日后查误杀。done: 不阻塞主流程,任何异常降级保留。
+    try:
+        kept_findings, traces = _post_validate_findings(all_findings, diff_info)
+    except Exception as e:            # 非常稳的一层: 校验失败绝不影响出报告
+        kept_findings, traces = all_findings, []
+        print(f"[review] verification layer skipped: {e}", flush=True)
+
+    # 阶段2: 独立复核(自检回环)—— 对 B 判定 flag 且 file 可定位的 finding 用另一个
+    # LLM session(同默认模型)复核。默认开启, 可用 config claude.verify_flags=false 关闭。
+    # 复核失败/被关 → 原样保留(flag 保持, 新增 verification 记录)。绝不因复核引入新误杀。
+    step2 = config.get("claude", {}).get("verify_flags", True)
+    if step2 and not traces:
+        step2 = False                     # 无 trace(校验层跳过)→ 无事可复核
+    if step2:
+        try:
+            kept_findings, traces = _verify_flags(
+                kept_findings, traces, diff_info,
+                api_key, c_claude_base_url(), model, max_output_tokens,
+            )
+        except Exception as e:
+            print(f"[review] stage-2 verify skipped: {e}", flush=True)   # 保守: 保留原状
+
+    drop_n = sum(1 for t in traces if t["decision"] == "drop")
+    flag_n = sum(1 for t in traces if t["decision"] == "flag")
+    keep_n = sum(1 for t in traces if t["decision"] == "keep")
+    verification_block = {
+        "vault": traces,
+        "counts": {"kept": keep_n, "flagged": flag_n, "dropped": drop_n},
+        "dropped_decision": "symbol absent in changed-file union, non-macro; "
+                            "confirmed by stage-2 re-verify when flagged",
+        "repo_dir_available": bool(diff_info.get("repo_dir")),
+        "base_branch": diff_info.get("base_branch") or "",
+        "branch": diff_info.get("branch") or "",
+        "stage2_verify": step2,
+        "generated_by": {"model": model},
+    }
+    if drop_n:
+        print(f"[review] anti-fab verified: dropped {drop_n} fabricated finding(s), "
+              f"flagged {flag_n}, kept {keep_n}", flush=True)
+
     return {
         "summary": agg_meta.get("summary", ""),
         "review_text": final_text,
         "severity_counts": total,
-        "findings": all_findings,
+        "findings": kept_findings,
         "error": first_error,   # non-None if at least one batch failed (partial results)
         "batches": num_batches,
+        "verification": verification_block,
     }
 
 

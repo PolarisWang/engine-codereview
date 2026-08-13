@@ -102,6 +102,10 @@ claude:
   # LLM API 基址（非敏感；空则走 env ANTHROPIC_BASE_URL / 默认 https://api.anthropic.com）
   base_url: ""
   max_tokens: 8192
+  # 反编造阶段2：对初筛"存疑(flag)"的 finding 用另一个独立 LLM session（同默认模型）
+  # 做抗附和复核，复核确认(drop)+B 已证符号不存在才真正删除，否则保留。
+  # false = 关闭阶段2（只保留 flag，不做二次复核）。
+  verify_flags: true
   review_instructions: |
     You are a senior game engine engineer reviewing a merge request.
     Focus on:
