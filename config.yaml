@@ -78,8 +78,8 @@ gitlab:
 # ============================================================
 feishu:
   chat_id: oc_e817ca07b9c71539e334b1701f2054b4   # 正式环境目标群（改一处生效）
-  bot_name: ""                                    # 可选：@ 精确匹配的机器人名
-  bot_open_id: ""                                 # 可选：机器人 open_id（@-gate 用）
+  bot_name: "Chaos Code Review"                  # @ 精确匹配的机器人名（飞书 app_name）
+  bot_open_id: "ou_1a4385da2771c92b5c05e8c08afe3b47"   # 机器人 open_id（@-gate 用；来自 bot/v3/info）
 
 # ============================================================
 # Real-time event subscription server (topic interaction)
