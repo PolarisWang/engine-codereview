@@ -722,29 +722,37 @@ def _lex_identifiers(text):
       - 纯数字、过短(<2)、中文串、pygments 元字符;
       - 常见英文 stopword / 中文连通词。
     Returns: list[str] 去重后的标识符。
+
+    容器 python 可能无 pygments → 回退正则抽标识符(不因缺 tokenizer 杀掉整个
+    审查; rage 也无 pygments 依赖, 我们只把 symbol-drop 当第二道兜底)。
     """
     if not text:
         return []
-    from pygments import lex
-    from pygments.lexers.c_cpp import CLexer
-    from pygments.token import Name
-    lexer = CLexer()
     _STOPWIN = set("""the a an and or to of in on for with from as by if else return void int
         float bool this nullptr true false const static class struct enum is are was were be been
         has have had should would could do does did not no yes when while than that then there here
         it its it's i we you they this thatthese""".split())
-    tokens = []
-    for ttype, value in lex(text, lexer):
-        if ttype not in Name:
-            continue
-        s = value.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s):
-            continue
-        if len(s) < 2 or len(s) > 96:
-            continue
-        if s in _STOPWIN:
-            continue
-        tokens.append(s)
+    try:
+        from pygments import lex
+        from pygments.lexers.c_cpp import CLexer
+        from pygments.token import Name
+        lexer = CLexer()
+        tokens = []
+        for ttype, value in lex(text, lexer):
+            if ttype not in Name:
+                continue
+            s = value.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s):
+                continue
+            if len(s) < 2 or len(s) > 96:
+                continue
+            if s in _STOPWIN:
+                continue
+            tokens.append(s)
+    except Exception:
+        # pygments absent -> regex fallback (capture identifier-like tokens).
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,96}", text)
+        tokens = [t for t in tokens if t not in _STOPWIN]
     seen = set()
     out = []
     for t in tokens:
@@ -2018,25 +2026,39 @@ Diff:
 ```
 """
 
-    payload = {
-        "model": model,
-        "max_tokens": (get_claude_config() or {}).get("max_tokens", 8192),
-        "system": AGENT_SYSTEM,
-        "tools": REVIEW_TOOLS,
-        "tool_choice": {"type": "tool", "name": "review_findings"},
-        "messages": [{"role": "user", "content": user_prompt}],
-    }
+    # Spawn the container claude CLI as a one-shot agent. The `-p` session
+    # does NOT receive the HTTP-path `review_findings` tool, so we do NOT
+    # reference it: we hand the full task inline and ask for one pure-JSON
+    # findings array (probe-verified: claude-opus-5 returns structured JSON).
+    # The agent keeps Bash+Read access to the local repo at REPO_DIR, so it can
+    # `git show <sha>:<path>` for whole-file scope verification. Range is
+    # bounded by `timeout`; beyond that we surface a clear agent-timeout error.
+    task = f"""{user_prompt}
+
+Now review per the rules (Chinese user-facing output). Respond with EXACTLY ONE
+pure JSON object (no code fences, no prose before/after) with this shape:
+{{
+  "findings": [
+    {{
+      "file": "repo-relative changed file",
+      "severity": "严重|中|轻|建议",
+      "line_range": "120-145",
+      "function": "optional",
+      "issue": "问题（中文）",
+      "suggestion": "修法（中文，可选）"
+    }}
+  ]
+}}
+Sort findings by severity (严重>中>轻>建议). If no real issues, findings=[]
+and add a non-empty "summary" stating 已完成审查，未发现问题.
+
+Your system prompt holds the mandatory rules (whole-file scope verification via
+`git show <branch_sha>:<path>` before ANY scope-dependent finding; only real +/-
+lines; line_range required for line-scoped findings). Follow them strictly."""
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                         encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-            payload_path = f.name
-        # Spawn the container claude CLI as a one-shot agent.
         cmd = [claude_exe, "-p", "--model", model,
                "--output-format", "json",
-               f"Read the review task; process it end-to-end per your system "
-               f"prompt; use the review_findings tool and return exactly one "
-               f"JSON object."]
+               task]
         env = os.environ.copy()
         if repo_dir:
             env.setdefault("PWD", repo_dir)
@@ -2047,12 +2069,14 @@ Diff:
             return {"summary": "agent failed", "findings": [],
                     "severity_counts": {}, "error": raw[:400] or "claude rc!=0",
                     "batches": 1}
-        # Parse the structured findings from stdout (agent echoes the JSON).
-        findings = _parse_agent_json(raw)
+        # Parse the structured findings from the agent's pure-JSON stdout.
+        # `claude -p --output-format json` wraps the answer in an envelope; peel it,
+        # then run the findings through _parse_agent_json.
+        findings = _parse_agent_json(_unwrap_claude_json(raw))
         if findings is None:
             return {"summary": "agent output unparseable", "findings": [],
                     "severity_counts": {},
-                    "error": f"no JSON in agent stdout: {raw[:400]}",
+                    "error": f"no JSON findings in agent stdout: {raw[:400]}",
                     "batches": 1}
         kept, traces = _post_validate_findings(findings, diff_info)
         net = _build_review_dict(kept, diff_info)
@@ -2063,11 +2087,24 @@ Diff:
     except Exception as e:
         return {"summary": "agent error", "findings": [], "severity_counts": {},
                 "error": f"{e}", "batches": 1}
-    finally:
-        try:
-            os.unlink(payload_path)
-        except (OSError, NameError):
-            pass
+
+
+def _unwrap_claude_json(raw):
+    """Peel the `claude -p --output-format json` envelope, returning the agent's
+    inner text (which should be a pure-JSON findings object). If raw isn't the
+    envelope, return raw unchanged so callers can fall back to parsing."""
+    if not raw:
+        return raw
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(d, dict) and isinstance(d.get("result"), str):
+        # result is the agent's text — return it regardless of whether it is
+        # pure JSON or fenced (```json ... ```), so _parse_agent_json can
+        # handle both. Do NOT fall back to the envelope here.
+        return d["result"]
+    return raw
 
 
 def _parse_agent_json(raw):

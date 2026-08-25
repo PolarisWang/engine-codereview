@@ -123,3 +123,25 @@ def test_severity_zh_mapping():
     assert cr._severity_zh("轻") == "轻"
     assert cr._severity_zh("建议") == "建议"
     assert cr._severity_zh("unknown-garbage") == "建议"
+
+
+# ── agent subprocess parse: claude -p envelope + fenced JSON + pygments-less ─
+
+def test_agent_envelope_unwrap_and_parse():
+    import code_reviewer as cr
+    under = '{"findings":[{"file":"asset.cpp","severity":"严重","line_range":"3","issue":"内存泄漏"}]}'
+    env = f'{{"type":"result","subtype":"success","result":"{under} · 已经修复"}}'
+    inner = cr._unwrap_claude_json(env)
+    assert "findings" in inner
+    # fenced form (the agent wrapped JSON in ```json ... ```)
+    fenced = '{"type":"result","result":"```json\\n{\\"findings\\":[{\\"file\\":\\"a.cpp\\",\\"severity\\":\\"轻\\"}]}\\n```"}'
+    f = cr._parse_agent_json(cr._unwrap_claude_json(fenced))
+    assert f is not None and f[0]["file"] == "a.cpp"
+
+
+def test_lex_identifiers_pygments_absent_fallback():
+    import code_reviewer as cr
+    # regex fallback must still extract identifier-like tokens without pygments
+    toks = cr._lex_identifiers("call updateFoo(n) and load asset_file_1")
+    assert "updateFoo" in toks
+    assert "asset_file_1" in toks
