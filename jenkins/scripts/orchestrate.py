@@ -418,10 +418,19 @@ def run(args):
     # config/env so it can be turned on per-project, with HTTP fallback retained.
     use_agent = _env("REVIEW_AGENT", "").lower() in ("1", "true", "yes") or \
         _env("REVIEW_AGENT_MODEL", "") != ""
+    # round-N incremental: pass the previous review SHA + carried (already-settled)
+    # issue indices so the agent diffs only since last review and does NOT re-raise
+    # issues earlier rounds confirmed fixed (rage incr_base / review_rounds).
+    _tcur = pipeline_state.get_topic(state_file, key) or {}
+    last_review_commit = (_tcur.get("last_review_commit") or "") or \
+        _env("REVIEW_LAST_COMMIT", "")
+    carried = (_tcur.get("carried") or []) or []
+    if isinstance(carried, str):
+        carried = [int(x) for x in carried.split(",") if x.strip().isdigit()]
     eng_res, gam_res = _review_repos(
         key, project, issue_key, review_branch, base_branch, engine_base,
         engine_repo, game_repo, mr_url, workspace, eng_out, gam_out,
-        use_agent=use_agent)
+        use_agent=use_agent, last_review_commit=last_review_commit, carried=carried)
 
     # 4. Record per-repo terminal states + update the in-flight card.
     _record_repo_state(state_file, key, "engine", eng_out, eng_res, review_branch, base_branch,
@@ -2716,13 +2725,30 @@ def _set_review_closure_fields(state_file, key, eng_res, gam_res):
     else:
         next_state = "AWAITING_APPROVAL" if triage == "complex" else "TRIAGE_DECISION"
 
+    # Record the reviewed head SHA so the next (round-N) run can diff incrementally
+    # (incr_base). Best-effort: resolve via the engine checkout's repo_dir already on
+    # disk; on failure leave empty so the next run degrades to the full diff.
+    review_sha = ""
+    try:
+        eng_repo_dir = (eng_res or {}).get("repo_dir") or (gam_res or {}).get("repo_dir") or ""
+        review_branch = topic.get("review_branch") or "HEAD"
+        if eng_repo_dir and review_branch:
+            import subprocess as _sp
+            p = _sp.run(["git", "-C", eng_repo_dir, "rev-parse", review_branch],
+                        capture_output=True, text=True, timeout=20)
+            if p.returncode == 0:
+                review_sha = p.stdout.strip()[:40]
+    except Exception:
+        review_sha = ""
+
     pipeline_state.set_topic_fields(state_file, key,
                                     review_issues=issues,
                                     issue_count=len(issues),
                                     review_triage=triage,
                                     review_state=next_state,
                                     creator_open_id=(topic.get("sender_id") or ""),
-                                    review_approved=False)
+                                    review_approved=False,
+                                    last_review_commit=review_sha)
 
 
 def _policy_admins():
@@ -4488,7 +4514,7 @@ def _is_bad_empty_result(res):
 
 def _review_repos(key, project, issue_key, review_branch, base_branch, engine_base,
                   engine_repo, game_repo, mr_url, workspace, eng_out, gam_out,
-                  use_agent=False):
+                  use_agent=False, last_review_commit="", carried=None):
     # Cache dir for reuse by diff_hash (avoids re-POSTing unchanged diffs to the LLM).
     cache_dir = os.path.join(workspace, ".review_cache")
     # Review cache version: bump when the rendered review format/prompt changes, so
@@ -4499,6 +4525,11 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         base_args = ["--repo", repo_url, "--branch", rb, "--base-branch", baseb,
                      "--project", project, "--issue-key", issue_key,
                      "--repo-type", repo, "--mr-url", mr_url, "--workspace", workspace]
+        # round-N incremental: only diff since last review, skip carried issues.
+        if last_review_commit:
+            base_args += ["--last-review-commit", last_review_commit]
+        if carried:
+            base_args += ["--carried", ",".join(str(i) for i in carried)]
         review_args = base_args + (["--agent"] if use_agent else [])
         # 1) Dry run: get diff_hash without the (expensive) LLM call.
         rc, out, err = _run_py("code_reviewer.py", base_args + ["--output", out_path + ".dry", "--dry"])
