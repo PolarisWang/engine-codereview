@@ -42,9 +42,22 @@
 |---|---|---|---|
 | P0 | Vendor rage review-bot 到 `vendor/rage-review-bot` | 上游 c035b16 | ✅ 完成 |
 | P0.5 | 平台探测 R1/R2 | — | ✅ R1过 / R2转人工 |
-| P1 | 契约化审查 agent（改 spawn 为 per-topic claude agent + findings schema + render + severity） | `state_machine.py`/`reply_parser.py`/`render.py`/`spawn_topic_agent.md` | 进行中 |
-| P2 | 闭环状态机 + 机械回复 | `mechanical_reply_handler.py`/`reply_parser.py` | — |
+| P1 | **契约化审查 agent（Path A）** | `spawn_topic_agent.md`/`state_machine.py` 等 | ✅ 容器实测通过 |
+| P2 | 闭环状态机 + 机械回复 | `mechanical_reply_handler.py`/`reply_parser.py` | 进行中 |
 | P3 | round-N 增量复审 | `incr_base.py`/`incr_cache.py`/`review_rounds.py` | — |
 | P4 | 人审集成 | `gitlab_threads.py`/`manual_issue_verifier.py` | — |
 | P5 | 复杂审查飞书 doc | `build_review_doc.py`/`lark_doc_helper.py`(重写) | — |
 | P7 | 灰度上线 + 存量迁移 | — | — |
+
+## P1 实测结论（容器，commit 5911e5f）
+- **Path A agent 真实可用**：容器 `code_reviewer --agent` spawn claude-opus-5（7 turns / ~107s），返回 rage 标准结果：
+  ```
+  🔍 Code Review — 2 项
+  #1 [严重] [engine] asset.cpp:3-3 update: 内存泄漏 → 修法
+  #2 [严重] [engine] asset.cpp:2-2 Asset: 裸指针违反 rule of three …
+  📊 严重2 / 中0 / 轻0 / 建议0
+  ```
+- **质量对齐 rage**：findings 绑定真实行（file:line）、agent 做了整文件 scope 验证（读了 hunk header 确认类完整）、严重/中/轻/建议 + 排序 + `[Repo] file:line` 前缀。
+- **容器坑已修**：`claude -p --output-format json` 信封解包 + fenced-JSON；`-p` 会话无 review_findings 工具（改纯 JSON 契约）；容器无 pygments（`_lex_identifiers` 加正则回退）。全在 commit 5911e5f。
+- **残余**：R2 飞书 doc 权限待人工验证（PlanA/PlanB 开关）；灰度期抽检 opus 别名是否落地真 Anthropic Opus。
+
