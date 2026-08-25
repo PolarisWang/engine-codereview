@@ -431,6 +431,14 @@ def run(args):
     _log('REPO', 'DONE', key, issue_key, project, '', 'repo states recorded')
     # (不再提前 update 进度卡 —— 让最终 review 结果在下方一次性刷新进度卡, 避免中途变稀疏状态卡)
 
+    # P2: 记录 review 闭环状态(供 closure 驱动 round-2+ 交互)。合并两仓 findings,
+    # 计入 review_issues / issue_count / review_state / review_triage / creator_open_id。
+    try:
+        _set_review_closure_fields(state_file, key, eng_res, gam_res)
+    except Exception as _ce:
+        print(f"[closure] set fields err: {_ce}", file=sys.stderr)
+
+
     # 5. Render + send final summary as PLAIN-TEXT messages (普通文字消息, 全量不折叠).
     pipeline_state.transition(state_file, key, to="NOTIFYING", status="RUNNING")
     _log('NOTIFY', 'RUNNING', key, issue_key, project, '', 'sending final summary')
@@ -1041,6 +1049,17 @@ def interact(args):
     actor = getattr(args, "sender_id", "") or ""   # the person @-ing / approving
     render_id = topic.get("render_msg_id") or ""
     low0 = (reply_text or "").lower().strip()
+
+    # ── P2: rage-style review closure (self-service dev loop). When the topic is
+    # in an active review state (review_state set by the agent path), a thread
+    # reply like `1 3` / `ok` / `done` / `close` drives the closure mechanically.
+    # Anything non-review falls through to the existing command-word path below.
+    # Ported from rage DESIGN §1.5 / §1.23 (closure.py). See
+    # jenkins/skills/rage-review/closure.py.
+    if not pipeline_state.is_closed(topic):
+        rcl = _try_handle_closure(key, topic, reply_text, actor, workspace, state_file)
+        if rcl is not _CLOSURE_NO_MATCH:
+            return rcl
 
     # ── Closed-topic handling (admin/owner close OR auto-silence) ─────────────
     # A closed topic ignores further replies except @审计 (audit stays visible).
@@ -2557,6 +2576,198 @@ def _proc_reply(key, topic, text, render_id, state_file, app_id, app_secret,
     if intent:
         text = f"{prefix} **准备执行：{intent}**\n\n{text}"
     _finalize(key, text, render_id, [], state_file, app_id, app_secret)
+
+
+# Sentinel: the reply was not a closure intent — caller should continue with the
+# normal command-word path.
+_CLOSURE_NO_MATCH = object()
+
+
+def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
+    """rage-style closure handling for a reply in an active review state.
+
+    When the topic's `review_state` is one of the actionable review states, classify
+    the reply via closure.py (P2) and handle it mechanically — persist dev_triage /
+    approve/close / handoff, transition review_state, post a template response, and
+    (for next-round) signal a re-review. Returns 0 when the reply WAS consumed as a
+    review intent, or _CLOSURE_NO_MATCH when not (caller falls through).
+
+    This is the decision layer only; it does NOT spawn the review agent — a round-N
+    review is triggered by the caller (orchestrate run) via REVIEW_AGENT=1 the same
+    way round 1 is.
+    """
+    import sys as _sys, os as _os
+    rdir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                         "..", "skills", "rage-review")
+    _sys.path.insert(0, rdir)
+    try:
+        import closure as _cl
+        app_id = _env("FEISHU_APP_ID")
+        app_secret = _env("FEISHU_APP_SECRET")
+        render_id = topic.get("render_msg_id") or key
+
+        review_state = topic.get("review_state") or ""
+        if review_state not in _cl.REVIEW_STATES:
+            return _CLOSURE_NO_MATCH
+
+        # Resolve per-project approvers (config) → fallback policy.yaml admins.
+        import config as _cfg
+        project_id = topic.get("project") or ""
+        projs = _cfg.load_config().get("projects") or {}
+        proj_cfg = projs.get(project_id) or {}
+        policy_admins = []
+        try:
+            import policy  # policy.yaml loader if present
+            policy_admins = _policy_admins()
+        except Exception:
+            policy_admins = []
+        approvers = _cl.approver_ids_for(proj_cfg, policy_admins)
+
+        triage = topic.get("review_triage") or "simple"
+        dev_triage = topic.get("dev_triage") or {}
+        issue_count = int(topic.get("issue_count") or len(topic.get("review_issues") or []))
+        developer = (topic.get("creator_open_id") or
+                     topic.get("sender_id") or "")
+
+        res = _cl.reconcil(reply_text, actor, review_state, approvers, developer,
+                           issue_count, triage=triage, dev_triage=dev_triage)
+        if not res or res.get("intent") in (None, "dev_question", "manual_refresh"):
+            return _CLOSURE_NO_MATCH  # question/sync → normal agent path
+
+        # Persist closure result + transition review_state.
+        updates = {}
+        if res.get("persist", {}).get("dev_triage") is not None:
+            updates["dev_triage"] = res["persist"]["dev_triage"]
+        if res.get("persist", {}).get("flagged_issues"):
+            updates["flagged_issues"] = res["persist"]["flagged_issues"]
+        if res.get("next_state"):
+            updates["review_state"] = res["next_state"]
+        if res.get("persist", {}).get("approved"):
+            updates["review_approved"] = True
+        if res.get("persist", {}).get("closed"):
+            updates["review_state"] = "CLOSED"
+        if updates:
+            pipeline_state.set_topic_fields(state_file, key, **updates)
+
+        # Post the appropriate template response.
+        post = res.get("post") or {}
+        tpl = post.get("template") or "revision_request"
+        msg = _closure_human_text(post, res, issue_count, topic)
+        _finalize(key, msg, render_id, [], state_file, app_id, app_secret)
+
+        # Next-round review trigger for dev_reply (dev pushed fixes, re-review).
+        if res.get("intent") == "dev_reply" and res.get("persist", {}).get("re_review"):
+            _log('CLOSURE', 'REREVIEW', key, topic.get("jira_key", ""), '', '',
+                 'dev pushed fixes — review agent re-runs next cycle')
+        return 0
+    except Exception as e:
+        print(f"[closure] err: {e}", file=_sys.stderr)
+        return _CLOSURE_NO_MATCH
+
+
+def _set_review_closure_fields(state_file, key, eng_res, gam_res):
+    """Persist the rage-style closure state on a topic after a review run.
+
+    Merges engine+game findings into `review_issues[]` (severity-sorted, #N),
+    sets `issue_count`, `review_triage`, and `review_state` so `_try_handle_closure`
+    can drive the developer/approver loop on round-2+ replies. Marked the topic's
+    opener as the developer (`creator_open_id`) when not already set.
+
+    review_state after a round:
+      - issues found → DEV_TRIAGE (dev triages first)
+      - zero issues  → TRIAGE_DECISION (simple) / AWAITING_APPROVAL (complex)
+    """
+    issues = []
+    for repo, res in (("engine", eng_res or {}), ("game", gam_res or {})):
+        rv = (res or {}).get("review") or {}
+        for f in rv.get("findings") or []:
+            issues.append({
+                "repo": repo,
+                "file": (f.get("file") or "").strip(),
+                "severity": (f.get("severity") or "").strip(),
+                "line_range": (f.get("line_range") or "").strip(),
+                "function": (f.get("function") or "").strip(),
+                "issue": (f.get("issue") or "").strip(),
+                "suggestion": (f.get("suggestion") or "").strip(),
+            })
+    # severity-sort then assign indices (rage: 严重>中>轻>建议, #N after sorting)
+    _order = {"严重": 0, "中": 1, "轻": 2, "建议": 3}
+    issues.sort(key=lambda x: (_order.get(x["severity"], 3), x["file"]))
+    for i, it in enumerate(issues, start=1):
+        it["index"] = i
+
+    # triage: complex if >5 files/100 lines across repos (rage rule), else simple.
+    total_files = (len((eng_res or {}).get("changed_files") or []) +
+                   len((gam_res or {}).get("changed_files") or []))
+    # crude line heuristic from stats strings
+    def _lines(res):
+        try:
+            s = (res or {}).get("stats") or ""
+            a = int(s.split("insertions")[0].split("+")[-1].strip())
+            return a
+        except Exception:
+            return 0
+    total_lines = _lines(eng_res) + _lines(gam_res)
+    triage = "complex" if (total_files > 5 or total_lines > 100) else "simple"
+
+    topic = pipeline_state.get_topic(state_file, key) or {}
+    if issues:
+        next_state = "DEV_TRIAGE"
+    else:
+        next_state = "AWAITING_APPROVAL" if triage == "complex" else "TRIAGE_DECISION"
+
+    pipeline_state.set_topic_fields(state_file, key,
+                                    review_issues=issues,
+                                    issue_count=len(issues),
+                                    review_triage=triage,
+                                    review_state=next_state,
+                                    creator_open_id=(topic.get("sender_id") or ""),
+                                    review_approved=False)
+
+
+def _policy_admins():
+    """policy.yaml admins fallback (best-effort)."""
+    try:
+        import common as _c
+        raw = _c.load_config() or {}
+        return _c.load_config().get("policy", {}).get("agent", {}).get("admins", [])
+    except Exception:
+        return []
+
+
+def _closure_human_text(post, res, issue_count, topic):
+    """Rage-standard human copy for a closure reply (Chinese)."""
+    tpl = post.get("template")
+    if tpl == "dev_triage" or tpl == "revision_request":
+        acc = post.get("vars", {}).get("accepted", [])
+        rej = post.get("vars", {}).get("rejected", [])
+        if rej:
+            return (f"✅ 已确认修复：{acc or '无'}；有异议（将交审查人）：{rej}。\n"
+                    f"请修改后在话题回复 `ok` 触发下一轮审查；异议理由可选 @bot 说明。")
+        return (f"✅ 已确认修复：{acc or len(list(range(1, issue_count + 1)))} 项。\n"
+                f"请修改后在话题回复 `ok` 触发下一轮审查。")
+    if tpl == "approval":
+        return "✅ 已批准。若已启用自动合入将由合并队列处理；否则请手动 merge 后话题自动进入已合并。"
+    if tpl == "closed":
+        return "🔒 已关闭本话题与对应 MR。"
+    if tpl == "escalated":
+        return "↗️ 已升级为完整审查。"
+    if tpl == "handoff_summary":
+        dt = post.get("vars", {}).get("dev_triage") or {}
+        rej = dt.get("rejected_indices") or []
+        notes = ""
+        if rej:
+            reasons = dt.get("reasons") or {}
+            notes = f"\n\n开发者异议：{rej}" + (f"（{reasons}）" if reasons else "")
+        return f"🤝 开发者已完成，已交审查人裁决。{notes}"
+    if tpl == "re_review":
+        return "⏳ 已收到修复，将进行下一轮增量审查（仅复核未解决项）。"
+    if tpl == "manual_refresh":
+        return "🔄 正在同步人工审查评论并核对修复状态…"
+    if tpl == "dev_question":
+        return "🤖 已收到提问，正在查证…"
+    return "ok"
+
 
 
 # ── Guarded side-effect executors (design-3): local apply + remote push + rollback ──
