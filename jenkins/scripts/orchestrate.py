@@ -2666,8 +2666,17 @@ def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
 
         # Next-round review trigger for dev_reply (dev pushed fixes, re-review).
         if res.get("intent") == "dev_reply" and res.get("persist", {}).get("re_review"):
-            _log('CLOSURE', 'REREVIEW', key, topic.get("jira_key", ""), '', '',
-                 'dev pushed fixes — review agent re-runs next cycle')
+            # Actually schedule the round-N review (P3): the Jenkins executor drains
+            # this re_review pending and re-runs orchestrate run, which now uses
+            # topic.last_review_commit (incremental) + carried (skip settled) from P3.
+            try:
+                import pipeline_state as _psc
+                _psc.set_pending(state_file, key, "re_review")
+                _log('CLOSURE', 'REREVIEW', key, topic.get("jira_key", ""), '', '',
+                     'dev pushed fixes — queued round-N incremental review')
+            except Exception as _err:
+                _log('CLOSURE', 'REREVIEW', key, topic.get("jira_key", ""), '', '',
+                     f'failed to queue re_review: {_err}')
         return 0
     except Exception as e:
         print(f"[closure] err: {e}", file=_sys.stderr)
