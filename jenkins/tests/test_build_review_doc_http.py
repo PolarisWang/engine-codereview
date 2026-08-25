@@ -48,3 +48,42 @@ def test_long_post_planb_sorted():
 
 def test_long_post_no_issues():
     assert "未发现问题" in b.build_long_post([])
+
+
+# ── R7: markdown → docx blocks content injection ───────────────────────────
+
+def test_build_code_blocks_maps_markdown():
+    md = ("# 代码审查 K-1\n"
+          "## 概述\n"
+          "这里一句 **加粗** 描述。\n"
+          "## 变更概览\n"
+          "- **[Chaos] a.cpp** +5/-3 — 改\n"
+          "## 问题详情\n"
+          "#### #1 [严重] [Game] x.cs:30\n"
+          "越界\n"
+          "```cpp\nint a = 1;\n```\n")
+    blocks = b.build_code_blocks(md)
+    types = [bl["block_type"] for bl in blocks]
+    assert 3 in types and 4 in types and 6 in types       # heading1/2/4
+    assert 12 in types and 2 in types                      # bullet + text (incl code-as-text)
+    # fenced code becomes a multiline inline_code text block (code_block 14 400s;
+    # a text block with inline_code renders the code acceptably per live probe).
+    code = [bl for bl in blocks if bl["block_type"] == 2 and
+            "int a" in bl["text"]["elements"][0]["text_run"]["content"]]
+    assert code and "int a = 1;" in code[0]["text"]["elements"][0]["text_run"]["content"]
+    # the inline_code run is flagged
+    assert code[0]["text"]["elements"][0]["text_run"]["text_element_style"]["inline_code"] is True
+
+
+def test_markdown_to_blocks_bold_heading_and_bullet():
+    blocks = b.markdown_to_blocks("## 概述\n这是 **重要** 一句。\n- 子项\n")
+    # heading2
+    assert blocks[0]["block_type"] == 4
+    # paragraph with a bold run
+    para = blocks[1]
+    assert para["block_type"] == 2
+    texts = [e["text_run"]["content"] for e in para["text"]["elements"]]
+    bolds = [e["text_run"]["content"] for e in para["text"]["elements"]
+             if e["text_run"]["text_element_style"]["bold"]]
+    assert "重要" in bolds and "这是" in texts[0]
+    assert blocks[2]["block_type"] == 12                  # bullet

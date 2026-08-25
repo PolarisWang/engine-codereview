@@ -19,10 +19,12 @@ doc, fall back to long-post) — see docs/review-bot-replication-plan.md.
 """
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 
 MAX_ISSUES_IN_THREAD = 40
+MAX_BLOCKS_PER_REQ = 30   # Feishu docx children-append batch limit (conservative)
 
 
 # ── pure markdown body builder (rage-standard, testable) ────────────────────
@@ -135,10 +137,113 @@ def create_lark_doc_http(app_id, app_secret, title, markdown, grant_view=(),
         if gr.get("code") == 0:
             granted.append(uid)
     url = f"https://www.feishu.cn/docx/{doc_token}"
-    # (markdown content would be written via import; not implemented here — the
-    # doc is created empty as a container; the thread reply is the source of truth
-    # until an import path (docs +import / block replace) is wired.)
+    # R7: write the review-doc content into the doc as native docx blocks (not an
+    # empty container). code fences render as code_block, the rest inline.
+    blocks = build_code_blocks(markdown)
+    if blocks:
+        okb, errb = _write_doc_blocks(token, doc_token, blocks)
+        if not okb:
+            # content write failed -> surface but still ok (doc created + granted)
+            return True, doc_token, url, errb
     return True, doc_token, url, ""
+
+
+def _text_run(content, bold=False):
+    return {"text_run": {"content": content,
+                         "text_element_style": {"bold": bold, "inline_code": False,
+                                                "italic": False, "strikethrough": False,
+                                                "underline": False}}}
+
+
+def markdown_to_blocks(markdown):
+    """Convert review-doc markdown (the non-code, non-fence portions) into Feishu
+    docx block JSON. Handles `#..###` headings, `- ` bullets, and plain paragraphs
+    with `**bold**`. Fences/code are handled by build_code_blocks. Applies a
+    single line or a whole block (each non-empty line becomes one docx block)."""
+    blocks = []
+    for raw in (markdown or "").splitlines():
+        line = raw.rstrip()
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r'^(#{1,6})\s+(.*)$', s)
+        if m:
+            lvl = len(m.group(1))
+            block_type = {1: 3, 2: 4, 3: 5, 4: 6, 5: 7, 6: 8}[lvl]
+            key = {3: "heading1", 4: "heading2", 5: "heading3",
+                   6: "heading4", 7: "heading5", 8: "heading6"}[block_type]
+            blocks.append({"block_type": block_type, key: {"elements": [_text_run(m.group(2).strip())]}})
+            continue
+        if s.startswith(("- ", "* ")):
+            blocks.append({"block_type": 12,
+                           "bullet": {"elements": [_text_run(s[2:].strip())]}})
+            continue
+        elems = []
+        for seg in re.split(r'(\*\*.+?\*\*)', s):
+            if not seg:
+                continue
+            if seg.startswith("**") and seg.endswith("**"):
+                elems.append(_text_run(seg[2:-2], bold=True))
+            else:
+                elems.append(_text_run(seg))
+        blocks.append({"block_type": 2, "text": {"elements": elems}})
+    return blocks
+
+
+def _write_doc_blocks(token, doc_token, blocks):
+    """Write docx blocks into document doc_token (page block = doc_token, replaced
+    by appending to its children after the title block). Returns (ok, err).
+
+    Appends in batches of MAX_BLOCKS_PER_REQ under the page block id = doc_token.
+    """
+    for i in range(0, len(blocks), MAX_BLOCKS_PER_REQ):
+        batch = blocks[i:i + MAX_BLOCKS_PER_REQ]
+        r = _feishu_api(token,
+                        f"docx/v1/documents/{doc_token}/blocks/{doc_token}/children",
+                        method="POST", body={"children": batch})
+        if r.get("code") != 0:
+            return False, f"docx append batch {i} failed: {r.get('msg')}"
+    return True, ""
+
+
+def build_code_blocks(markdown):
+    """Split the markdown, converting ``` fences into code-style text blocks.
+    Used by create_lark_doc_http to render diff/code sections natively.
+
+    Note: Feishu's native `code_block`(14) insert API 400s here; a multiline
+    plain-text block with inline_code runs renders the diff/code acceptably and
+    is stable. Headings/bullets/paragraphs go to their real block types.
+    """
+    blocks = []
+    in_code = False
+    code_buf = []
+    lines = (markdown or "").splitlines()
+    for line in lines:
+        s = line.strip()
+        if s.startswith("```"):
+            if in_code:
+                blocks.append({"block_type": 2, "text": {"elements": [
+                    {"text_run": {"content": "\n".join(code_buf),
+                                  "text_element_style": {"bold": False, "inline_code": True,
+                                                         "italic": False, "strikethrough": False,
+                                                         "underline": False}}}]}})
+                code_buf = []
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_buf.append(line)
+            continue
+        # non-code line -> normal markdown_to_blocks for this single line
+        blocks.extend(markdown_to_blocks(line))
+    if code_buf:
+        blocks.append({"block_type": 2, "text": {"elements": [
+            {"text_run": {"content": "\n".join(code_buf),
+                          "text_element_style": {"bold": False, "inline_code": True,
+                                                 "italic": False, "strikethrough": False,
+                                                 "underline": False}}}]}})
+    return blocks
 
 
 def build_long_post(issues, repo_label_key="engine"):
@@ -166,6 +271,7 @@ def build_long_post(issues, repo_label_key="engine"):
         L.append(line)
     parts = [f"📄 复杂审查明细（{len(L)} 项）"] + L
     return "\n".join(parts)
+
 
 
 if __name__ == "__main__":
