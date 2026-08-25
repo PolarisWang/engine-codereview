@@ -462,16 +462,37 @@ def run(args):
     # 方案C: 直接用 code_reviewer 产出的 skill 模板 review_text(含 Summary/Strengths/
     # 架构性能/严重度), 而非 feishu_notifier 旧的分组重渲染 —— 保证群里显示 skill 模板。
     # engine/game 两份分开、各加一行短标(引擎仓库 / 游戏仓库), 否则合并后分不清来源。
-    rev_texts = []
-    repo_labels = {"engine": "🛠️ 引擎仓库(engine)", "game": "🎮 游戏仓库(game)"}
+    # ── 方案C(交互卡): 统一用 rage 标准卡 render_rage_card (4级 #N + doc + 双段指令) ──
+    merged_findings = []
     for repo, res in (("engine", eng_res or {}), ("game", gam_res or {})):
-        rt = ((res or {}).get("review") or {}).get("review_text") or ""
-        if rt:
-            rev_texts.append(f"**{repo_labels.get(repo, repo)}**\n{rt}")
-    if rev_texts:
-        full_text = "\n\n".join(rev_texts)
+        for f in feishu_notifier._findings_of(res):
+            merged_findings.append({"repo": repo, **f})
+
+    doc_url = ""
+    try:
+        # 复杂审查生成完整评审文档(仅 triage=complex 时), 否则 doc_url 留空(卡上不显示)。
+        _t_after = pipeline_state.get_topic(state_file, key) or {}
+        if _t_after.get("review_triage") == "complex" and merged_findings:
+            okd, _tok, _url, _err = _maybe_create_review_doc(
+                key, issue_key, project, _t_after, merged_findings,
+                review_branch, app_id, app_secret)
+            if okd and _url:
+                doc_url = _url
+                pipeline_state.set_topic_fields(state_file, key, review_doc_url=_url)
+            if _err and not okd:
+                print(f"[doc] complex doc skipped: {_err}", file=sys.stderr)
+    except Exception as _dce:
+        print(f"[doc] create review doc err: {_dce}", file=sys.stderr)
+
+    _round_no = int((pipeline_state.get_topic(state_file, key) or {}).get("review_round") or 1)
+    if merged_findings or use_agent:
+        full_text = feishu_notifier.render_rage_card(
+            issue_key, merged_findings, doc_url=doc_url,
+            triage=(pipeline_state.get_topic(state_file, key) or {}).get("review_triage") or "",
+            round_no=_round_no, mr_url=mr_url, jira_url=jira_url,
+        )
     else:
-        # 把 MR state 注入 result, 供 _empty_review_reason 的 C 判据(已合并优先)使用
+        # agent 不可用且无 findings → 走旧 render(兜底解释 WHY: 已合并/无变更/错误)
         _eng_for_render = dict(eng_res or {})
         _gam_for_render = dict(gam_res or {})
         if mr_state:
@@ -2691,6 +2712,45 @@ def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
         return _CLOSURE_NO_MATCH
 
 
+def _maybe_create_review_doc(key, issue_key, project, topic, findings,
+                             review_branch, app_id, app_secret):
+    """Complex review → create the full-review Feishu doc (PlanA) and return
+    (ok, doc_token, url, err). Falls back to (False, ..., reason) when doc scope
+    unavailable or creation fails (caller then renders the card without doc link;
+    PlanB long-post is the fallback at the render layer)."""
+    try:
+        import os as _os, sys as _sys2
+        rdir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                             "..", "skills", "rage-review")
+        _sys2.path.insert(0, rdir)
+        import build_review_doc_http as _brd
+        # build issues in doc schema + files overview
+        issues = []
+        for f in findings or []:
+            issues.append({
+                "severity": f.get("severity") or "建议",
+                "repo": f.get("repo") or "engine",
+                "file": (f.get("file") or "").strip(),
+                "line_range": (f.get("line_range") or "").strip(),
+                "function": (f.get("function") or "").strip(),
+                "description": (f.get("issue") or f.get("description") or "").strip(),
+                "suggestion": (f.get("suggestion") or "").strip(),
+            })
+        files = [{"repo": f.get("repo") or "engine", "path": (f.get("file") or "").strip(),
+                  "insertions": 0, "deletions": 0, "description": ""} for f in findings or []]
+        md = _brd.build_doc_markdown(issue_key, "复杂审查完整报告。", issues, files)
+        grant = [t for t in (topic.get("approver_open_ids") or [])] + \
+                [t for t in ([topic.get("creator_open_id") or ""]) if t]
+        title = f"代码审查 {issue_key}"
+        ok, tok, url, err = _brd.create_lark_doc_http(app_id, app_secret, title, md,
+                                                       grant_view=grant)
+        return ok, tok, url, err
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        return False, "", "", f"_maybe_create_review_doc: {e}"
+
+
 def _set_review_closure_fields(state_file, key, eng_res, gam_res):
     """Persist the rage-style closure state on a topic after a review run.
 
@@ -4350,16 +4410,11 @@ def cmd_ci(args):
         print(f"[ci] {key}: unchanged ({new_status})", flush=True)
         return 0
     print(f"[ci] {key}: {block.replace(chr(10), ' ')[:150]}", flush=True)
-    render = topic.get("render_msg_id")
-    if render and app_id and app_secret:
-        # Build on the REVIEW SUMMARY (findings), not the sparse state card, so the
-        # findings stay visible and CI status is appended — NOT replacing them.
-        base = (topic.get("review_summary") or
-                feishu_notifier.render_state_card(pipeline_state.get_topic(state_file, key)))
-        _run_py("feishu_notifier.py", [
-            "update-reply", "--app-id", app_id, "--app-secret", app_secret,
-            "--message-id", render, "--message-base64",
-            _b64_str(base + "\n\n---\n" + block)])
+    # 方案C: GitLab CI 结果不再显示在 review 卡上（用户要求）。CI 跑在 GitLab
+    # 页面，review 卡只展示代码审查发现 + 交互指令。这里只记录状态去重，不回写卡。
+    # 若真要通知，可在 CI=FAILED 时另发一条独立消息（可选，暂不启用）。
+    # if summary.get("status") == "failed" and render and app_id and app_secret:
+    #     _run_py("feishu_notifier.py", ["send-message", ...])  # 独立 failed 提醒
     # record last reported status to prevent repeat posts
     pipeline_state.set_topic_fields(state_file, key, ci_status=new_status)
     return 0
