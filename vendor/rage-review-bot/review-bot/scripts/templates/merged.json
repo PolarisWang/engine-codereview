@@ -1,0 +1,11 @@
+{
+  "_comment": "Merge success notification — posted after MR is merged into master.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 已合入",
+    "content": [
+      [
+        {"tag": "text", "text": "✅ {{TICKET_ID}} 已合入。"}
+      ]
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "_comment": "Developer hand-off to the approver (DESIGN §1.23.7). Posted mechanically when the dev replies `done` — the first and only time the approver is @-mentioned in the topic under the self-service loop. ISSUE_STATUS_PARAGRAPHS is the fix ledger (built defensively by mechanical_reply_handler._handoff_status_paragraphs, not from a VERIFIED_ISSUES structured var); REJECTED_SECTION_PARAGRAPHS carries the dev's disputed issues plus their stated reasons and vanishes when nothing was rejected; ESCALATE_INSTRUCTION_PARAGRAPHS is passed only when review.triage == \"simple\".",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 开发者提交终审（共 {{ROUND}} 轮）",
+    "content": [
+      [
+        {"tag": "text", "text": "问题处理情况", "style": ["bold"]}
+      ],
+      "{{ISSUE_STATUS_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{REJECTED_SECTION_PARAGRAPHS}}",
+      [
+        {"tag": "at", "user_id": "{{APPROVER_ID}}", "user_name": "审查人"},
+        {"tag": "text", "text": " {{DEVELOPER_NAME}} 已完成修复并提交终审:"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复 \"ok\" 批准"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复问题序号（如 2 4）将对应异议问题重新列入修复"}
+      ],
+      "{{ESCALATE_INSTRUCTION_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "· 回复 \"close\" 或 \"关闭\" 终止MR"}
+      ]
+    ]
+  }
+}

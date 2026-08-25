@@ -1,0 +1,26 @@
+{
+  "_comment": "Post-merge cherry-pick offer. Posted by process_merge_queue._offer_cherrypick() right after the merged notice, when at least one active release branch was discovered. The token->branch mapping is generated per topic (active branches move as new rc branches are cut), so BRANCH_LINES is the authoritative mapping the approver answers against. See DESIGN section 1.24.",
+  "_usage": "Vars: TICKET_ID, APPROVER_ID (the cherry-pick decider — REVIEW_BOT_CHERRYPICK_DECIDER_OPEN_ID, falling back to the primary approver; any approver may still answer), BRANCH_LINES (array placeholder - one paragraph per offered branch, built by _offer_cherrypick). The topic stays out of closed/ while review.cherrypick_window_until is in the future; the dispatcher archives it on expiry.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "需要 cherry-pick 到发布分支吗？当前活跃分支："}
+      ],
+      "{{BRANCH_LINES}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "at", "user_id": "{{APPROVER_ID}}", "user_name": "审查人"},
+        {"tag": "text", "text": " 回复分支代号即可（如 \"p1\"，多个用空格分隔 \"p1 p2\"），或回复 \"no\" 跳过。"}
+      ],
+      [
+        {"tag": "text", "text": "· 仅列出各系列中最新的活跃分支，旧分支不再接收 cherry-pick"}
+      ],
+      [
+        {"tag": "text", "text": "· 24 小时内有效，逾期本话题自动归档"}
+      ]
+    ]
+  }
+}

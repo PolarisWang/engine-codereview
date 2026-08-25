@@ -1,0 +1,14 @@
+{
+  "_comment": "Posted by topic_reopen.reopen_superseded_predecessor when the duplicate root that superseded this topic is withdrawn - the topic is restored to its pre-supersede state and its missed replies are backfilled. The close line is the escape hatch for an unwanted resurrection. See DESIGN section 1.2.9.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "🤖 检测到重复话题已撤回，本话题的审查状态已恢复，将继续处理此前的回复。"}
+      ],
+      [
+        {"tag": "text", "text": "如已推送修改，请回复 \"ok\" 触发复审；如需终止审查，请回复 \"close\"。"}
+      ]
+    ]
+  }
+}

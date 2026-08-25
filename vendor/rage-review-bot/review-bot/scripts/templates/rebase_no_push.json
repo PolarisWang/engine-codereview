@@ -1,0 +1,12 @@
+{
+  "_comment": "Posted by mechanical_reply_handler.drain_rebase_conflict_ack() when a developer replies `ok` on a rebase-conflict-parked topic but the branch SHA has NOT advanced (they typed ok without pushing). Topic stays parked. See DESIGN section 3.29.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "at", "user_id": "{{DEVELOPER_ID}}", "user_name": "{{DEVELOPER_NAME}}"},
+        {"tag": "text", "text": " 未检测到新提交，请先推送解决冲突后的分支，再回复 ok。"}
+      ]
+    ]
+  }
+}

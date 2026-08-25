@@ -1,0 +1,24 @@
+{
+  "_comment": "Dev-triage → arbitration summary (DESIGN §1.23.2). Posted mechanically after the developer triages the round-1 issues. AGREED/REJECTED sections come from render.build_triage_section_paragraphs (empty side vanishes); ESCALATE_INSTRUCTION_PARAGRAPHS is passed only when review.triage == \"simple\".",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 开发者意见裁决",
+    "content": [
+      "{{AGREED_SECTION_PARAGRAPHS}}",
+      "{{REJECTED_SECTION_PARAGRAPHS}}",
+      [
+        {"tag": "at", "user_id": "{{APPROVER_ID}}", "user_name": "审查人"},
+        {"tag": "text", "text": " 请裁决开发者的处理意见:"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复 \"ok\" 同意（有待修复问题时通知开发者修复；全部无需修复时直接批准）"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复问题序号（如 2 4）将对应异议问题重新列入修复"}
+      ],
+      "{{ESCALATE_INSTRUCTION_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "· 回复 \"close\" 或 \"关闭\" 终止MR"}
+      ]
+    ]
+  }
+}

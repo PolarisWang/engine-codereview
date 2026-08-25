@@ -1,0 +1,23 @@
+{
+  "_comment": "Merge failure notification — auto-merge failed after rebase succeeded. Developer + approver must merge manually via GitLab UI.",
+  "_usage": "Called from process_merge_queue._post_merge_failure() when merge_tracker.merge_mr() returns success=false. Covers HTTP 405 (non-retryable policy rejection) on first failure and any error after MAX_MERGE_RETRIES.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "\u26a0\ufe0f \u81ea\u52a8\u5408\u5e76\u5931\u8d25\uff0c\u9700\u8981\u624b\u52a8\u5408\u5e76\u3002"}
+      ],
+      [
+        {"tag": "text", "text": "\u4ed3\u5e93\uff1a{{REPO}}  \u9519\u8bef\uff1a{{ERROR}}"}
+      ],
+      [
+        {"tag": "at", "user_id": "{{DEVELOPER_ID}}", "user_name": "{{DEVELOPER_NAME}}"},
+        {"tag": "text", "text": " "},
+        {"tag": "at", "user_id": "{{APPROVER_ID}}", "user_name": "\u5ba1\u67e5\u4eba"},
+        {"tag": "text", "text": " \u8bf7\u524d\u5f80 "},
+        {"tag": "a", "text": "MR", "href": "{{MR_URL}}"},
+        {"tag": "text", "text": " \u624b\u52a8\u5408\u5e76\u3002\u5408\u5e76\u961f\u5217\u5df2\u505c\u6b62\u91cd\u8bd5\u6b64 ticket\u3002"}
+      ]
+    ]
+  }
+}

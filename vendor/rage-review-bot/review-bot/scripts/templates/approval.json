@@ -1,0 +1,11 @@
+{
+  "_comment": "Approval notification — MR approved, pipeline status included.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 审查通过",
+    "content": [
+      [
+        {"tag": "text", "text": "✅ {{TICKET_ID}} 已批准。{{PIPELINE_MSG}}"}
+      ]
+    ]
+  }
+}

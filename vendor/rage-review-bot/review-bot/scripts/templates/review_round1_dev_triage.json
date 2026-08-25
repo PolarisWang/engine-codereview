@@ -1,0 +1,49 @@
+{
+  "_comment": "NOTE: no `回复 ok` instruction here — see the warning in review_roundN.json; `ok` in DEV_TRIAGE is either dropped or read as an approver approval. Round 1 review post, self-service dev loop (DESIGN §1.23) — @DEVELOPER triages the issue list; the approver is only mentioned once the dev replies `done` (handoff_summary, §1.23.7). Simple reviews pass FILES + ISSUES (full inline detail); full/complex reviews pass DOC_LINK + ISSUES (terse) and OMIT FILES. No escalate line here — escalation is the approver's, post-handoff. Keep the reply-instruction lines in sync with review_roundN.json.",
+  "_usage": "python scripts/templates/render.py review_round1_dev_triage --vars '{...}' > $WRITE_TMP_DIR/post.json",
+  "zh_cn": {
+    "title": "代码审查 {{TICKET_ID}}（第 {{ROUND}} 轮）",
+    "content": [
+      "{{DOC_LINK_PARAGRAPHS}}",
+      "{{FILE_SECTION_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "问题汇总", "style": ["bold"]}
+      ],
+      "{{ISSUE_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{MANUAL_ISSUE_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "审查结论: {{SUMMARY}}"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "at", "user_id": "{{DEVELOPER_ID}}", "user_name": "{{DEVELOPER_NAME}}"},
+        {"tag": "text", "text": " 请先确认需要修复的问题:"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复问题序号（如 1 3 5）确认修复这些问题，其余视为有异议"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复 \"-2\" 表示仅对 #2 有异议，其余修复；回复 \"all\" 全部修复"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复 \"none\" 或 \"不修\" 表示全部有异议"}
+      ],
+      [
+        {"tag": "text", "text": "· 序号后可附异议理由（如 \"-2 该写法是有意为之\"），提交终审时一并转交审查人"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复 \"done\" 提交审查人终审"}
+      ],
+      [
+        {"tag": "text", "text": "· 如有疑问，请以 "},
+        "{{BOT_MENTION_SEGMENTS}}",
+        {"tag": "text", "text": " 开头提问"}
+      ]
+    ]
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "_comment": "Immediate ack posted by scripts/ack_new_topic.py when a new RAGE ticket is picked up. Races ahead of the Claude topic agent so the user sees a response within seconds. The full review follows. TOPIC_ID (= thread_id = root message id) is printed so a developer can hand it to another agent, which then drives the topic per reference/agent-topic-reply.md (DESIGN §1.25).",
+  "_usage": "python scripts/templates/render.py ack_new_topic --vars '{...}' > $WRITE_TMP_DIR/post.json",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "🤖 自动化 Review 已收到 "},
+        {"tag": "text", "text": "{{TICKET_ID}}", "style": ["bold"]}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{REPO_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "text", "text": "⚠️注意：本次审查将仅针对上述MR，如果同一工单还会发起其他MR，请在本次审查结束后（合并结束或者关闭），重新使用Jira单号发起审查。"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "text", "text": "正在审查，请稍候…"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "text", "text": "话题 ID: "},
+        {"tag": "text", "text": "{{TOPIC_ID}}", "style": ["bold"]}
+      ],
+      [
+        {"tag": "text", "text": "（把它交给其他 agent，即可让它代你在本话题回复）"}
+      ]
+    ]
+  }
+}

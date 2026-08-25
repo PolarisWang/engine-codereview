@@ -1,0 +1,11 @@
+{
+  "_comment": "Posted by mechanical_reply_handler.drain_rebase_conflict_ack() when a developer replies `ok` on a rebase-conflict-parked topic AND the branch SHA has advanced (they actually pushed). Clears review.rebase_conflict_blocked so the topic re-enters the normal APPROVED merge flow. See DESIGN section 3.29.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "✅ 流水线运行中，完成后将自动合并。"}
+      ]
+    ]
+  }
+}

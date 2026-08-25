@@ -1,0 +1,16 @@
+{
+  "_comment": "Rebase conflict notification. Auto-rebase failed before merge. The bot parks the topic (stops auto-retrying) and waits for the developer to rebase, push, and reply `ok`. See DESIGN section 3.29.",
+  "_usage": "Called from process_merge_queue._post_conflict() when merge_tracker.rebase_mr() returns success=false with 'conflict' in error. The topic is then parked via review.rebase_conflict_blocked until a dev `ok` (SHA-verified) clears it.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "⚠️ 自动 rebase 失败（存在冲突），已暂停自动合并。"}
+      ],
+      [
+        {"tag": "at", "user_id": "{{DEVELOPER_ID}}", "user_name": "{{DEVELOPER_NAME}}"},
+        {"tag": "text", "text": " 请在本地 rebase 解决冲突并推送分支；完成后回复 ok 触发合并（在收到 ok 前机器人不会再自动重试）。"}
+      ]
+    ]
+  }
+}

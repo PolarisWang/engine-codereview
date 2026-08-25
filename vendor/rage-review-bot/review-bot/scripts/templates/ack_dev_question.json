@@ -1,0 +1,14 @@
+{
+  "_comment": "Immediate ack posted by scripts/ack_dev_question.py when a developer posts an `@bot <question>` (dev_question). Races ahead of the Claude topic agent's actual answer so the developer sees a response within seconds; the real answer follows as a freeform_reply. See DESIGN §1.3.3.",
+  "_usage": "python scripts/templates/render.py ack_dev_question --vars '{...}' > $WRITE_TMP_DIR/post.json",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 提问",
+    "content": [
+      [
+        {"tag": "text", "text": "🤖 已收到 "},
+        {"tag": "text", "text": "{{TICKET_ID}}", "style": ["bold"]},
+        {"tag": "text", "text": " 的提问，正在查证，稍后回复…"}
+      ]
+    ]
+  }
+}

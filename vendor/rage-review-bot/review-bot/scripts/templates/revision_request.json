@@ -1,0 +1,33 @@
+{
+  "_comment": "Revision request — the fix list posted to the developer. Self-service loop (DESIGN §1.23.6): the dev's own triage produces this list every round, so the header is neutral about who decided; PREFIX_PARAGRAPHS carries the approver's reinstate note when one applies (§1.23.9), MANUAL_ISSUE_PARAGRAPHS any newly discovered human MR comments. Legacy path: approver marked indices in TRIAGE_DECISION/AWAITING_APPROVAL. Both optional slots default to [].",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 修订请求",
+    "content": [
+      "{{PREFIX_PARAGRAPHS}}",
+      [
+        {"tag": "at", "user_id": "{{DEVELOPER_ID}}", "user_name": "{{DEVELOPER_NAME}}"},
+        {"tag": "text", "text": " 以下问题待修复:"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{FLAGGED_ISSUE_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{MANUAL_ISSUE_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "修复后推送并回复 "},
+        {"tag": "text", "text": "ok", "style": ["bold"]},
+        {"tag": "text", "text": " 触发下一轮审查；完成后回复 "},
+        {"tag": "text", "text": "done", "style": ["bold"]},
+        {"tag": "text", "text": " 提交审查人终审。"}
+      ],
+      [
+        {"tag": "text", "text": "如有疑问，请以 "},
+        "{{BOT_MENTION_SEGMENTS}}",
+        {"tag": "text", "text": " 开头提问。"}
+      ]
+    ]
+  }
+}

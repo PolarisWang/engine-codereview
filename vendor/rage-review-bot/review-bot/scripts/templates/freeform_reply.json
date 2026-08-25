@@ -1,0 +1,10 @@
+{
+  "_comment": "Freeform reply for dev_question answers, escalate clarifications, and other agent-generated text where there isn't a tighter template. Pass BODY_PARAGRAPHS as a JSON array of paragraph arrays. Use TITLE for the post title (Chinese, e.g. 'RAGE-12345 回复').",
+  "_usage": "python scripts/templates/render.py freeform_reply --vars '{\"TITLE\":\"RAGE-12345 回复\",\"BODY_PARAGRAPHS\":[[{\"tag\":\"text\",\"text\":\"...\"}]]}'",
+  "zh_cn": {
+    "title": "{{TITLE}}",
+    "content": [
+      "{{BODY_PARAGRAPHS}}"
+    ]
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "_comment": "Round 1 review post. Simple reviews pass FILES + ISSUES (full inline detail). Full/complex reviews pass DOC_LINK + ISSUES (terse) and OMIT FILES — the doc is the canonical detail view; the inline issue list keeps the index→reply flow.",
+  "_usage": "python scripts/templates/render.py review_round1 --vars '{...}' > $WRITE_TMP_DIR/post.json",
+  "zh_cn": {
+    "title": "代码审查 {{TICKET_ID}}（第 {{ROUND}} 轮）",
+    "content": [
+      "{{DOC_LINK_PARAGRAPHS}}",
+      "{{FILE_SECTION_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "问题汇总", "style": ["bold"]}
+      ],
+      "{{ISSUE_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{MANUAL_ISSUE_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "审查结论: {{SUMMARY}}"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "at", "user_id": "{{APPROVER_ID}}", "user_name": "审查人"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复问题序号（如 1,3,5）标记需修改；回复 \"all\" 标记全部；回复 \"-2 -4\" 标记除 #2 #4 外的全部"}
+      ],
+      [
+        {"tag": "text", "text": "· 回复 \"ok\" 批准"}
+      ],
+      "{{ESCALATE_INSTRUCTION_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "· 回复 \"close\" 或 \"关闭\" 终止MR"}
+      ]
+    ]
+  }
+}

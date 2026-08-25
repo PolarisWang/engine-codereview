@@ -1,0 +1,11 @@
+{
+  "_comment": "MR-closed notification — posted when a mechanical reconcile path (dispatcher passive check / recover) detects the MR was closed on GitLab out-of-band. Keeps the thread honest about the terminal transition. Parallel to merged.json. See DESIGN §1.6.11.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}} 已关闭",
+    "content": [
+      [
+        {"tag": "text", "text": "⚠️ {{TICKET_ID}} 的 MR 已在 GitLab 端关闭，本话题已关闭。"}
+      ]
+    ]
+  }
+}

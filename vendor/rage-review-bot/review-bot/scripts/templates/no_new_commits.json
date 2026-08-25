@@ -1,0 +1,12 @@
+{
+  "_comment": "No new commits detected — developer replied but no new SHA since last review.",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}",
+    "content": [
+      [
+        {"tag": "text", "text": "{{TICKET_ID}} 未检测到新提交（上次审查提交: {{LAST_SHA_SHORT}}）。请推送修复后再回复 ok 重新触发。 "},
+        "{{DEVELOPER_MENTION_SEGMENTS}}"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "_comment": "Immediate ack posted by scripts/ack_dev_reply.py when a developer pushes a revision and replies `ok`. Races ahead of the Claude topic agent's round-N review so the developer + approver see a response within seconds; the full re-review follows. Mirrors ack_new_topic in shape so the thread stays visually consistent across rounds.",
+  "_usage": "python scripts/templates/render.py ack_dev_reply --vars '{...}' > $WRITE_TMP_DIR/post.json",
+  "zh_cn": {
+    "title": "{{TICKET_ID}}（第 {{ROUND}} 轮）",
+    "content": [
+      [
+        {"tag": "text", "text": "🤖 已收到 "},
+        {"tag": "text", "text": "{{TICKET_ID}}", "style": ["bold"]},
+        {"tag": "text", "text": " 第 "},
+        {"tag": "text", "text": "{{ROUND}}", "style": ["bold"]},
+        {"tag": "text", "text": " 轮修改"}
+      ],
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      "{{REPO_PARAGRAPHS}}",
+      [
+        {"tag": "text", "text": "\n"}
+      ],
+      [
+        {"tag": "text", "text": "正在审查，请稍候…"}
+      ]
+    ]
+  }
+}
