@@ -2238,15 +2238,27 @@ def render_rage_markdown_from_findings(findings, meta=None, repo_label=""):
     return "\n".join([head] + lines + [total])
 
 
+def _findings_counts_zh(findings):
+    """Count findings by rage 4-tier severity (严重/中/轻/建议). A NEW field the
+    agent path adds alongside the legacy 3-tier `severity_counts`, so downstream
+    card render stays 3-level-compatible while the rage-standard 4-tier is
+    available. See http-fallback card path (feishu_notifier uses 3-tier keys)."""
+    from collections import Counter
+    return {"严重": 0, "中": 0, "轻": 0, "建议": 0, **Counter(
+        _severity_zh(f.get("severity")) for f in (findings or []))}
+
+
 def _build_review_dict(findings, diff_info, repo_label="engine"):
     """Assemble the review result the rest of the pipeline consumes."""
-    counts = _findings_counts(findings)
+    counts = _findings_counts(findings)          # legacy 3-tier (critical/warning/suggestion)
+    counts_zh = _findings_counts_zh(findings)    # rage 4-tier (严重/中/轻/建议)
     # Render a rage-standard report (严重/中/轻/建议 + [Repo] file:line).
     review_text = render_rage_markdown_from_findings(findings, meta={}, repo_label=repo_label)
     return {
         "summary": "",
         "review_text": review_text,
         "severity_counts": counts,
+        "severity_counts_zh": counts_zh,
         "findings": findings,
         "error": None,
         "batches": 1,

@@ -414,9 +414,17 @@ def run(args):
     eng_out = os.path.join(workspace, f"result_{key}_engine.json")
     gam_out = os.path.join(workspace, f"result_{key}_game.json")
     # rage-style per-topic agent review (Path A): spawn claude-opus-5 subprocess
-    # agent so findings bind to real code with whole-file verification. Keyed off
-    # config/env so it can be turned on per-project, with HTTP fallback retained.
-    use_agent = _env("REVIEW_AGENT", "").lower() in ("1", "true", "yes") or \
+    # agent so findings bind to real code with whole-file verification. Read
+    # config.yaml review.agent_enabled OR env so the gray-switch works both when
+    # the executor sets env and when it only relies on config. HTTP fallback kept.
+    _rev_cfg = {}
+    try:
+        import config as _cfg
+        _rev_cfg = (_cfg.load_config().get("review") or {})
+    except Exception:
+        pass
+    use_agent = bool(_rev_cfg.get("agent_enabled")) or \
+        _env("REVIEW_AGENT", "").lower() in ("1", "true", "yes") or \
         _env("REVIEW_AGENT_MODEL", "") != ""
     # round-N incremental: pass the previous review SHA + carried (already-settled)
     # issue indices so the agent diffs only since last review and does NOT re-raise
