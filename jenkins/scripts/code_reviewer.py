@@ -1906,6 +1906,284 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
 
 
 
+# ── rage-style agent contract (ported from rage/.claude/skills/review-bot
+#    /scripts/spawn_topic_agent.md mandatory rules). The spawned `claude -p`
+#    agent reads the LOCAL repo at REPO_DIR (git available) so it can
+#    `git show <SHA>:<path>` to read whole-file context before raising any
+#    scope-dependent finding — the core of rage's review quality. ─────────────
+AGENT_SYSTEM = """\
+You are a senior game engine code reviewer, operating as an autonomous review
+agent for ONE merge request. All user-facing review text is Simplified Chinese;
+internal notes (filenames, mode names) may be English.
+
+You get a local git checkout. Use it to verify claims against the real code,
+NEVER trust the diff hunk alone.
+
+## Mandatory rules (violate at your own peril)
+
+1. Review ONLY the real `+`/`-` lines in the diff and the real functions they
+   touch. Referencing a function/symbol that does not exist, or unchanged code,
+   is fabrication. No fabrication.
+
+2. Structured findings. Output exactly one JSON object (no prose before/after)
+   via the `review_findings` tool with this shape per finding:
+     {file, severity, line_range, function?, issue, suggestion}
+   - `severity` MUST be one of: 严重|中|轻|建议
+      严重 = correctness bugs (races, memory corruption, logic errors, security)
+      中   = significant design/rule-pattern violations (raw new/delete,
+             dynamic_cast, shared_ptr, architecture, perf regression)
+      轻   = localized project-rule violations (naming, magic numbers, missing
+             const, misleading names) — default naming/convention issues to 轻,
+             NOT 建议
+      建议 = pure opinion where no project rule is invoked
+   - `file` MUST be a changed file path (repo-relative).
+   - `line_range` REQUIRED for any line-scoped finding, e.g. "120-145". Omit
+     only for genuinely whole-file/structural findings. Must point at a real
+     changed line.
+   - `issue` is prose only (do NOT bake file/line into it).
+
+3. Whole-file scope verification (the single most important anti-false-positive
+   rule). A diff hunk carries only ~3 lines of context. BEFORE raising ANY
+   finding whose validity depends on enclosing lexical scope — preprocessor
+   guards (#ifdef/#if/#endif), namespace/class/function brace nesting, or a
+   declaration-vs-definition guard match — run:
+     git show <branch_sha>:<path>      (or grep the #ifdef/#endif lines)
+   and confirm which region actually encloses the symbol. Inferring "unguarded"
+   / "out of scope" / "no matching declaration" from the hunk alone is a
+   false-positive trap. Applies to every finding.
+
+4. Re-check against the full file before declaring anything. If a pattern you
+   want to flag is not present at the location in the assembled file, do NOT
+   flag it.
+
+5. Sort issues by severity (严重 > 中 > 轻 > 建议) before numbering.
+
+6. If the code has no real issues, output an empty findings array AND a
+   non-empty `summary` that explicitly states 已完成审查，未发现问题. An empty
+   findings array with an empty/absent summary is an LLM failure, not a review.
+"""
+
+
+def _spawn_review_agent(diff_info, project, issue_key, repo_type,
+                        model=None, claude_exe="claude", timeout=900):
+    """Spawn a per-topic `claude -p --model claude-opus-5` review agent.
+
+    Writes a topic spec + diff context to temp files, invokes the container's
+    claude CLI as a one-shot agent with Bash/Read access to the local repo at
+    REPO_DIR, and parses its structured `review_findings` tool output back into
+    the same {findings, summary, severity_counts, review_text, error} shape the
+    HTTP path returns, so the orchestrate cache/record/render layers are
+    unchanged.
+
+    Returns {"summary", "review_text", "severity_counts", "findings", "error",
+             "batches"}.
+    """
+    # rage replication: review agent runs on Opus. Allow override via env so
+    # operators can tier per-project without a code change.
+    model = model or os.environ.get("REVIEW_AGENT_MODEL", "") or "claude-opus-5"
+    claude_exe = os.environ.get("CLAUDE_EXE", claude_exe)
+    if not diff_info or not diff_info.get("diff_text"):
+        return {"summary": "No diff to review", "findings": [],
+                "severity_counts": {}, "error": None, "batches": 0}
+    repo_dir = diff_info.get("repo_dir") or ""
+    branch = diff_info.get("branch") or ""
+    base_branch = diff_info.get("base_branch") or ""
+    changed_files = diff_info.get("changed_files") or []
+    commit_log = diff_info.get("commit_log") or ""
+    diff_text = diff_info["diff_text"]
+    # Bound the diff we hand the agent so a record-breaking branch can't blow
+    # the subprocess budget (the agent can always git show for more).
+    if len(diff_text) > 200000:
+        diff_text = diff_text[:200000] + "\n\n...[truncated]"
+
+    user_prompt = f"""Review the following MR.
+
+Project: {project} ({repo_type} repository)
+Issue: {issue_key}
+Repo dir (local git checkout, use `git show <branch_sha>:<path>` to read whole files): {repo_dir}
+Branch: {branch}
+Base: {base_branch}
+Branch SHA: {diff_info.get('branch_sha') or branch}
+Diff hash: {diff_info.get('diff_hash') or ''}
+
+Changed files:
+{chr(10).join(changed_files)}
+
+Commits:
+{commit_log}
+
+Diff:
+```diff
+{diff_text}
+```
+"""
+
+    payload = {
+        "model": model,
+        "max_tokens": (get_claude_config() or {}).get("max_tokens", 8192),
+        "system": AGENT_SYSTEM,
+        "tools": REVIEW_TOOLS,
+        "tool_choice": {"type": "tool", "name": "review_findings"},
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            payload_path = f.name
+        # Spawn the container claude CLI as a one-shot agent.
+        cmd = [claude_exe, "-p", "--model", model,
+               "--output-format", "json",
+               f"Read the review task; process it end-to-end per your system "
+               f"prompt; use the review_findings tool and return exactly one "
+               f"JSON object."]
+        env = os.environ.copy()
+        if repo_dir:
+            env.setdefault("PWD", repo_dir)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                              timeout=timeout)
+        raw = proc.stdout.strip()
+        if proc.returncode != 0:
+            return {"summary": "agent failed", "findings": [],
+                    "severity_counts": {}, "error": raw[:400] or "claude rc!=0",
+                    "batches": 1}
+        # Parse the structured findings from stdout (agent echoes the JSON).
+        findings = _parse_agent_json(raw)
+        if findings is None:
+            return {"summary": "agent output unparseable", "findings": [],
+                    "severity_counts": {},
+                    "error": f"no JSON in agent stdout: {raw[:400]}",
+                    "batches": 1}
+        kept, traces = _post_validate_findings(findings, diff_info)
+        net = _build_review_dict(kept, diff_info)
+        return net
+    except subprocess.TimeoutExpired:
+        return {"summary": "agent timeout", "findings": [], "severity_counts": {},
+                "error": f"claude subprocess timed out after {timeout}s", "batches": 1}
+    except Exception as e:
+        return {"summary": "agent error", "findings": [], "severity_counts": {},
+                "error": f"{e}", "batches": 1}
+    finally:
+        try:
+            os.unlink(payload_path)
+        except (OSError, NameError):
+            pass
+
+
+def _parse_agent_json(raw):
+    """Pull the findings list out of the agent's stdout (JSON tool call)."""
+    if not raw:
+        return None
+    # Accept raw findings array or wrapped {findings:[...]}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("findings"), list):
+            return data["findings"]
+    except json.JSONDecodeError:
+        pass
+    # Sometimes the agent wraps JSON in ```json fences.
+    import re as _re
+    m = _re.search(r"```json\s*(.+?)\s*```", raw, _re.S)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and "findings" in data:
+                return data["findings"]
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _severity_zh(sev):
+    """Map a severity value to rage's 4-tier canonical label."""
+    s = (sev or "").strip().lower()
+    if s in ("严重", "critical", "high", "error", "blocker"):
+        return "严重"
+    if s in ("中", "warning", "warn", "medium"):
+        return "中"
+    if s in ("轻", "suggestion", "info", "note", "minor", "low"):
+        return "轻"
+    return "建议"
+
+
+def _severity_sort_key(sev):
+    return {"严重": 0, "中": 1, "轻": 2, "建议": 3}.get(_severity_zh(sev), 3)
+
+
+def render_rage_markdown_from_findings(findings, meta=None, repo_label=""):
+    """Render a rage-standard review report (完全对齐 rage 审查输出):
+
+      🔍 Code Review — N 项
+      (empty/findings each as)
+      #1 [严重] [Repo] file:line_range 问题 → 修法
+      ...
+      📊 严重X / 中Y / 轻Z / 建议W
+
+    Findings are sorted by severity then #N assigned. `repo_label` (e.g.
+    "chaos"/"rage"/"engine") is prefixed when provided, mirroring rage's
+    `[Repo] file:line_range` prefix. This is the card body for the agent path
+    and matches the numbering the round-N / revision flow expects.
+    """
+    meta = meta or {}
+    findings = findings or []
+    ordered = sorted(findings, key=lambda f: (_severity_sort_key(f.get("severity")),
+                                              (f.get("file") or "")))
+    counts = {"严重": 0, "中": 0, "轻": 0, "建议": 0}
+    lines = []
+    for i, f in enumerate(ordered, start=1):
+        sev = _severity_zh(f.get("severity"))
+        counts[sev] += 1
+        file = (f.get("file") or "").strip()
+        lr = (f.get("line_range") or "").strip()
+        func = (f.get("function") or "").strip()
+        loc = file
+        if lr:
+            loc += f":{lr}"
+        if func:
+            loc += f" {func}"
+        prefix = f"[{repo_label}] " if repo_label else ""
+        issue = (f.get("issue") or "").strip()
+        fix = (f.get("suggestion") or "").strip()
+        line = f"#{i} [{sev}] {prefix}{loc}: {issue}"
+        if fix:
+            line += f" → {fix}"
+        lines.append(line)
+    head = f"🔍 Code Review — {len(ordered)} 项"
+    if meta.get("summary"):
+        head += f"\n{meta['summary']}"
+    total = f"📊 严重{counts['严重']} / 中{counts['中']} / 轻{counts['轻']} / 建议{counts['建议']}"
+    return "\n".join([head] + lines + [total])
+
+
+def _build_review_dict(findings, diff_info, repo_label="engine"):
+    """Assemble the review result the rest of the pipeline consumes."""
+    counts = _findings_counts(findings)
+    # Render a rage-standard report (严重/中/轻/建议 + [Repo] file:line).
+    review_text = render_rage_markdown_from_findings(findings, meta={}, repo_label=repo_label)
+    return {
+        "summary": "",
+        "review_text": review_text,
+        "severity_counts": counts,
+        "findings": findings,
+        "error": None,
+        "batches": 1,
+        "verification": {
+            "vault": [], "counts": {"kept": len(findings), "flagged": 0, "dropped": 0},
+            "confidence": {"dropped": [], "warned_count": 0},
+            "dropped_decision": "agent-contract enforced",
+            "repo_dir_available": bool(diff_info.get("repo_dir")),
+            "base_branch": diff_info.get("base_branch") or "",
+            "branch": diff_info.get("branch") or "",
+            "stage2_verify": False,
+            "generated_by": {"model": "claude-opus-5"},
+        },
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Code Review via Claude API")
     parser.add_argument("--repo", required=True, help="Git repository URL")
@@ -1921,6 +2199,8 @@ def main():
     parser.add_argument("--dry", action="store_true",
                         help="Compute the diff hash only (no LLM call); for result caching")
     parser.add_argument("--mr-url", default="", help="Merge request URL")
+    parser.add_argument("--agent", action="store_true",
+                        help="Review via per-topic claude subprocess agent (rage-style, model=claude-opus-5)")
     args = parser.parse_args()
 
     config = load_config(repo_type=args.repo_type)
@@ -1985,9 +2265,13 @@ def main():
         else:
             # Code review via Claude
             print(f"[{args.repo_type}] Sending to Claude API for review...", flush=True)
-            review_result = review_with_claude(
-                diff_info, config, args.project, args.issue_key, args.repo_type
-            )
+            if getattr(args, "agent", False):
+                review_result = _spawn_review_agent(
+                    diff_info, args.project, args.issue_key, args.repo_type)
+            else:
+                review_result = review_with_claude(
+                    diff_info, config, args.project, args.issue_key, args.repo_type
+                )
             result = {
                 "project": args.project,
                 "issue_key": args.issue_key,

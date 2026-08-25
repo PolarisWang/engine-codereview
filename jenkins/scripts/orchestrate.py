@@ -413,9 +413,15 @@ def run(args):
     _log('REVIEWING', 'RUNNING', key, issue_key, project, '', 'code review started')
     eng_out = os.path.join(workspace, f"result_{key}_engine.json")
     gam_out = os.path.join(workspace, f"result_{key}_game.json")
+    # rage-style per-topic agent review (Path A): spawn claude-opus-5 subprocess
+    # agent so findings bind to real code with whole-file verification. Keyed off
+    # config/env so it can be turned on per-project, with HTTP fallback retained.
+    use_agent = _env("REVIEW_AGENT", "").lower() in ("1", "true", "yes") or \
+        _env("REVIEW_AGENT_MODEL", "") != ""
     eng_res, gam_res = _review_repos(
         key, project, issue_key, review_branch, base_branch, engine_base,
-        engine_repo, game_repo, mr_url, workspace, eng_out, gam_out)
+        engine_repo, game_repo, mr_url, workspace, eng_out, gam_out,
+        use_agent=use_agent)
 
     # 4. Record per-repo terminal states + update the in-flight card.
     _record_repo_state(state_file, key, "engine", eng_out, eng_res, review_branch, base_branch,
@@ -4270,7 +4276,8 @@ def _is_bad_empty_result(res):
 
 
 def _review_repos(key, project, issue_key, review_branch, base_branch, engine_base,
-                  engine_repo, game_repo, mr_url, workspace, eng_out, gam_out):
+                  engine_repo, game_repo, mr_url, workspace, eng_out, gam_out,
+                  use_agent=False):
     # Cache dir for reuse by diff_hash (avoids re-POSTing unchanged diffs to the LLM).
     cache_dir = os.path.join(workspace, ".review_cache")
     # Review cache version: bump when the rendered review format/prompt changes, so
@@ -4281,6 +4288,7 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         base_args = ["--repo", repo_url, "--branch", rb, "--base-branch", baseb,
                      "--project", project, "--issue-key", issue_key,
                      "--repo-type", repo, "--mr-url", mr_url, "--workspace", workspace]
+        review_args = base_args + (["--agent"] if use_agent else [])
         # 1) Dry run: get diff_hash without the (expensive) LLM call.
         rc, out, err = _run_py("code_reviewer.py", base_args + ["--output", out_path + ".dry", "--dry"])
         dry = _read_json_file(out_path + ".dry") or {}
@@ -4315,7 +4323,7 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
                     _log('REPO', 'SOLVED', key, issue_key, project, repo,
                          f"cached result for {diff_hash[:8]} is an LLM-empty stub; re-reviewing")
         # 2) Real review (LLM).
-        rc2, _, err2 = _run_py("code_reviewer.py", base_args + ["--output", out_path])
+        rc2, _, err2 = _run_py("code_reviewer.py", review_args + ["--output", out_path])
         res = _read_json_file(out_path)
         # Save to cache for reuse only for a REAL (non-empty) diff AND a valid result
         # (not an LLM-empty stub) — see _is_bad_empty.
@@ -4330,7 +4338,6 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
     eng_res, rc_e = _one("engine", engine_repo, review_branch, engine_base, eng_out)
     gam_res, rc_g = _one("game", game_repo, review_branch, base_branch, gam_out)
     return eng_res, gam_res
-
 
 def _record_repo_state(state_file, key, repo, out_path, res, review_branch, base_branch, repo_url=""):
     repo_url = repo_url or ""

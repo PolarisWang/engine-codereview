@@ -7,7 +7,10 @@ the index/triage reply-parse grammar. They guard the port: any future
 platform-adapter edit must not change this behavior.
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skills", "rage-review"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# rage-review core (vendored / ported) + jenkins/scripts (code_reviewer)
+sys.path.insert(0, os.path.join(_HERE, "..", "skills", "rage-review"))
+sys.path.insert(0, os.path.join(_HERE, "..", "scripts"))
 
 import state_machine as sm
 import review_rounds as rr
@@ -88,3 +91,35 @@ def test_indices_none_needs_flag():
     assert rp.parse_indices_with_mode("none") is None
     n = rp.parse_indices_with_mode("none", allow_none=True)
     assert n is not None and n.get("none") is True
+
+
+# ── rage-standard renderer (severity 严重/中/轻/建议 + [Repo] file:line) ───
+
+def test_rage_render_severity_sort_and_location():
+    import code_reviewer as cr
+    findings = [
+        {"file": "a.cpp", "severity": "轻", "issue": "const 缺失"},
+        {"file": "a.cpp", "severity": "严重", "line_range": "120-145",
+         "issue": "路径校验缺失", "suggestion": "加校验"},
+    ]
+    d = cr._build_review_dict(findings, {"repo_dir": "/x", "base_branch": "m",
+                                         "branch": "b"}, repo_label="chaos")
+    text = d["review_text"]
+    # 严重 first (sorted), #N assigned after sort
+    assert "#1 [严重]" in text and "#2 [轻]" in text
+    # [Repo] file:line_range prefix
+    assert "[chaos] a.cpp:120-145" in text
+    # severity count line uses the 4-tier rack
+    assert "📊 严重1 / 中0 / 轻1 / 建议0" in text
+    # downstream severity_counts kept in 3-tier for legacy cache/render compat
+    assert d["severity_counts"] == {"critical": 0, "warning": 0, "suggestion": 2}
+
+
+def test_severity_zh_mapping():
+    import code_reviewer as cr
+    assert cr._severity_zh("严重") == "严重"
+    assert cr._severity_zh("critical") == "严重"
+    assert cr._severity_zh("中") == "中"
+    assert cr._severity_zh("轻") == "轻"
+    assert cr._severity_zh("建议") == "建议"
+    assert cr._severity_zh("unknown-garbage") == "建议"
