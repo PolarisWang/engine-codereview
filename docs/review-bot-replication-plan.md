@@ -43,11 +43,11 @@
 | P0 | Vendor rage review-bot 到 `vendor/rage-review-bot` | 上游 c035b16 | ✅ 完成 |
 | P0.5 | 平台探测 R1/R2 | — | ✅ R1过 / R2转人工 |
 | P1 | **契约化审查 agent（Path A）** | `spawn_topic_agent.md`/`state_machine.py` 等 | ✅ 容器实测通过 |
-| P2 | 闭环状态机 + 机械回复 | `mechanical_reply_handler.py`/`reply_parser.py` | 进行中 |
-| P3 | round-N 增量复审 | `incr_base.py`/`incr_cache.py`/`review_rounds.py` | — |
-| P4 | 人审集成 | `gitlab_threads.py`/`manual_issue_verifier.py` | — |
-| P5 | 复杂审查飞书 doc | `build_review_doc.py`/`lark_doc_helper.py`(重写) | — |
-| P7 | 灰度上线 + 存量迁移 | — | — |
+| P2 | 闭环状态机 + 机械回复 | `mechanical_reply_handler.py`/`reply_parser.py` | ✅ 完成 (222125a) |
+| P3 | round-N 增量复审 | `incr_base.py`/`review_rounds.py` | ✅ 完成 (c492f08) |
+| P4 | 人审集成 | `gitlab_threads_http.py`/`manual_issue_verifier` | ✅ 完成 (885f0ba) |
+| P5 | 复杂审查飞书 doc | `build_review_doc_http.py`(PlanA doc/PlanB 长贴) | ✅ 完成 (16d5cb1) |
+| P7 | 灰度上线 + 存量迁移 | `config review:` 开关 + runbook | ✅ 代码/runbook 完成；部署待执行 |
 
 ## P1 实测结论（容器，commit 5911e5f）
 - **Path A agent 真实可用**：容器 `code_reviewer --agent` spawn claude-opus-5（7 turns / ~107s），返回 rage 标准结果：

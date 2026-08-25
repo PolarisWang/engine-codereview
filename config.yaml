@@ -137,6 +137,25 @@ claude:
     Summarize at the end with a count of each severity level.
 
 # ============================================================
+# rage 式审查复核 (P1-P6 复刻 rage 质量引擎的开关) —— 方案D
+# 复刻 rage review-bot 到本仓库, 保真对齐其标准(结构化 findings + 严重/中/轻/建议
+# + 闭环 dev-triage + round-N 增量 + 人审 + 复杂飞书 doc)。见
+# docs/review-bot-replication-plan.md。
+# ============================================================
+review:
+  # 用 per-topic claude subprocess agent 审查 (Path A) 而非单次 HTTP LLM 调用。
+  # 复刻 rage 的 agent 契约: 结构化 findings + 整文件 scope 验证 + 对齐真实代码行。
+  # 模型默认 claude-opus-5 (env REVIEW_AGENT_MODEL 覆盖)。
+  # true/1/yes -> 启用 agent 路径; 留空/false 回退旧 HTTP 单调用。
+  agent_enabled: true
+  # 复杂审查(>5文件/100行): 若飞书 app 已授权 docx/drive scope (R2 已人工验证),
+  # 生成飞书 doc 全量 + thread 只发 #N index; 未授权则降级为长贴(PlanB, 无需额外 scope)。
+  # true -> 尝试 doc, 失败降级; false -> 始终长贴。
+  doc_enabled: true
+  # 是否给审查人/开发者写回 GitLab resolved(人审集成 P4)。默认 true。
+  mark_resolved: true
+
+# ============================================================
 # 生命周期 / 并发 / 文案 / 命令词 —— 方案C 配置统一化
 # 这些都可在此文件调整, 无需改代码, 调整后重跑/重启生效。
 # ============================================================
