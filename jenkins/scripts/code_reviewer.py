@@ -392,11 +392,22 @@ def git_cmd(subcmd, token, cwd=None, timeout=600):
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True, mr_url="", gitlab_token=""):
+def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True, mr_url="", gitlab_token="",
+                 last_review_commit="", carried=None):
     """
     Clone (or fetch) repo, checkout branch, return path and diff info.
     Returns dict with: diff_text, changed_files, insertions, deletions, commit_log, branch_exists, branch_merged
+
+    last_review_commit: optional SHA from the previous review round. When set and
+      still an ancestor of the branch head, the diff is computed incrementally
+      from that SHA (round-N, only what changed since last review); otherwise it
+      falls back to a three-dot diff vs base (rebase-safe), mirroring rage
+      incr_base.resolve_incr_range (DESIGN §1.4.5). Passed through to diff_info
+      so callers know the effective base for incremental review.
+    carried: list[int] of already-settled issue indices — the agent should NOT
+      re-raise them in a round-N review (rage review_rounds, DESIGN §1.4.8).
     """
+    carried = carried or []
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     repo_dir = os.path.join(workspace, repo_name)
     branch_exists = True
@@ -482,38 +493,54 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         git_cmd(["fetch", "origin", fetch_ref], tok, repo_dir)
     else:
         git_cmd(["fetch", "origin", base_branch], tok, repo_dir)
-    # Get merge-base for accurate diff
-    rc, merge_base, _ = git_cmd(
-        ["merge-base", branch, f"origin/{base_branch}"], tok, repo_dir
-    )
+    # Get merge-base for accurate diff. For round-N incremental, prefer the
+    # previous review SHA as the two-dot base when it's still an ancestor of the
+    # branch head; otherwise fall back to the base-branch merge-base (rebase-safe).
+    incr_prev = None
+    if last_review_commit and branch:
+        rc, h_sha, _ = git_cmd(["rev-parse", branch], tok, repo_dir)
+        if rc == 0:
+            rc2, _, _ = git_cmd(["merge-base", "--is-ancestor",
+                                 last_review_commit, h_sha.strip()], tok, repo_dir)
+            if rc2 == 0:
+                incr_prev = last_review_commit
+    if incr_prev:
+        merge_base = incr_prev
+    else:
+        rc, merge_base, _ = git_cmd(
+            ["merge-base", branch, f"origin/{base_branch}"], tok, repo_dir
+        )
     if rc != 0:
         print("[git] merge-base failed, falling back to origin/base")
         merge_base = f"origin/{base_branch}"
 
-    # Generate diff
+    # Generate diff. Incremental round-N uses two-dot (merge_base..branch);
+    # round-1 uses three-dot (merge_base...branch). `diff_sep` captures that.
+    diff_sep = ".." if incr_prev else "..."
+    name_status_range = f"{merge_base}{diff_sep}{branch}"
     rc, diff_text, _ = git_cmd(
-        ["diff", merge_base + "..." + branch, "--", "."], tok, repo_dir
+        ["diff", name_status_range, "--", "."], tok, repo_dir
     )
     if not diff_text:
         # Try direct diff
         rc, diff_text, _ = git_cmd(
-            ["diff", f"origin/{base_branch}...{branch}", "--", "."], tok, repo_dir
+            ["diff", f"origin/{base_branch}{diff_sep}{branch}", "--", "."], tok, repo_dir
         )
 
     # Changed files list
     rc, changed_files_str, _ = git_cmd(
-        ["diff", "--name-status", f"origin/{base_branch}...{branch}"], tok, repo_dir
+        ["diff", "--name-status", name_status_range], tok, repo_dir
     )
     changed_files = [line for line in changed_files_str.split("\n") if line.strip()]
 
     # Stats
     rc, stats_str, _ = git_cmd(
-        ["diff", "--shortstat", f"origin/{base_branch}...{branch}"], tok, repo_dir
+        ["diff", "--shortstat", name_status_range], tok, repo_dir
     )
 
     # Commit log
     rc, commit_log, _ = git_cmd(
-        ["log", f"origin/{base_branch}..{branch}", "--oneline", "--no-decorate"], tok, repo_dir
+        ["log", f"{merge_base}..{branch}", "--oneline", "--no-decorate"], tok, repo_dir
     )
 
     # Detect if branch is merged (branch exists but no new commits vs base)
@@ -547,6 +574,9 @@ def prepare_repo(repo_url, branch, base_branch, workspace, issue_key, cache=True
         "branch_exists": branch_exists,
         "branch_merged": branch_merged,
         "repo_dir": repo_dir,
+        "last_review_commit": last_review_commit,
+        "incr_mode": "incremental" if incr_prev else "",
+        "carried": carried,
     }
 
 
@@ -2004,6 +2034,13 @@ def _spawn_review_agent(diff_info, project, issue_key, repo_type,
     if len(diff_text) > 200000:
         diff_text = diff_text[:200000] + "\n\n...[truncated]"
 
+    scope_line = ""
+    if diff_info.get("incr_mode"):
+        scope_line = (f"Review scope: incremental round-N (since last review SHA "
+                      f"{diff_info.get('last_review_commit') or ''}) — review ONLY "
+                      f"what changed in this delta; do NOT re-review already-reviewed code.\n")
+    carried_line = f"Carried (already settled, do NOT re-raise): {diff_info.get('carried') or []}"
+
     user_prompt = f"""Review the following MR.
 
 Project: {project} ({repo_type} repository)
@@ -2013,6 +2050,8 @@ Branch: {branch}
 Base: {base_branch}
 Branch SHA: {diff_info.get('branch_sha') or branch}
 Diff hash: {diff_info.get('diff_hash') or ''}
+
+{scope_line}{carried_line}
 
 Changed files:
 {chr(10).join(changed_files)}
@@ -2033,28 +2072,31 @@ Diff:
     # The agent keeps Bash+Read access to the local repo at REPO_DIR, so it can
     # `git show <sha>:<path>` for whole-file scope verification. Range is
     # bounded by `timeout`; beyond that we surface a clear agent-timeout error.
-    task = f"""{user_prompt}
-
-Now review per the rules (Chinese user-facing output). Respond with EXACTLY ONE
-pure JSON object (no code fences, no prose before/after) with this shape:
-{{
-  "findings": [
-    {{
-      "file": "repo-relative changed file",
-      "severity": "严重|中|轻|建议",
-      "line_range": "120-145",
-      "function": "optional",
-      "issue": "问题（中文）",
-      "suggestion": "修法（中文，可选）"
-    }}
-  ]
-}}
-Sort findings by severity (严重>中>轻>建议). If no real issues, findings=[]
-and add a non-empty "summary" stating 已完成审查，未发现问题.
-
-Your system prompt holds the mandatory rules (whole-file scope verification via
-`git show <branch_sha>:<path>` before ANY scope-dependent finding; only real +/-
-lines; line_range required for line-scoped findings). Follow them strictly."""
+    json_shape = (
+        '{\n'
+        '  "findings": [\n'
+        '    {\n'
+        '      "file": "repo-relative changed file",\n'
+        '      "severity": "严重|中|轻|建议",\n'
+        '      "line_range": "120-145",\n'
+        '      "function": "optional",\n'
+        '      "issue": "问题",\n'
+        '      "suggestion": "修法"\n'
+        '    }\n'
+        '  ]\n'
+        '}'
+    )
+    task = (
+        user_prompt
+        + "\nNow review per the rules (Chinese user-facing output). Respond with EXACTLY ONE "
+        + "pure JSON object (no code fences, no prose before/after) with this shape:\n"
+        + json_shape
+        + "\nSort findings by severity (严重>中>轻>建议). If no real issues, findings=[] "
+        + "and add a non-empty 'summary' stating 已完成审查，未发现问题.\n"
+        + "\nYour system prompt holds the mandatory rules (whole-file scope verification via "
+        + "`git show <branch_sha>:<path>` before ANY scope-dependent finding; only real +/- "
+        + "lines; line_range required for line-scoped findings). Follow them strictly.\n"
+    )
     try:
         cmd = [claude_exe, "-p", "--model", model,
                "--output-format", "json",
@@ -2238,6 +2280,14 @@ def main():
     parser.add_argument("--mr-url", default="", help="Merge request URL")
     parser.add_argument("--agent", action="store_true",
                         help="Review via per-topic claude subprocess agent (rage-style, model=claude-opus-5)")
+    parser.add_argument("--last-review-commit", default="",
+                        help="Previous-review SHA for a round-N incremental diff "
+                             "(rage incr_base, per-repo or scalar). When still an "
+                             "ancestor of head, diff only since last review.")
+    parser.add_argument("--carried", default="",
+                        help="Comma-separated issue indices already settled in earlier "
+                             "rounds (addressed/obsolete) — the agent must NOT re-raise "
+                             "them (rage review_rounds, DESIGN §1.4.8).")
     args = parser.parse_args()
 
     config = load_config(repo_type=args.repo_type)
@@ -2246,10 +2296,12 @@ def main():
     # Prepare repo and get diff
     print(f"[{args.repo_type}] Cloning/preparing repo...", flush=True)
     gitlab_token = os.environ.get("GITLAB_TOKEN") or os.environ.get("CI_JOB_TOKEN", "")
+    carried = [int(x) for x in args.carried.split(",") if x.strip().isdigit()] if args.carried else []
     diff_info = prepare_repo(
         args.repo, args.branch, args.base_branch,
         args.workspace, args.issue_key,
         mr_url=args.mr_url, gitlab_token=gitlab_token,
+        last_review_commit=args.last_review_commit, carried=carried,
     )
 
     changed_file_count = len([f for f in diff_info["changed_files"] if f])
