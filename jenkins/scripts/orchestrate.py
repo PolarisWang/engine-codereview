@@ -485,24 +485,13 @@ def run(args):
         print(f"[doc] create review doc err: {_dce}", file=sys.stderr)
 
     _round_no = int((pipeline_state.get_topic(state_file, key) or {}).get("review_round") or 1)
-    if merged_findings or use_agent:
-        full_text = feishu_notifier.render_rage_card(
-            issue_key, merged_findings, doc_url=doc_url,
-            triage=(pipeline_state.get_topic(state_file, key) or {}).get("review_triage") or "",
-            round_no=_round_no, mr_url=mr_url, jira_url=jira_url,
-        )
-    else:
-        # agent 不可用且无 findings → 走旧 render(兜底解释 WHY: 已合并/无变更/错误)
-        _eng_for_render = dict(eng_res or {})
-        _gam_for_render = dict(gam_res or {})
-        if mr_state:
-            _eng_for_render["mr_state"] = mr_state
-            _gam_for_render["mr_state"] = mr_state
-        chunks = feishu_notifier.render_full_findings_text(
-            issue_key, project, review_branch, base_branch, jira_url, mr_url,
-            _eng_for_render, _gam_for_render,
-        )
-        full_text = "\n\n".join(c for c in chunks if c).rstrip()
+    # R7-C4 (统一卡): 一律走 rage 标准卡(4 级 #N + doc 链接 + 双段指令), 不再跳旧 3 级卡。
+    # 空 findings 由 render_rage_card 渲染"已完成审查, 未发现问题"。
+    full_text = feishu_notifier.render_rage_card(
+        issue_key, merged_findings, doc_url=doc_url,
+        triage=(pipeline_state.get_topic(state_file, key) or {}).get("review_triage") or "",
+        round_no=_round_no, mr_url=mr_url, jira_url=jira_url,
+    )
     # 全量 review 单条普通消息发出(≤45000字符); 超大才拆第二段。
     segs = _split_text(full_text)
     # 记录渲染后的完整 review(供 ci-poll 追加, 不覆盖 findings)
@@ -2739,8 +2728,23 @@ def _maybe_create_review_doc(key, issue_key, project, topic, findings,
         files = [{"repo": f.get("repo") or "engine", "path": (f.get("file") or "").strip(),
                   "insertions": 0, "deletions": 0, "description": ""} for f in findings or []]
         md = _brd.build_doc_markdown(issue_key, "复杂审查完整报告。", issues, files)
-        grant = [t for t in (topic.get("approver_open_ids") or [])] + \
-                [t for t in ([topic.get("creator_open_id") or ""]) if t]
+        # R7-C3 (加固): grant_view 从 config projects.<project>.approver_open_ids 读
+        # （rage 要求授权审查人+开发者，topic 上不一定有 approver 字段）。回退 topic 字段。
+        import common as _common
+        _grant = []
+        try:
+            _proj_cfg = (_common.load_config().get("projects") or {}).get(project) or {}
+            _grant += [a for a in (_proj_cfg.get("approver_open_ids") or []) if a]
+        except Exception:
+            pass
+        _grant += [a for a in (topic.get("approver_open_ids") or []) if a]
+        _grant += [a for a in ([topic.get("creator_open_id") or ""]) if a]
+        # de-dup preserving order
+        grant, _seen = [], set()
+        for g in _grant:
+            if g and g not in _seen:
+                _seen.add(g)
+                grant.append(g)
         title = f"代码审查 {issue_key}"
         ok, tok, url, err = _brd.create_lark_doc_http(app_id, app_secret, title, md,
                                                        grant_view=grant)
@@ -2783,8 +2787,17 @@ def _set_review_closure_fields(state_file, key, eng_res, gam_res):
         it["index"] = i
 
     # triage: complex if >5 files/100 lines across repos (rage rule), else simple.
-    total_files = (len((eng_res or {}).get("changed_files") or []) +
-                   len((gam_res or {}).get("changed_files") or []))
+    # R7-C1 (加固): changed_files may be absent on the agent path, so ALSO count
+    # unique files from the findings (agent always yields findings). Max of the
+    # two, so a 30-file MR with findings never mis-sorts to simple → skips doc.
+    _cf_files = set()
+    for res in (eng_res or {}, gam_res or {}):
+        for _cf in (res.get("changed_files") or []):
+            p = _cf.split("\t", 1)[-1] if "\t" in _cf else _cf
+            if p:
+                _cf_files.add(p)
+    _finding_files = {i["file"] for i in issues if i.get("file")}
+    total_files = len(_cf_files | _finding_files)
     # crude line heuristic from stats strings
     def _lines(res):
         try:

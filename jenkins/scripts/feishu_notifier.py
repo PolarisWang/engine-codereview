@@ -523,7 +523,7 @@ CLOSURE_FOOTER = [
 
 # 我们的自动修改/其它指令(方案C 自定义)。去掉了 改码/指引。
 CUSTOM_FOOTER = [
-    "· 优化：自动修复关键问题 → 推送修复分支 → 建/更新 MR",
+    "· 优化：自动修复关键问题 → 推送修复分支 → 建/更新 MR（需回复确认后执行）",
     "· mr：生成/更新 MR",
     "· 深入：深度分析",
     "· 质疑：质疑 findings",
@@ -552,13 +552,14 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
     ordered = sorted(merged, key=lambda f: (_sev_zh_sort(f.get("severity") or "建议"),
                                             (f.get("file") or "")))
     counts = {"严重": 0, "中": 0, "轻": 0, "建议": 0}
+    # R7-I2: doc 链接放最前(复杂审查最重要的产物), 再 MR/Jira
     parts = [f"🔍 {issue_key} · 审查结果" + (f"（第 {round_no} 轮）" if round_no else "")]
+    if doc_url:
+        parts.append(f"📄 完整评审文档：{doc_url}")
     if mr_url:
         parts.append(f"🔗 MR：{mr_url}")
     if jira_url:
         parts.append(f"📎 {jira_url}")
-    if doc_url:
-        parts.append(f"📄 完整评审文档：{doc_url}")
     for f in ordered:
         counts[f.get("severity") or "建议"] = counts.get(f.get("severity") or "建议", 0) + 1
     if ordered:
@@ -581,9 +582,15 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
         parts.append("✅ 已完成审查，未发现问题。")
     if summary:
         parts.append(f"\n{summary}")
-    # footer blocks
+    # footer blocks (R7-I1: 无 findings 时隐藏"回复序号", 只留 ok/close + 自定义指令)
     parts.append("\n【闭环指令】")
-    parts.extend(CLOSURE_FOOTER)
+    if ordered:
+        parts.append(CLOSURE_FOOTER[0])           # 回复问题序号
+        parts.append("· ok：开发者修复后推进下一轮 / 审查人批准")
+    else:
+        parts.append("· ok：审查人批准")
+    parts.append("· done：开发者提交给审查人裁决")
+    parts.append("· @bot 同步：刷新人工审查评论")
     parts.append("\n【自动修改 / 其它指令】")
     parts.extend(CUSTOM_FOOTER)
     return "\n".join(parts)

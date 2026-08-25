@@ -40,6 +40,21 @@ def test_rage_card_doc_link():
     assert "📄 完整评审文档：https://www.feishu.cn/docx/DOC" in t
 
 
+def test_rage_card_doc_link_first():
+    # R7-I2: 复杂审查的 doc 链接放最前(比 MR 更突出)
+    t = fn.render_rage_card("K-1", _findings(), doc_url="https://www.feishu.cn/docx/DOC",
+                            mr_url="https://g/1")
+    assert t.index("📄 完整评审文档") < t.index("🔗 MR"), "doc link should precede MR"
+
+
+def test_rage_card_no_findings_hides_index_footer():
+    # R7-I1: 无 findings 时不显示"回复问题序号"(没得编号), 只留 ok/done/close + 自定义
+    t = fn.render_rage_card("K-1", [], round_no=0)
+    assert "回复问题序号" not in t
+    assert "ok：审查人批准" in t
+    assert "关闭" in t
+
+
 def test_rage_card_dual_footer_no_changma():
     t = fn.render_rage_card("K-1", _findings())
     assert "【闭环指令】" in t and "【自动修改 / 其它指令】" in t

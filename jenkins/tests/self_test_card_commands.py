@@ -47,3 +47,18 @@ def test_card_shows_customs_hides_changma():
     for w in ("优化", "mr", "深入", "质疑", "重新审查", "更新结论", "关闭"):
         assert w in t, f"card missing {w}"
     assert "改码" not in t and "指引" not in t, "改码/指引 should be hidden"
+
+
+def test_card_doc_link_first_and_confirm_hint():
+    t = fn.render_rage_card("CB2N-T", [{"severity": "中", "file": "a.cpp", "issue": "x"}],
+                            doc_url="https://www.feishu.cn/docx/D", mr_url="https://g/1")
+    assert t.index("📄 完整评审文档") < t.index("🔗 MR"), "doc link should precede MR"
+    assert "需回复确认" in t, "优化 should indicate it needs confirmation"
+
+
+def test_card_no_findings_hides_index_footer():
+    t = fn.render_rage_card("CB2N-T", [], round_no=0)
+    assert "回复问题序号" not in t, "no index footer when no findings"
+    assert "ok：审查人批准" in t
+    assert "关闭" in t
+
