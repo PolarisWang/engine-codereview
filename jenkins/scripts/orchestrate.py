@@ -4236,6 +4236,39 @@ def _parse_jira(jira_url, host, token, gitlab_token):
         return {"error": "jira parse produced non-JSON", "raw": out[:200]}
 
 
+def _is_bad_empty_result(res):
+    """True if a review result is an LLM-empty stub that must NOT be cached/published.
+
+    A "clean" result must carry an explicit conclusion (review summary or a
+    review_text that states one). An empty findings set with no summary and only a
+    mechanical stub ("🔍 Code Review — 0 项 (0 必改)…") is an LLM failure
+    (CB2N-30597: MR had 17 changed files but posted a 0/0/0 card), not a real
+    zero-issue review.
+    """
+    rv = (res or {}).get("review")
+    if not rv or not isinstance(rv, dict):
+        # No review block at all — nothing to judge as an LLM-empty stub.
+        return False
+    if rv.get("error"):
+        # Error/partial results must never be served from cache — a re-review
+        # should re-run rather than replay the error.
+        return True
+    if rv.get("findings"):
+        return False
+    if (rv.get("summary") or "").strip():
+        # An explicit summary counts as a conclusion (incl. "no issues").
+        return False
+    rt = (rv.get("review_text") or "").strip()
+    if not rt:
+        return True
+    # Only the mechanical stub with no real conclusion -> still bad-empty.
+    try:
+        import code_reviewer as _cr
+        return not _cr._empty_output_allowed({}, rt)
+    except Exception:
+        return True
+
+
 def _review_repos(key, project, issue_key, review_branch, base_branch, engine_base,
                   engine_repo, game_repo, mr_url, workspace, eng_out, gam_out):
     # Cache dir for reuse by diff_hash (avoids re-POSTing unchanged diffs to the LLM).
@@ -4261,22 +4294,32 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
         # Guard: an empty diff (sha1 of "") must never be cached/reused as a valid
         # review — it means the branch/base produced no diff. Only cache real diffs.
         EMPTY_DIFF_HASHES = {"da39a3ee5e6b4b0d3255bfef95601890afd80709", ""}
-        if diff_hash not in EMPTY_DIFF_HASHES:
+        _real = diff_hash not in EMPTY_DIFF_HASHES  # a real, non-empty diff
+
+        if _real:
             cached = os.path.join(cache_dir, f"v{REVIEW_CACHE_VERSION}_{key}_{repo}_{diff_hash}.json")
             if os.path.exists(cached):
-                # Reuse cached review result (same diff, already reviewed).
-                _log('REPO', 'CACHED', key, issue_key, project, repo,
-                     f"diff {diff_hash[:8]} already reviewed; reusing result")
-                with open(cached, encoding="utf-8") as f:
-                    cached_res = json.load(f)
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(cached_res, f, ensure_ascii=False)
-                return cached_res, 0
+                try:
+                    with open(cached, encoding="utf-8") as f:
+                        cached_res = json.load(f)
+                except (OSError, ValueError):
+                    cached_res = None
+                if cached_res and not _is_bad_empty_result(cached_res):
+                    # Reuse cached review result (same diff, already reviewed).
+                    _log('REPO', 'CACHED', key, issue_key, project, repo,
+                         f"diff {diff_hash[:8]} already reviewed; reusing result")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        json.dump(cached_res, f, ensure_ascii=False)
+                    return cached_res, 0
+                elif cached_res:
+                    _log('REPO', 'SOLVED', key, issue_key, project, repo,
+                         f"cached result for {diff_hash[:8]} is an LLM-empty stub; re-reviewing")
         # 2) Real review (LLM).
         rc2, _, err2 = _run_py("code_reviewer.py", base_args + ["--output", out_path])
         res = _read_json_file(out_path)
-        # Save to cache for reuse only for a REAL (non-empty) diff.
-        if res and diff_hash and diff_hash not in EMPTY_DIFF_HASHES:
+        # Save to cache for reuse only for a REAL (non-empty) diff AND a valid result
+        # (not an LLM-empty stub) — see _is_bad_empty.
+        if res and _real and not _is_bad_empty_result(res):
             os.makedirs(cache_dir, exist_ok=True)
             with open(os.path.join(cache_dir, f"v{REVIEW_CACHE_VERSION}_{key}_{repo}_{diff_hash}.json"), "w", encoding="utf-8") as f:
                 json.dump(res, f, ensure_ascii=False)

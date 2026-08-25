@@ -180,7 +180,8 @@ REVIEW_TOOLS = [{
         "type": "object",
         "properties": {
             "summary": {"type": "string",
-                        "description": "1-2 sentence overview of what was reviewed and the overall conclusion (中文)."},
+                        "minLength": 8,
+                        "description": "1-2 sentence overview of what was reviewed and the overall conclusion (中文). MUST be non-empty EVEN when no issues are found — state '已完成审查，未发现问题' explicitly in that case."},
             "strengths": {"type": "array",
                           "items": {"type": "string"},
                           "description": "2-3 things that were done well (中文, optional)."},
@@ -1561,11 +1562,51 @@ def _call_llm_batch(system_prompt, user_prompt, api_key, base_url, model,
             # blocks from a tool-only or partial response, and guarantees the
             # detailed card matches severity_counts exactly.
             review_text = _build_markdown_from_findings(findings, meta=meta)
+        if findings is None and not review_text:
+            # Token answered in plain text (no tool_use) and left the text block
+            # empty — synthesize a reviewable no-finding result instead of a stub,
+            # so the empty-result guard below distinguishes "clean" from "empty".
+            review_text = "🔍 Code Review — 0 项 (0 必改)\n📊 🔴0 / 🟡0 / 🟢0"
         if not review_text:
             review_text = result.get("completion", json.dumps(result))
     except Exception:
         review_text = json.dumps(result)
     return review_text, findings, None, meta
+
+
+def _empty_output_allowed(meta, review_text):
+    """Whether "no findings at all" may be published as a normal result.
+
+    The LLM sometimes returns an EMPTY structured response for a real diff:
+    findings=[], no summary, and only the mechanical stub text ("🔍 Code Review —
+    0 项 (0 必改)\n📊 🔴0 / 🟡0 / 🟢0"). Publishing that stub as a real review is
+    misleading — it reads as "no issues" but means the model returned nothing
+    reviewable (CB2N-30597: MR had 17 changed files but posted a 0/0/0 card).
+
+    We only allow publishing an empty result when the model EXPLICITLY concludes
+    the code is clean — a non-empty summary, an explicit clean/finding-free
+    conclusion phrase in the text, or an explicit severity count (word + number).
+    The bare emoji count row (🔴/🟡/ℹ️) is NOT a conclusion by itself: it appears
+    in every mechanically-rebuilt stub.
+    """
+    if (meta.get("summary") or "").strip():
+        return True
+    txt = (review_text or "").strip()
+    if not txt:
+        return False
+    low = txt.lower()
+    phrases = ("未发现", "没有发现", "未找到", "无问题", "无严重问题", "无明显问题",
+               "未发现严重问题", "整体干净", "没有明显", "审查完成",
+               "no issues", "no bugs", "no problems", "no error",
+               "no finding", "nothing to", "all good", "looks good", "clean")
+    if any(p in low for p in phrases):
+        return True
+    # Explicit severity count conclusion, e.g. "Critical: 0" / "🔴 Critical 0".
+    import re as _re
+    for w in ("critical", "warning", "suggestion"):
+        if _re.search(rf"{w}[^\n]{{0,14}}\d", low):
+            return True
+    return False
 
 
 def review_with_claude(diff_info, config, project, issue_key, repo_type):
@@ -1752,7 +1793,11 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
 
     # 跨批次聚合: 用全部 findings + 聚合的 summary/strengths 重新渲染成完整 skill 模板,
     # 而非各批 "第 N/M 部分" 拼接(那会丢失聚合 meta 且 render 不完整)。
-    final_text = _build_markdown_from_findings(all_findings, meta=agg_meta)
+    # 仅当确有条目时重建; 若 findings 为空但有结论文本(如纯文本"未发现问题"),
+    # 保留模型原文, 不覆盖成机械 stub(CV: bad rebuild once turned model prose
+    # into "0 项" even when the model clearly said clean)。
+    final_text = _build_markdown_from_findings(all_findings, meta=agg_meta) if all_findings \
+        else (all_text[0] if (len(all_text) == 1 and all_text[0] and len(all_text[0]) > 80) else "")
 
     # 阶段0.5: 垃圾文件客观事实(keep/drop 冻结) 提前定死, 必须在阶段1/2 之前——
     # 否则 ref5(垃圾文件)会因某符号(如 PowerShell)不在变更集而被后续阶段误 drop。
@@ -1793,6 +1838,23 @@ IMPORTANT: Reply in Chinese (中文). Keep it concise — focus on the most crit
     except Exception as e:
         conf_notes = {"drop": [], "warn": 0}
         print(f"[review] confidence layer skipped: {e}", flush=True)
+
+    # 反编造兜底: LLM 对真实 diff 返回"空 findings + 空 summary + 无结论文本"
+    # (CV-CB2N-30597: MR 17 文件但卡是 "🔴0/🟡0/🟢0")——这读起来像"未发现问题",
+    # 实际是模型没返回可审查内容。此处识别并转失败, 由调用方走 error 卡, 不当作成功发布。
+    if num_batches > 0 and not all_findings and not _empty_output_allowed(agg_meta, final_text):
+        _empty_reason = ("LLM 返回空审查结果(无 findings、无总结、无结论文本)。"
+                         "这不代表'未发现问题', 而是审查未完成。")
+        print(f"[review] EMPTY-RESULT: {_empty_reason}", flush=True)
+        return {
+            "summary": _empty_reason,
+            "review_text": "",
+            "severity_counts": {},
+            "findings": [],
+            "error": _empty_reason,
+            "batches": num_batches,
+        }
+
     conf_dropped = len(conf_notes.get("drop") or [])
     conf_warned = conf_notes.get("warn") or 0
     # confidence-drop 也进 verification.vault 供溯源(不改阶段1 的 traces,单独记)
