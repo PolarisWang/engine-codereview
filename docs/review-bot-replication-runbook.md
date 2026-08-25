@@ -13,6 +13,50 @@
       （留空回退 `policy.yaml` 的 admins）。
 - [ ] **app_id/app_secret/gitlab token** 已注入运行容器 env（现有部署即有）。
 
+## 0.0 飞书 doc scope 授权（R2）—— 让 app 能创建飞书文档
+
+给 bot 的飞书自建应用授权文档创建权限。**一次性操作，由应用管理员在飞书开放平台完成**：
+
+1. 打开 **飞书开放平台** → https://open.feishu.cn/app → 选中 bot 的应用
+   （app_id = `cli_aab26e8f92789bda`，即群内运行的 code-review 应用）。
+2. 左侧菜单 **权限管理** → 在搜索框搜索并勾选以下权限 scope：
+   - `docx:document`（读写/创建云文档）
+   - `drive:drive`（云空间读写）
+     （若集成需要改已有成员权限，另需 `drive:permission:members:add` 之类的成员
+     授权 scope，看实际授权提示。）
+3. 点击 **批量开通**，然后在右上角 **创建版本并发布** → 发布新版本。
+4. 等待管理员 **审核通过并发布**（如果 app 勾选了"需要管理员审核"）。
+5. 版本发布后，重新获取 tenant token（无需改代码，`_tenant_token` 会带新 scope）。
+
+**验证 scope 已生效**（只读，无副作用）——在部署机跑：
+```python
+# python -c "..."; 用 app_id/secret 拿 tenant token，再调用 docx 只读接口看返回码
+```
+```bash
+docker exec chaos-agent-cr bash -lc '
+APPID=cli_aab26e8f92789bda
+SECRET=$FEISHU_APP_SECRET
+TT=$(curl -s -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
+  -H "Content-Type: application/json" \
+  -d "{\"app_id\":\"$APPID\",\"app_secret\":\"$SECRET\"}" | python3 -c "import sys,json;print(json.load(sys.stdin).get(\"tenant_access_token\",\"\"))")
+# 调 docx 只读接口(不带业务id), 返回 0/有 data 即具备 docx 读写; 10702/权限错误则未授权
+curl -s "https://open.feishu.cn/open-apis/docx/v1/documents" \
+  -H "Authorization: Bearer $TT" | head -c 300
+'
+```
+- 若返回 `"code":0` 或有 `data` 字段 → **docx scope 已授权**，`review.doc_enabled=true` 走 PlanA 出 doc。
+- 若返回 `10702`/`invalid access token` 或权限不足 → 未授权 → `review.doc_enabled=false`（走 PlanB 长贴）。
+
+> 注：token secret 在容器里是 env 注入的，`$FEISHU_APP_SECRET` 是否回显取决于部署；
+> 用上面的方式拿 token 即可。若拿不到，说明 app_id/secret 在容器 env 用别的变量名。
+
+## 0.1 各项目 approver 已填（王浩川）
+
+`config.yaml projects.<id>.approver_open_ids` 已统一填为
+`ou_55bca7b7dae982e96749bd84f57c21e8`（王浩川）。闭环评审中，王浩川回复 `ok`
+= 批准 MR、`close` = 关闭、`1 3 5` = 标记残留问题。如需增改审查人，编辑该字段后
+`apply.sh --force` 重启生效。
+
 ## 1. 灰度切换（先对部分项目 / 新话题）
 
 节点与开关：
@@ -60,8 +104,26 @@ for key, t in topics.items():
 
 ## 3. 端到端验证清单（部署环境跑，本仓库单测覆盖纯逻辑）
 
-1. **Path A agent**：对一真 MR 触发 review → 卡含 `#N [严重|中|轻|建议] [Repo]
-   file:line 问题`；随机抽查一种 `[Repo] file:line` 能 `git show` 到真实行。
+**快速路径（推荐先跑）**：用 `verify_rage_flow.py` 在真实 MR 上验证 Path A agent
++ rage 标准输出（本仓库已交付该验证器，纯单测已通过，这里跑真实 diff）：
+```bash
+docker exec chaos-agent-cr bash -lc '
+cd /home/jenkins/workspace/code-review-pipeline/jenkins/scripts
+python3 verify_rage_flow.py \
+  --project CB2 \
+  --mr-url "https://gitlab.booming-inc.com/booming/dev/projects/conquerorsblade2/chaos-cb-2/-/merge_requests/7201" \
+  --issue-key CB2N-E2E \
+  --workspace /tmp/rage-e2e-ws \
+  --model claude-opus-5
+'
+# 先只想看 diff 解析不跑 agent:
+#   ... --dry-mr
+```
+退出码 0 = Path A agent 在该真 MR 上产出 rage 标准 findings（`[Repo] file:line`
+都在 changed_files 内、severity ∈ 严重/中/轻/建议）。然后按下面 1-6 走完整闭环。
+
+1. **Path A agent**：触发 review → 卡含 `#N [严重|中|轻|建议] [Repo] file:line 问题`；
+   随机抽查一种 `[Repo] file:line` 能 `git show` 到真实行。
    - 若结果不理想（模型代理把 opus 别名落到 deepseek）→ 调 `REVIEW_AGENT_MODEL`
      或走真 Anthropic API。
 2. **闭环**：开发在群话题回 `1 3 5` → bot 记录 dev_triage → 开发 push 后回 `ok`

@@ -17,7 +17,7 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/chaos.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git"
     default_branch: main
-    approver_open_ids: []
+    approver_open_ids: [ "ou_55bca7b7dae982e96749bd84f57c21e8" ]
 
   ENG:
     jira_project_key: ENG
@@ -25,7 +25,7 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/chaos.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/engine/cb-engine-verify.git"
     default_branch: main
-    approver_open_ids: []
+    approver_open_ids: [ "ou_55bca7b7dae982e96749bd84f57c21e8" ]
 
   CB2:
     jira_project_key: CB2
@@ -33,7 +33,7 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/chaos-cb-2.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/conquerorsblade2/conquerors-blade-2.git"
     default_branch: main
-    approver_open_ids: []
+    approver_open_ids: [ "ou_55bca7b7dae982e96749bd84f57c21e8" ]
 
   Mars:
     jira_project_key: MARS
@@ -41,7 +41,7 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/mars/chaos-mars.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/mars/mars.git"
     default_branch: main
-    approver_open_ids: []
+    approver_open_ids: [ "ou_55bca7b7dae982e96749bd84f57c21e8" ]
 
   # MS 项目 = Mars 的同套引擎/游戏仓库(用户确认 MS == MARS)。Jira key 是 MS, 与 MARS 不同,
   # identify_project 是精确匹配 jira_project_key, 所以需单独一条, 复用 Mars 的仓库。
@@ -51,7 +51,7 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/mars/chaos-mars.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/mars/mars.git"
     default_branch: main
-    approver_open_ids: []
+    approver_open_ids: [ "ou_55bca7b7dae982e96749bd84f57c21e8" ]
 
   Rage:
     jira_project_key: RAGE
@@ -59,7 +59,7 @@ projects:
     engine_repo: "git@gitlab.booming-inc.com:booming/dev/projects/rage/chaos.git"
     game_repo: "git@gitlab.booming-inc.com:booming/dev/projects/rage/rage.git"
     default_branch: main
-    approver_open_ids: []
+    approver_open_ids: [ "ou_55bca7b7dae982e96749bd84f57c21e8" ]
     # engine_default_branch: optional override — engine repo's base may differ
     # from the game repo's default_branch (e.g. "rage/master"). Uncomment to set.
     # engine_default_branch: rage/master
