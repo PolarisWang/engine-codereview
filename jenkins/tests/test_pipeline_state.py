@@ -10,6 +10,7 @@ These are the state invariants that R7 (auto-close on DONE) and other lifecycle
 fixes will later lean on.
 """
 import time
+import os
 
 import pytest
 
@@ -119,3 +120,24 @@ def test_pending_queue_set_clear_list(store):
     ps.clear_pending(store, "om_1")
     assert "om_1" not in [k for k, _ in ps.list_pending_topics(store)]
     assert "om_2" in [k for k, _ in ps.list_pending_topics(store)]
+
+
+def test_set_repo_success_clears_stale_skip_reason(tmp_path):
+    """重审后 SKIPPED 残留的 skip_reason 必须在 SUCCESS 时清除(ENG-34409)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        sf = os.path.join(tmp, "s.json")
+        ps.save_state({"schema_version": 1, "updated_at": "", "topics": {}}, sf)
+        ps.add_topic(sf, message_id="om", jira_key="ENG-34409", project="ENG", sender_id="ou")
+        # 先记 SKIPPED + skip_reason(首次 branch 不存在)
+        ps.set_repo(sf, "om", "engine", status="SKIPPED",
+                    skip_reason="branch ENG-34409 not remote", repo_url="x")
+        # 重审后 SUCCESS —— skip_reason/error 必须被清掉
+        ps.set_repo(sf, "om", "engine", status="SUCCESS",
+                    stats="2 files changed", changed_files=2, repo_url="x")
+        t = ps.get_topic(sf, "om")
+        e = t["repos"]["engine"]
+        assert e["status"] == "SUCCESS"
+        assert e.get("skip_reason") == "", f"skip_reason should be cleared, got {e.get('skip_reason')!r}"
+        assert e.get("error") == ""
+        assert e.get("changed_files") == 2

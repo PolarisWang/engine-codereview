@@ -3289,9 +3289,10 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
         rc = _run_review_subprocess(key, jira_url, workspace, state_file)
         ok = rc == 0
         pipeline_state.clear_pending(state_file, key)
-        # Feedback: refresh the result card (with buttons). If the diff hash is the
-        # SAME as the previous result, the outcome intentionally did not change —
-        # surface that so the user does not read "no reaction" as a failure.
+        # Feedback: refresh the result card with the RAGE-standard review results
+        # (run() already rebuilt review_summary into the rage card). NOT the sparse
+        # render_state_card — that was overwriting the findings with a "阶段 DONE/
+        # branch not remote" state card, which read as "no results" (ENG-34409).
         try:
             note = ""
             if ok:
@@ -3302,7 +3303,9 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                     all_f = (eng_res or []) + (gam_res or [])
                     if not all_f:
                         note = "\n\nℹ️ 本次审查未发现代码问题（无 findings）。"
-            text = feishu_notifier.render_state_card(pipeline_state.get_topic(state_file, key))
+            fresh = pipeline_state.get_topic(state_file, key)
+            text = fresh.get("review_summary") or \
+                feishu_notifier.render_state_card(fresh)
             if note:
                 text = text + note
             if render and app_id and app_secret:

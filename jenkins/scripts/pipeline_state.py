@@ -763,6 +763,11 @@ def set_repo(path, key, repo, *, status, error="", skip_reason="",
     r["status"] = status
     if repo_url:
         r["repo_url"] = repo_url
+    # SUCCESS 是成功态, 必须清掉历史 SKIPPED/FAILED 残留的 skip_reason/error,
+    # 否则重审后 status 变 SUCCESS 但 skip_reason 还带 "branch not remote"(ENG-34409)。
+    if status == "SUCCESS":
+        r["skip_reason"] = ""
+        r["error"] = ""
     if error:
         r["error"] = error
     if skip_reason:
