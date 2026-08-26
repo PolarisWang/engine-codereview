@@ -123,3 +123,26 @@ def test_closure_token_after_at_mention_directed():
     assert _is_bot_directed("#1", []) is False
     assert _is_bot_directed("1", []) is False
     assert _is_bot_directed("3 没有问题", []) is False
+
+
+def test_is_closure_token_fallback_when_parser_missing(monkeypatch):
+    """P2-M3: reply_parser import 失败时, _is_closure_token 走 fallback 仍认 #1/1/1 3 5."""
+    import os, sys
+    from event_server import _is_closure_token
+    # 正常路径
+    assert _is_closure_token("#1") is True
+    assert _is_closure_token("1 3 5") is True
+    assert _is_closure_token("随便聊聊") is False
+    # fallback: 让 import reply_parser 失败 -> 走弱化正则(仅裸数字)
+    import builtins
+    orig = builtins.__import__
+    def _fake_import(name, *a, **k):
+        if name == "reply_parser":
+            raise ImportError("no reply_parser in this env")
+        return orig(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    # fallback 应仍认 #1 / 1 (digit-based)
+    assert _is_closure_token("#1") is True
+    assert _is_closure_token("1") is True
+    # 认 ok/done/close (fast path 在 import 之前)
+    assert _is_closure_token("done") is True

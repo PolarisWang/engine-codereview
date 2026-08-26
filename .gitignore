@@ -48,3 +48,8 @@ monitor/grafana/data/
 monitor/node-exporter/textfile/*.prom
 monitor/node-exporter/textfile/*.err.log
 monitor/grafana/data/
+
+# pytest coverage data
+.coverage
+htmlcov/
+

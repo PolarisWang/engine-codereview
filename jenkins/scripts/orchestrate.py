@@ -2739,51 +2739,76 @@ def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
         return _CLOSURE_NO_MATCH
 
 
+def _build_review_doc_args(project, topic, findings, issue_key=""):
+    """Pure: build the (title, markdown, grant_view) args for create_lark_doc_http.
+
+    Deterministic (no I/O / no external API) so it is unit-testable:
+      - issues/files assembled into the doc-markdown schema
+      - grant_view = config.projects.<project>.approver_open_ids (if project
+        resolves) + topic.approver_open_ids + topic.creator_open_id, de-duped
+      - markdown via build_review_doc_http.build_doc_markdown
+
+    Returns (title, md, grant_view).
+    """
+    import os as _os, sys as _sys2
+    rdir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                         "..", "skills", "rage-review")
+    if rdir not in _sys2.path:
+        _sys2.path.insert(0, rdir)
+    import build_review_doc_http as _brd
+    issues = []
+    for f in findings or []:
+        issues.append({
+            "severity": f.get("severity") or "建议",
+            "repo": f.get("repo") or "engine",
+            "file": (f.get("file") or "").strip(),
+            "line_range": (f.get("line_range") or "").strip(),
+            "function": (f.get("function") or "").strip(),
+            "description": (f.get("issue") or f.get("description") or "").strip(),
+            "suggestion": (f.get("suggestion") or "").strip(),
+        })
+    files = [{"repo": f.get("repo") or "engine", "path": (f.get("file") or "").strip(),
+              "insertions": 0, "deletions": 0, "description": ""} for f in findings or []]
+    _key = issue_key or (topic.get("jira_key") or "")
+    md = _brd.build_doc_markdown(_key, "复杂审查完整报告。", issues, files)
+    # grant_view: config projects.<project>.approver_open_ids (rage要求审查人+开发者)
+    # → topic.approver_open_ids → topic.creator_open_id; de-dup preserving order.
+    import common as _common
+    _grant = []
+    try:
+        _proj_cfg = (_common.load_config().get("projects") or {}).get(project) or {}
+        _grant += [a for a in (_proj_cfg.get("approver_open_ids") or []) if a]
+    except Exception:
+        pass
+    _grant += [a for a in (topic.get("approver_open_ids") or []) if a]
+    _grant += [a for a in ([topic.get("creator_open_id") or ""]) if a]
+    grant, _seen = [], set()
+    for g in _grant:
+        if g and g not in _seen:
+            _seen.add(g)
+            grant.append(g)
+    title = f"代码审查 {_key}" if _key else "代码审查"
+    return title, md, grant
+
+
 def _maybe_create_review_doc(key, issue_key, project, topic, findings,
                              review_branch, app_id, app_secret):
     """Complex review → create the full-review Feishu doc (PlanA) and return
     (ok, doc_token, url, err). Falls back to (False, ..., reason) when doc scope
     unavailable or creation fails (caller then renders the card without doc link;
-    PlanB long-post is the fallback at the render layer)."""
+    PlanB long-post is the fallback at the render layer).
+
+    Side-effect boundary: only create_lark_doc_http (真实外部 API) here; the
+    deterministic args (title/markdown/grant) come from _build_review_doc_args
+    (pure, unit-tested)."""
     try:
         import os as _os, sys as _sys2
         rdir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
                              "..", "skills", "rage-review")
-        _sys2.path.insert(0, rdir)
+        if rdir not in _sys2.path:
+            _sys2.path.insert(0, rdir)
         import build_review_doc_http as _brd
-        # build issues in doc schema + files overview
-        issues = []
-        for f in findings or []:
-            issues.append({
-                "severity": f.get("severity") or "建议",
-                "repo": f.get("repo") or "engine",
-                "file": (f.get("file") or "").strip(),
-                "line_range": (f.get("line_range") or "").strip(),
-                "function": (f.get("function") or "").strip(),
-                "description": (f.get("issue") or f.get("description") or "").strip(),
-                "suggestion": (f.get("suggestion") or "").strip(),
-            })
-        files = [{"repo": f.get("repo") or "engine", "path": (f.get("file") or "").strip(),
-                  "insertions": 0, "deletions": 0, "description": ""} for f in findings or []]
-        md = _brd.build_doc_markdown(issue_key, "复杂审查完整报告。", issues, files)
-        # R7-C3 (加固): grant_view 从 config projects.<project>.approver_open_ids 读
-        # （rage 要求授权审查人+开发者，topic 上不一定有 approver 字段）。回退 topic 字段。
-        import common as _common
-        _grant = []
-        try:
-            _proj_cfg = (_common.load_config().get("projects") or {}).get(project) or {}
-            _grant += [a for a in (_proj_cfg.get("approver_open_ids") or []) if a]
-        except Exception:
-            pass
-        _grant += [a for a in (topic.get("approver_open_ids") or []) if a]
-        _grant += [a for a in ([topic.get("creator_open_id") or ""]) if a]
-        # de-dup preserving order
-        grant, _seen = [], set()
-        for g in _grant:
-            if g and g not in _seen:
-                _seen.add(g)
-                grant.append(g)
-        title = f"代码审查 {issue_key}"
+        title, md, grant = _build_review_doc_args(project, topic, findings, issue_key=issue_key)
         ok, tok, url, err = _brd.create_lark_doc_http(app_id, app_secret, title, md,
                                                        grant_view=grant)
         return ok, tok, url, err
