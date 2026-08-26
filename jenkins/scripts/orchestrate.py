@@ -419,8 +419,8 @@ def run(args):
     # the executor sets env and when it only relies on config. HTTP fallback kept.
     _rev_cfg = {}
     try:
-        import config as _cfg
-        _rev_cfg = (_cfg.load_config().get("review") or {})
+        import common as _common_cfg2
+        _rev_cfg = (_common_cfg2.load_config().get("review") or {})
     except Exception:
         pass
     use_agent = bool(_rev_cfg.get("agent_enabled")) or \
@@ -2664,15 +2664,16 @@ def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
         # Resolve per-project approvers (config) → fallback policy.yaml admins.
         # 修法3: topic.project 可能为空(真实话题 CB2N-30597 的 project=''), 此时从
         # jira_key 前缀反推(CB2N→CB2)以拿到正确的 approver_open_ids 列表。
-        import config as _cfg
+        # 注意: config(config.py) 无 load_config —— 必须用 common.load_config()。
+        import common as _common_cfg
         import jira_parser as _jp
         project_id = topic.get("project") or ""
         if not project_id:
             _jira = topic.get("jira_key") or ""
-            _pid, _pcfg = _jp.identify_project(_jira, _cfg.load_config())
+            _pid, _pcfg = _jp.identify_project(_jira, _common_cfg.load_config())
             if _pid:
                 project_id = _pid
-        projs = _cfg.load_config().get("projects") or {}
+        projs = _common_cfg.load_config().get("projects") or {}
         proj_cfg = projs.get(project_id) or {}
         policy_admins = []
         try:

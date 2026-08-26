@@ -62,3 +62,27 @@ def test_closure_human_text_templates():
         {"template": "re_review", "vars": {}}, {}, 0, {})
     assert "裁决" in orch._closure_human_text(
         {"template": "handoff_summary", "vars": {"dev_triage": {}}}, {}, 0, {})
+
+
+def test_closure_consumes_number_on_real_topic():
+    """Regression: _try_handle_closure MUST consume `1`/`#1` as dev_triage on a
+    review topic. Previously config.load_config() (nonexistent) threw and closure
+    always returned NO_MATCH -> 数字回复落到命令分发(fix_patch)."""
+    import common as cm
+    # no FEISHU creds in test harness -> post is skipped but closure consumes
+    t = {
+        "message_id": "om_t1", "jira_key": "CB2N-30597", "project": "",
+        "sender_id": "ou_x", "creator_open_id": "ou_x",
+        "review_state": "DEV_TRIAGE", "review_triage": "complex",
+        "issue_count": 6, "render_msg_id": "card",
+    }
+    # _try_handle_closure returns 0 on consumed (no creds -> post skipped, still consumed)
+    with tempfile.TemporaryDirectory() as tmp:
+        sf = os.path.join(tmp, "s.json")
+        ps.save_state({"schema_version": 1, "updated_at": "", "topics": {
+            "om_t1": dict(t, phase="DONE")}}, sf)
+        r = orch._try_handle_closure("om_t1", t, "1", "ou_x", tmp, sf)
+        assert r == 0, f"closure should consume 1, got {r}"
+        # verify state transitioned (dev_triage recorded)
+        tt = ps.get_topic(sf, "om_t1")
+        assert tt.get("dev_triage"), "dev_triage should be recorded after consuming 1"
