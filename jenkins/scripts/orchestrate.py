@@ -2731,6 +2731,11 @@ def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
         return 0
     except Exception as e:
         print(f"[closure] err: {e}", file=_sys.stderr)
+        try:
+            import traceback as _tb
+            _tb.print_exc()
+        except Exception:
+            pass
         return _CLOSURE_NO_MATCH
 
 
