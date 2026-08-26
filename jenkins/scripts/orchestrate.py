@@ -2773,14 +2773,16 @@ def _build_review_doc_args(project, topic, findings, issue_key=""):
     md = _brd.build_doc_markdown(_key, "复杂审查完整报告。", issues, files)
     # grant_view: config projects.<project>.approver_open_ids (rage要求审查人+开发者)
     # → topic.approver_open_ids → topic.creator_open_id; de-dup preserving order.
+    # 用 closure.parse_open_ids 归一化(prod minimal YAML 可能把列表解析成字符串).
     import common as _common
     _grant = []
     try:
         _proj_cfg = (_common.load_config().get("projects") or {}).get(project) or {}
-        _grant += [a for a in (_proj_cfg.get("approver_open_ids") or []) if a]
+        import closure as _cl
+        _grant += _cl.parse_open_ids(_proj_cfg.get("approver_open_ids"))
     except Exception:
         pass
-    _grant += [a for a in (topic.get("approver_open_ids") or []) if a]
+    _grant += [a for a in (topic.get("approver_open_ids") or []) if isinstance(a, str) and a]
     _grant += [a for a in ([topic.get("creator_open_id") or ""]) if a]
     grant, _seen = [], set()
     for g in _grant:

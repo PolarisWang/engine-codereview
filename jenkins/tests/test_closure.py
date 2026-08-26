@@ -117,3 +117,20 @@ def test_bystander_done_ignored():
 def test_ignored_garbage():
     r = c.reconcil("随便说点什么", "dev1", "DEV_TRIAGE", ["apr1"], "dev1", issue_count=2)
     assert r["intent"] is None
+
+
+def test_parse_open_ids_minimal_yaml_string_forms():
+    # prod minimal YAML 把内联列表解析成字符串, 必须兼容
+    assert c.parse_open_ids('["ou_a", "ou_b"]') == ["ou_a", "ou_b"]
+    assert c.parse_open_ids('["ou_a"]') == ["ou_a"]
+    assert c.parse_open_ids("ou_a,ou_b") == ["ou_a", "ou_b"]
+    assert c.parse_open_ids(["ou_a", "ou_b"]) == ["ou_a", "ou_b"]
+    assert c.parse_open_ids(['"ou_a"', "ou_b"]) == ["ou_a", "ou_b"]
+    assert c.parse_open_ids([]) == []
+    assert c.parse_open_ids("") == []
+
+
+def test_approver_ids_for_minimal_yaml_string(monkeypatch):
+    # config 里 approver_open_ids 是字符串形式时, approver_ids_for 仍解析出正确 id
+    cfg = {"approver_open_ids": '["ou_aaa", "ou_bbb"]'}
+    assert c.approver_ids_for(cfg, []) == ["ou_aaa", "ou_bbb"]

@@ -32,6 +32,43 @@ REVIEW_STATES = {
 }
 
 
+def parse_open_ids(raw):
+    """归一化 approver_open_ids 到真 open_id 列表。
+
+    minimal YAML(prod 无 PyYAML) 把内联列表 `[ "ou_a", "ou_b" ]` 解析成**字符串**
+    `'["ou_a", "ou_b"]'` 而非真 list。这里兼容:
+      - list   -> 原样(逐项去空白/去引号)
+      - JSON 数组字符串 `["a","b"]` / `'["a"]'` -> 解析
+      - 逗号分隔字符串 `a,b` -> split
+    返回去空白/去引号/去空 的去重 open_id 列表(可能为空)。"""
+    import re as _re, json as _json
+    raw = raw or []
+    if isinstance(raw, str):
+        s = raw.strip()
+        # 形如 ["a", "b"] / ["a"] 的 JSON 数组字符串(minimal YAML 产物)
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = _json.loads(s)
+                if isinstance(arr, list):
+                    return parse_open_ids(arr)
+            except Exception:
+                pass
+            # 非严格 JSON 但带引号 -> 摘引号
+            return [_re.sub(r'^["\']|["\']$', '', t).strip()
+                    for t in _re.findall(r'["\']([^"\']+)["\']', s)]
+        # 逗号/空白分隔
+        return [t for t in (_re.split(r'[\s,，]+', s) if s else []) if t]
+    if isinstance(raw, (list, tuple)):
+        out = []
+        for x in raw:
+            if isinstance(x, str):
+                x = x.strip().strip('"').strip("'")
+            if x:
+                out.append(str(x))
+        return out
+    return []
+
+
 def approver_ids_for(project_cfg, policy_admins):
     """Resolve the project's approver open_ids.
 
@@ -39,9 +76,7 @@ def approver_ids_for(project_cfg, policy_admins):
     policy.yaml `policy.agent.admins` when empty. Returns a list of open_id
     strings (never None).
     """
-    ap = (project_cfg or {}).get("approver_open_ids") or []
-    if isinstance(ap, str):
-        ap = [x.strip() for x in ap.split(",") if x.strip()]
+    ap = parse_open_ids((project_cfg or {}).get("approver_open_ids"))
     ap = [x for x in ap if x]
     if ap:
         return ap
