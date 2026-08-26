@@ -87,3 +87,38 @@ def test_markdown_to_blocks_bold_heading_and_bullet():
              if e["text_run"]["text_element_style"]["bold"]]
     assert "重要" in bolds and "这是" in texts[0]
     assert blocks[2]["block_type"] == 12                  # bullet
+
+
+def test_set_public_readable_calls_v2_docx(monkeypatch):
+    """方案B: _set_public_readable 调 v2 ?type=docx + tenant_readable."""
+    calls = []
+    def fake(tok, path, method='GET', body=None, timeout=30):
+        calls.append((path, method, body))
+        return {"code": 0, "data": {"permission_public": {"link_share_entity": "tenant_readable"}}}
+    monkeypatch.setattr("build_review_doc_http._feishu_api", fake)
+    ok, err = b._set_public_readable("tok", "doc_x")
+    assert ok and not err
+    path, method, body = calls[0]
+    assert "drive/v2/permissions/doc_x/public?type=docx" in path
+    assert body == {"link_share_entity": "tenant_readable"}
+
+
+def test_create_doc_members_use_type_docx(monkeypatch):
+    """create_lark_doc_http 的 member grant 带 ?type=docx(否则 docx 400)."""
+    seq = {"n": 0}
+    def fake(tok, path, method='GET', body=None, timeout=30):
+        seq["n"] += 1
+        # 第1次=create doc; 第2次=public? no; 顺序: token, create, public, members
+        if "docx/v1/documents" in path and method == "POST":
+            return {"code": 0, "data": {"document": {"document_id": "doc123"}}}
+        if "permissions/doc123/public" in path:
+            return {"code": 0, "data": {"permission_public": {"link_share_entity": "tenant_readable"}}}
+        if "permissions/doc123/members" in path:
+            assert "?type=docx" in path, f"members must carry ?type=docx, got {path}"
+            return {"code": 0, "data": {}}
+        return {"code": 0}
+    monkeypatch.setattr("build_review_doc_http._feishu_api", fake)
+    monkeypatch.setattr("build_review_doc_http._tenant_token", lambda a, s: "tok")
+    monkeypatch.setattr("build_review_doc_http.build_code_blocks", lambda md: [])
+    ok, tok_, url, err = b.create_lark_doc_http("a", "s", "T", "# 标题")
+    assert ok and url.endswith("/doc123")

@@ -107,12 +107,40 @@ def _feishu_api(token, path, method="GET", body=None, timeout=30):
         return {"code": -1, "msg": str(e)}
 
 
+def _set_public_readable(token, doc_token, type_name="docx", timeout=20):
+    """Set the doc's sharing to tenant_readable (组织内获得链接者可读, 方案B).
+
+    Uses the v2 endpoint with the doc type as a query param:
+      PATCH /drive/v2/permissions/{token}/public?type=docx
+      body: {"link_share_entity": "tenant_readable"}
+
+    The v1 endpoint (drive/v1/permissions/.../public) does NOT support docx and
+    keeps rejecting the `type` field; v2 + ?type=docx works (live-probed).
+    Returns (ok, err).
+    """
+    r = _feishu_api(token,
+                    f"drive/v2/permissions/{doc_token}/public?type={type_name}",
+                    method="PATCH",
+                    body={"link_share_entity": "tenant_readable"},
+                    timeout=timeout)
+    if r.get("code") == 0 and (r.get("data") or {}).get("permission_public", {}).get(
+            "link_share_entity") == "tenant_readable":
+        return True, ""
+    return False, f"set tenant_readable failed: {r.get('msg')}"
+
+
 def create_lark_doc_http(app_id, app_secret, title, markdown, grant_view=(),
                          public_link=True):
     """PlanA: create a Feishu doc + grant view. Returns (ok, token, url, err).
 
     Requires the app to have docx/drive scope (P0.5 R2). On any scope/API failure
-    returns (False, ...) so the caller falls back to a long-post (PlanB).
+    (other than the best-effort public link) returns (False, ...) so the caller
+    falls back to a long-post (PlanB).
+
+    Sharing (方案B): after creating, set the doc to tenant_readable (组织内可读) via
+    v2 permission public, so anyone in the tenant with the link can read — not just
+    approver/developer. The explicit `permission.members create` grant still runs so
+    named reviewers get full_access regardless.
     """
     token = _tenant_token(app_id, app_secret)
     if not token:
@@ -127,16 +155,25 @@ def create_lark_doc_http(app_id, app_secret, title, markdown, grant_view=(),
         (r.get("data") or {}).get("document_id") or ""
     if not doc_token:
         return False, "", "", "docx create returned no document_id"
+    url = f"https://www.feishu.cn/docx/{doc_token}"
+    # ── 方案B: 组织内可读 (tenant_readable). best-effort: 失败不阻断创建. ──
+    pub_ok = True
+    if public_link:
+        pub_ok, pub_err = _set_public_readable(token, doc_token, type_name="docx")
+        if not pub_ok:
+            import sys as _sys
+            print(f"[lark_doc_http] public link skipped: {pub_err}", file=_sys.stderr)
     # Best-effort permission grant to approver + developer (drive scope).
+    # v1 members needs ?type=docx for docx documents (probed: without it -> 400).
     granted = []
     for uid in grant_view or []:
-        gr = _feishu_api(token, f"drive/v1/permissions/{doc_token}/members",
+        gr = _feishu_api(token,
+                         f"drive/v1/permissions/{doc_token}/members?type=docx",
                          method="POST", body={"member_type": "openid",
                                               "member_id": uid,
-                                              "perm": "full_access"})
+                                              "perm": "edit"})
         if gr.get("code") == 0:
             granted.append(uid)
-    url = f"https://www.feishu.cn/docx/{doc_token}"
     # R7: write the review-doc content into the doc as native docx blocks (not an
     # empty container). code fences render as code_block, the rest inline.
     blocks = build_code_blocks(markdown)
