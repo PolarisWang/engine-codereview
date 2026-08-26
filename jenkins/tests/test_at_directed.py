@@ -109,3 +109,17 @@ def test_at_review_command_directed(monkeypatch):
     assert es._is_bot_directed("@_user_1 review", []) is True
     # 但 @某人类 + 非命令闲聊 仍不触发
     assert es._is_bot_directed("@_user_1 你看下这个", []) is False
+
+
+def test_closure_token_after_at_mention_directed():
+    """真实场景: Feishu 把 bot 的 @ 渲染成 @_user_1; 回复 `@_user_1 #1` 应视为
+    bot-directed(闭路序号回复), 否则闭路交互永远被 gate 挡住."""
+    from event_server import _is_bot_directed
+    assert _is_bot_directed("@_user_1 #1", []) is True
+    assert _is_bot_directed("@_user_1 1", []) is True
+    assert _is_bot_directed("@_user_1 1 3 5", []) is True
+    assert _is_bot_directed("@_user_1 ok", []) is True
+    # 无 @ 纯数字(无 mentions 命中 bot) 仍保持不打扰
+    assert _is_bot_directed("#1", []) is False
+    assert _is_bot_directed("1", []) is False
+    assert _is_bot_directed("3 没有问题", []) is False

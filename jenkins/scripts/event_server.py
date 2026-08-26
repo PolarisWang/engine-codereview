@@ -598,6 +598,44 @@ def _starts_with_command(body, words):
     return _token_matches_command(first, words)
 
 
+def _is_closure_token(body):
+    """True if `body` (after @-mention stripping) is a review-closure reply verb:
+    an issue index (`1`, `#1`, `1 3 5`, `#-2`, `all`), or `ok`/`done`/`close`.
+
+    In a review-closure topic these are the bot's interaction verbs (rage: dev
+    回序号/ok/done/close), so a reply like `@_user_1 #1` or a bare `1` should be
+    treated as bot-directed even if `#1` isn't a registered command word. Reuses
+    the ported reply_parser to classify, so it stays consistent with closure.
+    """
+    b = (body or "").strip().lower()
+    if not b:
+        return False
+    # fast path: sole closure verbs
+    if b in ("ok", "done", "close", "关闭", "all", "none", "不修"):
+        return True
+    try:
+        import os as _os, sys as _sys
+        _rdir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                              "..", "skills", "rage-review")
+        if _rdir not in _sys.path:
+            _sys.path.insert(0, _rdir)
+        import reply_parser as _rp
+        # index grammar (1/#1/1 3 5/-2/all) -> a closure index reply
+        r = _rp.parse_indices_with_mode(body, allow_none=True, allow_trailing_text=True)
+        if r is not None:
+            return True
+        # @bot 同步 / @bot <question> handled by mentions/at paths elsewhere
+        return False
+    except Exception:
+        # reply_parser unavailable / parse edge -> fall back to a simple check so a
+        # bare `#1`, `1`, `1 3 5` reply is never wrongly dropped.
+        import re as _re
+        stripped = b.lstrip("#")
+        if stripped.replace(" ", "").replace(",", "").replace("，", "").isdigit():
+            return True
+        return False
+
+
 def _is_bot_directed(text, mentions):
     """True if a threaded reply is directed at the bot, so the bot only replies when
     addressed and stays silent when users chat among themselves.
@@ -611,8 +649,12 @@ def _is_bot_directed(text, mentions):
       2) If the message began with an '@' mention, strip the leading mention(s) and
          check the remainder: starting with a KNOWN COMMAND KEYWORD (@_user_1 3 → `3`)
          or with the configured bot name → BOT-DIRECTED.
+      3) The remainder is a review-closure reply token (`#1`/`1`/`1 3`/`ok`/`done`/
+         `close`) → BOT-DIRECTED. In a review topic these are the bot's interaction
+         verbs, so `@_user_1 #1` must reach the closure handler.
     A leading '@' followed by another user's name AND casual (non-command) text is NOT
-    directed. A plain message with NO '@' is only bot-directed if it mentions the bot.
+    directed. A plain message with NO '@' is only bot-directed if it mentions the bot
+    or is a closure reply token.
     """
     s = (text or "").strip()
     if not s:
@@ -627,7 +669,8 @@ def _is_bot_directed(text, mentions):
         if bot_name and (m.get("name") or "").strip().lstrip("@").lower() == bot_name:
             return True
 
-    # ② 若消息以 '@' 开头: 剥掉前导 @mention(s) 后, 后续以命令词或 bot 名开头即 directed
+    # ② 若消息以 '@' 开头: 剥掉前导 @mention(s) 后, 后续以命令词 / bot 名 /
+    #    闭路回复 token(序号/#N/ok/done/close) 开头即 directed
     had_at = s.startswith("@")
     if had_at:
         body = _strip_leading_mentions(s, _command_words())
@@ -635,8 +678,10 @@ def _is_bot_directed(text, mentions):
             return True
         if bot_name and body.lower().startswith(bot_name):
             return True
+        if _is_closure_token(body):
+            return True
 
-    # 纯文本无 '@' 且未在 mentions 命中 bot -> 不回复
+    # 纯文本无 '@' 且未在 mentions 命中 bot / 不是命令 / 不是闭路 token -> 不回复
     return False
 
 
