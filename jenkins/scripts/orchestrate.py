@@ -506,11 +506,13 @@ def run(args):
         # 追加新消息(不覆盖, 完整保留)。普通 review 只有 1 段 → 仍单次 update-reply 不变。
         rc_all = _send_review_segments(
             reply_msg_id, segs, app_id, app_secret, chat_id, key, issue_key, project)
-        # 交互指引卡: review 结果后单独发一张, 教用户下一步(重点是 `优化` 自动改码+提MR)。
+        # 交互指引卡: review 结果后单独发一张(方案C 交互卡)——承载全部交互指令,
+        # review 结果卡不重复。有 findings 才显示"回复序号", 否则只留 ok/close。
         if rc_all == 0:
+            _interact_txt = feishu_notifier.build_interact_card(has_findings=bool(merged_findings))
             _run_py("feishu_notifier.py", [
                 "reply-message", "--app-id", app_id, "--app-secret", app_secret,
-                "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(M("interact_hint"))])
+                "--chat-id", chat_id, "--message-id", key, "--message-base64", _b64_str(_interact_txt)])
         if rc_all != 0:
             topic_after = pipeline_state.record_failure(state_file, key, "update reply failed")
             _alert_if_exhausted(state_file, topic_after, app_id, app_secret)

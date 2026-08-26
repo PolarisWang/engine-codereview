@@ -533,25 +533,70 @@ CUSTOM_FOOTER = [
 ]
 
 
+def _severity_zh_norm(sev):
+    """Normalize a finding's severity to 严重/中/轻/建议 (英文 severity → 中文)。
+
+    Handles both the agent path (中文 严重/中/轻/建议) and the HTTP path (英文
+    critical/warning/suggestion) so counts/sort/icon are correct regardless.
+    """
+    s = (sev or "").strip().lower()
+    if s in ("严重", "critical", "high", "error", "blocker"):
+        return "严重"
+    if s in ("中", "warning", "warn", "medium", "minor"):
+        return "中"
+    if s in ("轻", "suggestion", "info", "note", "low", "nit"):
+        return "轻"
+    return "建议"
+
+
+_SEV_ICON = {"严重": "🔴", "中": "🟠", "轻": "🟡", "建议": "🟢"}
+_SEV_ORDER = {"严重": 0, "中": 1, "轻": 2, "建议": 3}
+
+
+def build_interact_card(has_findings=True):
+    """方案C 交互卡：独立的第二张卡，承载全部交互指令。
+
+    rage 闭环指令 + 我们的自动修改/其它指令，合并到这一张，避免与 review 结果
+    卡重复(方案C 语义分离: 第一张=审查结果, 第二张=操作台)。"""
+    parts = ["🤖 **下一步操作**"]
+    # rage 闭环指令
+    lines = []
+    if has_findings:
+        lines.append(CLOSURE_FOOTER[0])   # 回复问题序号
+        lines.append("· ok：开发者修复后推进下一轮 / 审查人批准")
+    else:
+        lines.append("· ok：审查人批准")
+    lines.append("· done：开发者提交给审查人裁决")
+    lines.append("· @bot 同步：刷新人工审查评论")
+    parts.append("\n【闭环指令】(rage)")
+    parts.extend(lines)
+    # 我们的自动修改/其它指令
+    parts.append("\n【自动修改 / 其它指令】")
+    parts.extend(CUSTOM_FOOTER)
+    return "\n".join(parts)
+
+
 def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
                      triage="", round_no=1, summary="", mr_url="", jira_url="", project=""):
-    """Render the FULL review as a rage-standard card (方案C).
+    """Render the review results card (方案C).
 
-    Format: `#N [严重|中|轻|建议] [repo] file:line_range （function）: 问题 → 修法`,
-    severity-sorted, plus an optional doc link (complex review) and the two
-    command-footer blocks (rage closure + our custom auto-edit/MR commands).
+    Format: `#N [icon 严重] [repo] file:line_range （function）: 问题 → 修法`,
+    severity-normalized (英文→中文) + severity-sorted + icon (🔴🟠🟡🟢).
 
-    repo_labels: optional dict mapping repo key -> display label (e.g.
-    {engine:'engine', game:'game'}); defaults derived from finding.repo.
+    NOTE (方案C 交互卡分离): this card does NOT embed the command footers — the
+    interactive commands (rage closure + our auto-edit/MR) live on the SEPARATE
+    interact card, so the review card shows results only (no semantic duplication).
     """
     findings = findings or []
     merged = [dict(f) for f in findings]
-    # normalize repo label: use finding.repo if present, else infer
+    # normalize severity first (English->Chinese) so sort + count + icon align
     for f in merged:
         f["_repo"] = (f.get("repo") or _short_fn(f)).strip()
-    ordered = sorted(merged, key=lambda f: (_sev_zh_sort(f.get("severity") or "建议"),
-                                            (f.get("file") or "")))
+        f["_sev"] = _severity_zh_norm(f.get("severity"))
+    ordered = sorted(merged, key=lambda f: (_SEV_ORDER.get(f["_sev"], 3), (f.get("file") or "")))
     counts = {"严重": 0, "中": 0, "轻": 0, "建议": 0}
+    for f in ordered:
+        counts[f["_sev"]] += 1
     # R7-I2: doc 链接放最前(复杂审查最重要的产物), 再 MR/Jira
     parts = [f"🔍 {issue_key} · 审查结果" + (f"（第 {round_no} 轮）" if round_no else "")]
     if doc_url:
@@ -560,13 +605,12 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
         parts.append(f"🔗 MR：{mr_url}")
     if jira_url:
         parts.append(f"📎 {jira_url}")
-    for f in ordered:
-        counts[f.get("severity") or "建议"] = counts.get(f.get("severity") or "建议", 0) + 1
     if ordered:
         parts.append(f"📊 严重{counts['严重']} / 中{counts['中']} / 轻{counts['轻']} / 建议{counts['建议']}")
     parts.append("")
     for i, f in enumerate(ordered, start=1):
-        sev = f.get("severity") or "建议"
+        sev = f["_sev"]
+        icon = _SEV_ICON.get(sev, "🟢")
         repo = f.get("_repo")
         file = (f.get("file") or "").strip()
         lr = (f.get("line_range") or "").strip()
@@ -574,7 +618,7 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
         loc = file + (f":{lr}" if lr else "") + (f" {fn}" if fn else "")
         issue = (f.get("issue") or f.get("description") or "").strip()
         sug = (f.get("suggestion") or "").strip()
-        line = f"#{i} [{sev}] [{repo}] {loc}: {issue}"
+        line = f"#{i} [{icon} {sev}] [{repo}] {loc}: {issue}"
         if sug:
             line += f" → {sug}"
         parts.append(line)
@@ -582,17 +626,6 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
         parts.append("✅ 已完成审查，未发现问题。")
     if summary:
         parts.append(f"\n{summary}")
-    # footer blocks (R7-I1: 无 findings 时隐藏"回复序号", 只留 ok/close + 自定义指令)
-    parts.append("\n【闭环指令】")
-    if ordered:
-        parts.append(CLOSURE_FOOTER[0])           # 回复问题序号
-        parts.append("· ok：开发者修复后推进下一轮 / 审查人批准")
-    else:
-        parts.append("· ok：审查人批准")
-    parts.append("· done：开发者提交给审查人裁决")
-    parts.append("· @bot 同步：刷新人工审查评论")
-    parts.append("\n【自动修改 / 其它指令】")
-    parts.extend(CUSTOM_FOOTER)
     return "\n".join(parts)
 
 

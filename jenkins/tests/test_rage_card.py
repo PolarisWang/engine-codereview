@@ -1,9 +1,12 @@
-"""Tests for 方案C: rage-standard card (render_rage_card) + command routing.
+"""Tests for 方案C: rage-standard review card (render_rage_card) + interact card.
 
-Verifies the card renders 4-tier #N findings + doc link + dual command footers
-(rage closure + custom, with 改码/指引 removed), and that custom commands are
-NOT intercepted by the closure (they route to the existing interact command-word
-path) while closure intents (序号/ok/done/close) are.
+Verifies:
+- render_rage_card normalizes English severity (critical/warning/suggestion) to
+  严重/中/轻/建议, gives each an icon (🔴🟠🟡🟢), severity-sorts, and does NOT
+  embed command footers (方案C: review card = results only).
+- build_interact_card carries ALL interactive commands (rage closure + our
+  auto-edit/MR), with 改码/指引 removed.
+- custom commands are NOT intercepted by closure; closure intents still route.
 """
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
@@ -12,7 +15,7 @@ import feishu_notifier as fn
 import closure as c
 
 
-def _findings():
+def _findings_zh():
     return [
         {"severity": "中", "repo": "engine", "file": "chaos/a.cpp",
          "line_range": "1303-1320", "function": "activateX", "issue": "mask 不对称",
@@ -23,66 +26,91 @@ def _findings():
     ]
 
 
-def test_rage_card_4tier_and_numbering():
-    t = fn.render_rage_card("CB2N-99", _findings(), doc_url="https://www.feishu.cn/docx/X",
+def _findings_en():
+    # English severity (HTTP-path findings) — the key bug: must normalize to 中文
+    return [
+        {"severity": "critical", "repo": "game", "file": "x.cs", "issue": "越界"},
+        {"severity": "warning", "repo": "engine", "file": "chaos/a.cpp", "issue": "mask"},
+        {"severity": "suggestion", "repo": "engine", "file": "chaos/c.cpp", "issue": "缩进"},
+        {"severity": "warning", "repo": "engine", "file": "chaos/d.cpp", "issue": "race"},
+    ]
+
+
+# ── review card: 4-tier + icon + sort + no footer ──────────────────────────
+
+def test_rage_card_4tier_numbering_and_icon():
+    t = fn.render_rage_card("CB2N-99", _findings_zh(), doc_url="https://www.feishu.cn/docx/X",
                             triage="complex", round_no=1, mr_url="https://g/1",
                             jira_url="https://j/1")
-    # 4-tier #N, severity-sorted (严重 first)
-    assert "#1 [严重] [game] x.cs:30" in t
-    assert "#2 [中] [engine] chaos/a.cpp:1303-1320 activateX" in t
-    assert "#3 [建议] [engine] chaos/c.cpp" in t
+    # 4-tier #N, severity-sorted (严重 first), with icons
+    assert "#1 [🔴 严重] [game] x.cs:30" in t
+    assert "#2 [🟠 中] [engine] chaos/a.cpp:1303-1320 activateX" in t
+    assert "#3 [🟢 建议] [engine] chaos/c.cpp" in t
     assert "📊 严重1 / 中1 / 轻0 / 建议1" in t
 
 
+def test_rage_card_normalizes_english_severity():
+    # The real bug: English findings showed 严重0/中0/轻0/建议0. Normalize → correct.
+    t = fn.render_rage_card("CB2N-100", _findings_en())
+    assert "📊 严重1 / 中2 / 轻1 / 建议0" in t, "English severity must normalize to 中文 counts"
+    assert "#1 [🔴 严重] [game] x.cs" in t      # critical first
+    assert "#2 [🟠 中]" in t                        # warning
+    assert "#4 [🟡 轻]" in t                        # suggestion -> 轻
+
+
 def test_rage_card_doc_link():
-    t = fn.render_rage_card("K-1", _findings(), doc_url="https://www.feishu.cn/docx/DOC",
+    t = fn.render_rage_card("K-1", _findings_zh(), doc_url="https://www.feishu.cn/docx/DOC",
                             triage="complex")
     assert "📄 完整评审文档：https://www.feishu.cn/docx/DOC" in t
 
 
 def test_rage_card_doc_link_first():
-    # R7-I2: 复杂审查的 doc 链接放最前(比 MR 更突出)
-    t = fn.render_rage_card("K-1", _findings(), doc_url="https://www.feishu.cn/docx/DOC",
+    t = fn.render_rage_card("K-1", _findings_zh(), doc_url="https://www.feishu.cn/docx/DOC",
                             mr_url="https://g/1")
-    assert t.index("📄 完整评审文档") < t.index("🔗 MR"), "doc link should precede MR"
+    assert t.index("📄 完整评审文档") < t.index("🔗 MR")
 
 
-def test_rage_card_no_findings_hides_index_footer():
-    # R7-I1: 无 findings 时不显示"回复问题序号"(没得编号), 只留 ok/done/close + 自定义
-    t = fn.render_rage_card("K-1", [], round_no=0)
+def test_rage_card_has_NO_footer():
+    # 方案C: review 卡不内嵌指令 footer(已移到交互卡), 避免语义重复
+    t = fn.render_rage_card("K-1", _findings_zh())
+    assert "【闭环指令】" not in t and "【自动修改 / 其它指令】" not in t
     assert "回复问题序号" not in t
-    assert "ok：审查人批准" in t
-    assert "关闭" in t
-
-
-def test_rage_card_dual_footer_no_changma():
-    t = fn.render_rage_card("K-1", _findings())
-    assert "【闭环指令】" in t and "【自动修改 / 其它指令】" in t
-    # rage closure verbs present (as Chinese tokens, since card is Chinese)
-    for w in ("回复问题序号", "ok：", "done：", "@bot 同步"):
-        assert w in t, f"missing closure token {w!r} in:\n{t}"
-    # customs present
-    for w in ("优化", "mr", "深入", "质疑", "重新审查", "更新结论", "关闭"):
-        assert w in t, f"missing custom token {w!r} in:\n{t}"
-    # 改码/指引 REMOVED
-    assert "改码" not in t and "指引" not in t
 
 
 def test_rage_card_no_findings_clean():
     t = fn.render_rage_card("K-1", [], round_no=0)
     assert "已完成审查，未发现问题" in t
     assert "🔍 K-1 · 审查结果" in t
+    assert "📊" not in t
 
+
+# ── interact card: all commands, no 改码/指引 ──────────────────────────────
+
+def test_interact_card_has_all_commands_no_changma():
+    t = fn.build_interact_card(has_findings=True)
+    assert "【闭环指令】" in t and "【自动修改 / 其它指令】" in t
+    for w in ("回复问题序号", "ok：", "done：", "@bot 同步",
+              "优化", "mr", "深入", "质疑", "重新审查", "更新结论", "关闭"):
+        assert w in t, f"interact card missing {w!r}"
+    assert "改码" not in t and "指引" not in t
+
+
+def test_interact_card_no_findings_hides_index():
+    t = fn.build_interact_card(has_findings=False)
+    assert "回复问题序号" not in t
+    assert "ok：审查人批准" in t
+    assert "关闭" in t
+
+
+# ── closure routing unchanged ──────────────────────────────────────────────
 
 def test_custom_commands_not_intercepted_by_closure():
-    # custom commands → ignored → fall through to interact command-word path
     for cmd in ("优化", "mr", "深入", "质疑", "重新审查", "更新结论"):
         cls = c.classify(cmd, "dev1", "DEV_TRIAGE", ["apr1"], developer_id="dev1")
         assert cls["intent"] is None and cls["role"] == "ignored"
 
 
 def test_closure_intents_still_routed():
-    # rage closure intents still resolve (dev_triage / approve / handoff / dev_reply)
     r = c.reconcil("1 3", "dev1", "DEV_TRIAGE", ["apr1"], "dev1", issue_count=3)
     assert r["intent"] == "dev_triage"
     r = c.reconcil("ok", "apr1", "AWAITING_APPROVAL", ["apr1"], "dev1", 0)
