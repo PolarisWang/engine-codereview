@@ -621,6 +621,10 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
     parts = [f"🔍 {issue_key} · 审查结果" + (f"（第 {round_no} 轮）" if round_no else "")]
     if doc_url:
         parts.append(f"📄 完整评审文档：{doc_url}")
+    elif triage == "simple":
+        # 方案A(贴 rage): 仅复杂审查(>5文件/100行)生成完整文档; 简单审查只在 thread
+        # 列出序号, 不加 doc —— 加一句轻提示避免用户误以为"漏了"。
+        parts.append("ℹ️ 变更较小（简单审查），未生成完整文档；完整文档仅用于较大变更。")
     if mr_url:
         parts.append(f"🔗 MR：{mr_url}")
     if jira_url:

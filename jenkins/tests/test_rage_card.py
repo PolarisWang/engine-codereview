@@ -127,3 +127,15 @@ def test_closure_intents_still_routed():
     assert r["intent"] == "approve"
     r = c.reconcil("done", "dev1", "DEV_TRIAGE", ["apr1"], "dev1", 0)
     assert r["intent"] == "dev_handoff"
+
+
+def test_simple_no_doc_shows_notice():
+    """方案A: simple 审查无 doc 时不显示链接, 但加句轻提示(不是漏了)."""
+    t = fn.render_rage_card("K-1", [{"severity": "中", "file": "a.cpp", "issue": "x"}],
+                            triage="simple")
+    assert "📄 完整评审文档" not in t
+    assert "变更较小" in t or "未生成完整文档" in t
+    # complex 有 doc 才显示链接
+    c = fn.render_rage_card("K-1", [{"severity": "中", "file": "a.cpp", "issue": "x"}],
+                            triage="complex", doc_url="https://www.feishu.cn/docx/D")
+    assert "📄 完整评审文档" in c
