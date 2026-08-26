@@ -305,9 +305,6 @@ def _lark_message_to_route(lark_message):
         raw_content = getattr(lark_message, "content", "") or ""
         sender = getattr(lark_message, "sender", None)
         sender_id = _sender_id_of(sender)
-        if not sender_id:
-            print("[event] WARN: no sender_id extracted from message (guarded actions "
-                  "like re_review/apply/close will be denied)", flush=True)
         text = ""
         mentions = []
         if msg_type == "text":
@@ -362,6 +359,12 @@ def on_p2_im_message_receive(data):
             return
         msg_id, parent_id, chat_type, text, _sender2, mentions = routed
         sender_id = sender_id or _sender2
+        # Only warn when the FINAL sender is empty (guarded actions will be denied).
+        # Do not warn per-`_sender_id_of` call — event.sender is often absent but
+        # message.sender fallback succeeds (was a misleading WARN on every reply).
+        if not sender_id:
+            print("[event] WARN: no sender_id extracted from message (guarded actions "
+                  "like re_review/apply/close will be denied)", flush=True)
         if chat_type != "group":
             return
         _route(msg_id, parent_id, text, sender_id, mentions)

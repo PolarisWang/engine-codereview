@@ -146,3 +146,11 @@ def test_is_closure_token_fallback_when_parser_missing(monkeypatch):
     assert _is_closure_token("1") is True
     # 认 ok/done/close (fast path 在 import 之前)
     assert _is_closure_token("done") is True
+
+
+def test_rereview_synonyms_directed():
+    """方案1: 「重新审核」/「审核」等近义词应过 @-gate(用户措辞差异不能挡掉 re_review)."""
+    from event_server import _is_bot_directed
+    for txt in ("@_user_1 重新审核", "@_user_1 重新审查", "@_user_1 审核",
+                "@_user_1 重审", "@_user_1 重新review"):
+        assert _is_bot_directed(txt, []) is True, f"{txt} should be directed"

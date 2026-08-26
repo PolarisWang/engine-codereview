@@ -853,7 +853,7 @@ for _wlist in _config.CMD.values():
         _COMMAND_FIRST_WORDS.update(w for w in _wlist if isinstance(w, str))
 _COMMAND_FIRST_WORDS |= {
     "1", "补丁", "生成补丁", "修复",
-    "2", "重新审查", "重审", "review", "重新review",
+    "2", "重新审查", "重审", "重新审核", "审核", "review", "重新review",
     "3", "解释",
     "预览", "预览补丁", "patch预览",
     "应用并提交", "确认提交", "push并建mr",
@@ -928,7 +928,7 @@ def _register_builtin_commands():
                               ctx["render_id"], ctx["workspace"], ctx["state_file"],
                               ctx["app_id"], ctx["app_secret"], ctx["actor"])
 
-    @command("2", "重新审查", "重审", "review", "重新review")
+    @command("2", "重新审查", "重审", "重新审核", "审核", "review", "重新review")
     def _h_rereview(ctx):
         _cmd_rereview(ctx["key"], ctx["topic"], ctx["state_file"], ctx["render_id"],
                       ctx["app_id"], ctx["app_secret"], ctx["actor"])
