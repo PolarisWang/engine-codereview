@@ -102,6 +102,16 @@ def test_interact_card_no_findings_hides_index():
     assert "关闭" in t
 
 
+def test_interact_card_closure_style_hides_number_commands():
+    # 闭路卡: 不展示 2/4 纯数字命令(闭路下 2/4 是序号不是命令), 避免歧义
+    t = fn.build_interact_card(has_findings=True, closure_style=True)
+    assert "对应 `2`" not in t and "回复 `4`" not in t
+    assert "重新审查" in t and "关闭" in t       # 文本命令仍有
+    # 非闭路版仍保留数字命令提示
+    t2 = fn.build_interact_card(has_findings=True, closure_style=False)
+    assert "对应 `2`" in t2 and "回复 `4`" in t2
+
+
 # ── closure routing unchanged ──────────────────────────────────────────────
 
 def test_custom_commands_not_intercepted_by_closure():

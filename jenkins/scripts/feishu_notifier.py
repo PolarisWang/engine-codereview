@@ -554,11 +554,30 @@ _SEV_ICON = {"严重": "🔴", "中": "🟠", "轻": "🟡", "建议": "🟢"}
 _SEV_ORDER = {"严重": 0, "中": 1, "轻": 2, "建议": 3}
 
 
-def build_interact_card(has_findings=True):
+# 闭路卡自定义指令: 不标 2/4(闭路状态下 2/4 是问题序号, 不是命令 —— 避免歧义)。
+# 非闭路(普通话题)才用 1/2/3/4 数字命令。
+CUSTOM_FOOTER_CLOSURE = [
+    "· 优化：自动修复关键问题 → 推送修复分支 → 建/更新 MR（需回复确认后执行）",
+    "· mr：生成/更新 MR",
+    "· 深入：深度分析",
+    "· 质疑：质疑 findings",
+    "· 重新审查：重跑审查",
+    "· 更新结论：修订结论",
+    "· 关闭话题：回复『关闭』",
+]
+
+
+def build_interact_card(has_findings=True, closure_style=True):
     """方案C 交互卡：独立的第二张卡，承载全部交互指令。
 
     rage 闭环指令 + 我们的自动修改/其它指令，合并到这一张，避免与 review 结果
-    卡重复(方案C 语义分离: 第一张=审查结果, 第二张=操作台)。"""
+    卡重复(方案C 语义分离: 第一张=审查结果, 第二张=操作台)。
+
+    歧义规避(closure_style): 闭路状态下数字(1/2/3/4...)只作问题序号, 不是命令;
+    故闭路卡不展示"对应2/回复4"这类纯数字命令提示, 只留文本命令, 避免用户误解
+    2/4 是命令(实为序号)。非闭路话题才用 1/2/3/4 数字快捷命令。
+    """
+    custom = CUSTOM_FOOTER_CLOSURE if closure_style else CUSTOM_FOOTER
     parts = ["🤖 **下一步操作**"]
     # rage 闭环指令
     lines = []
@@ -573,7 +592,7 @@ def build_interact_card(has_findings=True):
     parts.extend(lines)
     # 我们的自动修改/其它指令
     parts.append("\n【自动修改 / 其它指令】")
-    parts.extend(CUSTOM_FOOTER)
+    parts.extend(custom)
     return "\n".join(parts)
 
 
