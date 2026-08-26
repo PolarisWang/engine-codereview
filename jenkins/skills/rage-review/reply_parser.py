@@ -38,10 +38,11 @@ ESCALATE_PATTERNS = re.compile(r"^(yes|完整审查|完整版|full\s*review|full
 CLOSE_PATTERNS = re.compile(r"^(no|close|关闭)$", re.IGNORECASE)
 # Indices: digit-runs separated by whitespace, ASCII comma, or 中文逗号.
 INDICES_PATTERN = re.compile(r"^\s*\d+(?:[\s,，]+\d+)*\s*$")
-# Extended indices: also accepts `all` and `-N` (exclusions). Tokenized
-# and validated by `parse_indices_with_mode` because the regex alone
+# Extended indices: also accepts `all`, `-N` (exclusions), and an optional `#`
+# prefix (`#1`, `#1 3`, `#-2`) — users naturally write `#1` to refer to issue #1.
+# Tokenized and validated by `parse_indices_with_mode` because the regex alone
 # can't reject the ambiguous mixed-mode `1 -2` form.
-_INDICES_EXT_TOKEN = r"(?:all|-?\d+)"
+_INDICES_EXT_TOKEN = r"#?(?:all|-?\d+)"
 INDICES_EXT_PATTERN = re.compile(
     rf"^\s*{_INDICES_EXT_TOKEN}(?:[\s,，]+{_INDICES_EXT_TOKEN})*\s*$",
     re.IGNORECASE,
@@ -49,7 +50,7 @@ INDICES_EXT_PATTERN = re.compile(
 _TOKEN_SPLIT = re.compile(r"[\s,，]+")
 # A single index-grammar token, used to find where the indices stop and a
 # free-text reason begins (`allow_trailing_text`, DESIGN §1.23.8).
-_INDEX_TOKEN = re.compile(r"^(?:all|-?\d+)$", re.IGNORECASE)
+_INDEX_TOKEN = re.compile(r"^#?(?:all|-?\d+)$", re.IGNORECASE)
 _NON_SEPARATOR_RUN = re.compile(r"[^\s,，]+")
 _NONE_WITH_REASON = re.compile(
     r"^(none|0|不修)[\s,，]+(.*)$", re.IGNORECASE | re.DOTALL)
@@ -218,6 +219,9 @@ def parse_indices_with_mode(content, allow_none=False,
     for tok in _TOKEN_SPLIT.split(stripped):
         if not tok:
             continue
+        # strip optional `#` prefix (users write #1 / #1 3)
+        if tok.startswith("#"):
+            tok = tok[1:]
         low = tok.lower()
         if low == "all":
             has_all = True

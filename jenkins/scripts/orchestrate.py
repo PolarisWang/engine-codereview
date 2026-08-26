@@ -881,11 +881,33 @@ def command(*words, needs_findings=True, guarded=None):
     return _reg
 
 
+def _is_closure_state(topic):
+    """True if the topic is in an active (open) review-closure state where bare
+    numbers / #N should be treated as issue indices, NOT as commands."""
+    rs = (topic or {}).get("review_state") or ""
+    return bool(rs) and rs not in ("MERGED", "CLOSED")
+
+
+def _looks_like_index_word(word):
+    """True if `word` is a bare issue-index (1 / #1 / 12). In a closure state these
+    must be treated as issue indices, never hijacked by a command like fix_patch(1)."""
+    w = (word or "").strip()
+    if not w:
+        return False
+    if w.startswith("#"):
+        w = w[1:]
+    return w.isdigit() and int(w) > 0
+
+
 def _dispatch_command(ctx):
     """Look up a registered handler by the leading word; returns its rc, or None if
     no command matched (caller falls through to operation-guard / agent loop)."""
     entry = _HANDLER_REGISTRY.get(ctx["word"])
     if not entry:
+        return None
+    # 修法1(双重占用): 在 active review-closure 状态, 裸数字(#N / 1 / 12) 只作闭路
+    # 序号, 绝不落到 fix_patch 等命令 —— 否则"回复问题序号 1"会被当成"生成补丁"。
+    if _is_closure_state(ctx.get("topic")) and _looks_like_index_word(ctx["word"]):
         return None
     fn, needs_findings, _g = entry
     if needs_findings and not (ctx.get("all_findings") or ctx.get("findings_status") == "ok"):
@@ -2640,8 +2662,16 @@ def _try_handle_closure(key, topic, reply_text, actor, workspace, state_file):
             return _CLOSURE_NO_MATCH
 
         # Resolve per-project approvers (config) → fallback policy.yaml admins.
+        # 修法3: topic.project 可能为空(真实话题 CB2N-30597 的 project=''), 此时从
+        # jira_key 前缀反推(CB2N→CB2)以拿到正确的 approver_open_ids 列表。
         import config as _cfg
+        import jira_parser as _jp
         project_id = topic.get("project") or ""
+        if not project_id:
+            _jira = topic.get("jira_key") or ""
+            _pid, _pcfg = _jp.identify_project(_jira, _cfg.load_config())
+            if _pid:
+                project_id = _pid
         projs = _cfg.load_config().get("projects") or {}
         proj_cfg = projs.get(project_id) or {}
         policy_admins = []

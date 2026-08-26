@@ -145,3 +145,38 @@ def test_lex_identifiers_pygments_absent_fallback():
     toks = cr._lex_identifiers("call updateFoo(n) and load asset_file_1")
     assert "updateFoo" in toks
     assert "asset_file_1" in toks
+
+
+# ── 修法1/2/3: # 前缀、闭路序号优先、approver 反查 ─────────────────────────
+
+def test_hash_prefix_indices_parse():
+    """M1: #N 前缀被解析为闭路序号, 与纯数字等价"""
+    for txt in ("#1", "#1 3", "#1 #3", "#-2"):
+        r = rp.parse_indices_with_mode(txt, allow_none=True, allow_trailing_text=True)
+        assert r is not None, f"{txt} should parse"
+    assert rp.parse_indices_with_mode("#1")["indices"] == [1]
+    assert rp.parse_indices_with_mode("#1 3")["indices"] == [1, 3]
+
+
+def test_closure_state_bare_number_not_command(monkeypatch=None):
+    """修法1: 闭路状态下裸数字不做命令(不触发 fix_patch), 非闭路可做命令"""
+    import orchestrate as orch
+    # 闭路状态: 裸数字是序号 -> dispatch 返回 None(不落命令)
+    topic = {"review_state": "DEV_TRIAGE"}
+    ctx = {"word": "1", "topic": topic, "all_findings": [], "findings_status": "ok"}
+    assert orch._is_closure_state(topic) is True
+    assert orch._looks_like_index_word("1") is True
+    assert orch._dispatch_command(ctx) is None  # 不触发 fix_patch
+    # 非闭路: 裸数字可作命令
+    topic2 = {"review_state": ""}
+    entry = orch._HANDLER_REGISTRY.get("1")
+    assert entry is not None  # 1 仍是注册命令
+
+
+def test_jira_key_project_reverse_lookup():
+    """修法3: CB2N→CB2 反查, 拿到 CB2 的 approver"""
+    import common as cm
+    import jira_parser as jp
+    pid, pcfg = jp.identify_project("CB2N-30597", cm.load_config())
+    assert pid == "CB2"
+    assert "ou_55bca7b7dae982e96749bd84f57c21e8" in (pcfg or {}).get("approver_open_ids", [])
