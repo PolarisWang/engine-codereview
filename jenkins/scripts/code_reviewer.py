@@ -2002,8 +2002,23 @@ NEVER trust the diff hunk alone.
 """
 
 
+def _find_claude():
+    """Locate the claude CLI by absolute path. CRITICAL: the persistent env
+    (cr-env/env.sh) sets PATH=/usr/bin:/bin, stripping /usr/local/bin, so a bare
+    `claude` lookup fails ``in production EVEN IF claude is installed`` (ENG-34158:
+    agent returned "No such file or directory: 'claude'" -> unparseable -> empty
+    findings -> misleading green card). Mirrors orchestrate._find_claude so the
+    review subprocess resolves claude the same way the orchestrator does."""
+    for c in ("/usr/local/bin/claude",
+              "/root/.hermes/node/bin/claude",
+              "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def _spawn_review_agent(diff_info, project, issue_key, repo_type,
-                        model=None, claude_exe="claude", timeout=900):
+                        model=None, claude_exe="", timeout=900):
     """Spawn a per-topic `claude -p --model claude-opus-5` review agent.
 
     Writes a topic spec + diff context to temp files, invokes the container's
@@ -2019,7 +2034,9 @@ def _spawn_review_agent(diff_info, project, issue_key, repo_type,
     # rage replication: review agent runs on Opus. Allow override via env so
     # operators can tier per-project without a code change.
     model = model or os.environ.get("REVIEW_AGENT_MODEL", "") or "claude-opus-5"
-    claude_exe = os.environ.get("CLAUDE_EXE", claude_exe)
+    # R6 (ENG-34158 root cause #2): resolve claude by ABSOLUTE path. A bare
+    # `claude` fails in prod because env.sh strips /usr/local/bin from PATH.
+    claude_exe = os.environ.get("CLAUDE_EXE") or claude_exe or (_find_claude() or "claude")
     if not diff_info or not diff_info.get("diff_text"):
         return {"summary": "No diff to review", "findings": [],
                 "severity_counts": {}, "error": None, "batches": 0}
