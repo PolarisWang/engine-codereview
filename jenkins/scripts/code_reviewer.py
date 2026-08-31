@@ -2178,30 +2178,63 @@ def _unwrap_claude_json(raw):
 
 
 def _parse_agent_json(raw):
-    """Pull the findings list out of the agent's stdout (JSON tool call)."""
+    """Pull the findings list out of the agent's stdout (JSON tool call).
+
+    Handles several output shapes the agent may return despite the strict
+    "pure JSON, no prose" instruction (ENG-34158: the agent found 3 real
+    findings but prefixed the JSON with Chinese prose, so a strict parse
+    dropped ALL of them → false "no findings"):
+      1. A bare findings array        [...]
+      2. A bare {findings: [...]}     {...}
+      3. ```json ... ``` fenced JSON
+      4. Prose/junk BEFORE the JSON   "分析...：\n\n{...}"  ← new: locate the 1st '{'/'['
+    """
     if not raw:
         return None
-    # Accept raw findings array or wrapped {findings:[...]}
-    try:
-        data = json.loads(raw)
+
+    def _ok(data):
         if isinstance(data, list):
             return data
         if isinstance(data, dict) and isinstance(data.get("findings"), list):
             return data["findings"]
+        return None
+
+    # #1/#2: try the whole string as pure JSON first (fast path).
+    try:
+        res = _ok(json.loads(raw))
+        if res is not None:
+            return res
     except json.JSONDecodeError:
         pass
-    # Sometimes the agent wraps JSON in ```json fences.
+
+    # #3: fenced ```json ... ```.
     import re as _re
     m = _re.search(r"```json\s*(.+?)\s*```", raw, _re.S)
     if m:
         try:
-            data = json.loads(m.group(1))
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict) and "findings" in data:
-                return data["findings"]
+            res = _ok(json.loads(m.group(1)))
+            if res is not None:
+                return res
         except json.JSONDecodeError:
             pass
+
+    # #4: prose/junk before the JSON — locate the first '{' or '[' and parse
+    # from there (agent sometimes prepends a Chinese rationale line, ENG-34158).
+    try:
+        dec = json.JSONDecoder()
+        # find the earliest position of '{' or '[' (skip leading prose)
+        lbrace = raw.find("{")
+        lbracket = raw.find("[")
+        candidates = [i for i in (lbrace, lbracket) if i >= 0]
+        if candidates:
+            start = min(candidates)
+            obj, _end = dec.raw_decode(raw[start:])
+            res = _ok(obj)
+            if res is not None:
+                return res
+    except json.JSONDecodeError:
+        pass
+
     return None
 
 

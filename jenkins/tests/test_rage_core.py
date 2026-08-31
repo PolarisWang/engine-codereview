@@ -139,6 +139,46 @@ def test_agent_envelope_unwrap_and_parse():
     assert f is not None and f[0]["file"] == "a.cpp"
 
 
+def test_parse_agent_json_prose_prefix():
+    """R-parse (ENG-34158): agent prepends Chinese prose before the JSON
+    ("分析 diff 内容...\\n\\n{\"findings\":...}"). A strict parse drops ALL real
+    findings → false empty. _parse_agent_json must locate the first '{' and parse
+    from there."""
+    import code_reviewer as cr
+    findings_json = ('{"findings":[{"file":"sentry_plugin.cpp","severity":"中",'
+                     '"line_range":"37-39","issue":"枚举值可能 != 5",'
+                     '"suggestion":"核对 SENTRY_GAMETYPE_EV"}]}')
+    prose_prefix = "分析 diff 内容，无需整文件读取即可确定的问题如下：\n\n"
+    # plain string (the form _unwrap_claude_json returns)
+    f = cr._parse_agent_json(prose_prefix + findings_json)
+    assert f is not None and len(f) == 1
+    assert f[0]["file"] == "sentry_plugin.cpp"
+    assert f[0]["severity"] == "中"
+
+
+def test_parse_agent_json_prose_prefix_full_envelope():
+    """Full path: envelope → unwrap → parse, with prose before JSON, as produced
+    by the real claude-opus-5 agent in ENG-34158 (3 findings)."""
+    import code_reviewer as cr
+    # The agent puts literal \n (backslash-n, not newline) inside the JSON envelope
+    inner = "分析 diff 内容，无需整文件读取即可确定的问题如下：\\n\\n" \
+            '{\\"findings\\":[{\\"file\\":\\"a.cpp\\",\\"severity\\":\\"轻\\",' \
+            '\\"issue\\":\\"x\\"},{\\"file\\":\\"b.cpp\\",\\"severity\\":\\"中\\",' \
+            '\\"issue\\":\\"y\\"}]}'
+    env = '{"type":"result","subtype":"success","result":"' + inner + '"}'
+    f = cr._parse_agent_json(cr._unwrap_claude_json(env))
+    assert f is not None and len(f) == 2
+    assert f[0]["file"] == "a.cpp"
+    assert f[1]["file"] == "b.cpp"
+
+
+def test_parse_agent_json_bare_array_prose():
+    """Prose followed by a bare findings array (not wrapped in an object)."""
+    import code_reviewer as cr
+    f = cr._parse_agent_json("问题如下：\n\n[{\"file\":\"c.cpp\",\"severity\":\"轻\"}]")
+    assert f is not None and len(f) == 1 and f[0]["file"] == "c.cpp"
+
+
 def test_lex_identifiers_pygments_absent_fallback():
     import code_reviewer as cr
     # regex fallback must still extract identifier-like tokens without pygments
