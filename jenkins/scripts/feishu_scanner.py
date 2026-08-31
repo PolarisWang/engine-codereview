@@ -26,6 +26,15 @@ import time
 from common import JIRA_URL_PATTERN, MR_URL_PATTERN, http_request
 from common import c_feishu_chat_id
 
+# ── Scanner time-window constants (S2, ENG-34158) ────────────────────────
+# INITIAL_WINDOW: how far back to scan when NO cursor exists (fresh deploy /
+# workspace clean). Was 300s — too small; a topic posted during a scanner outage
+# (executor busy, deploy gap) fell outside it and the cursor then advanced past
+# it, so the topic was dropped forever. 3600s (1h) covers real deploy/outage gaps.
+INITIAL_WINDOW = 3600   # sec
+OVERLAP = 60            # sec — pulled back from previous cursor to close gaps
+MAX_GAP = 86400         # sec — ignore a stale cursor older than 1 day
+
 
 # ── Feishu API helpers ───────────────────────────────────────────────────────
 
@@ -123,9 +132,11 @@ def main():
     #   - Subsequent runs: start at `last_scan_time - OVERLAP` to close gaps,
     #     end at now. Repeated messages within the overlap are de-duplicated
     #     downstream by message_id.
-    INITIAL_WINDOW = 300    # sec — how far back from first run with no cursor
-    OVERLAP = 60            # sec — overlap pulled back from the previous cursor
-    MAX_GAP = 86400         # sec — ignore a stale cursor older than 1 day
+    #
+    # S2 (ENG-34158): 初始窗口从 300s 扩大到 3600s(1小时)。当 scanner cursor
+    # 因部署/工作区清理而丢失时, 300s 窗口太小 → 刚过几分钟的话题就永远扫不到。
+    # 1 小时窗口覆盖绝大多数部署间隙, 且 cursor 恢复后 follow-up 扫描走正常
+    # 的 cursor-based 路径(不再碰到 initial window)。
     now_sec = int(time.time())
 
     last_scan = state.get("last_scan_time")

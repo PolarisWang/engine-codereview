@@ -28,6 +28,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -707,8 +708,34 @@ def _route(msg_id, parent_id, text, sender_id="", mentions=None):
     """
     if not parent_id:
         if _is_jira_topic(text):
-            # Review is owned by the Jenkins scanner; acknowledge here.
-            print(f"[event] NEW TOPIC {msg_id}: {text[:80]} (handing review to scanner)", flush=True)
+            # Review is owned by the Jenkins scanner; acknowledge here. But ALSO
+            # register the topic in pipeline_state (idempotent) so a NEW TOPIC is
+            # never lost if the scanner's Feishu cursor misses it (ENG-34158: a
+            # topic posted while the Jenkins executor was busy, then the scanner
+            # cursor advanced past it — the topic was never reviewed). add_topic
+            # mode=scan is idempotent: an existing in-progress/DONE record is left
+            # untouched, so this is safe to call on every event.
+            try:
+                import pipeline_state as _ps
+                _jira_url = ""
+                _key = ""
+                m = common.JIRA_URL_PATTERN.search(text or "")
+                if m:
+                    _key = m.group(1)          # bare key, e.g. ENG-34158
+                    _jira_url = m.group(0)     # full browse URL
+                _ps.add_topic(
+                    _state_file(),
+                    message_id=msg_id,
+                    jira_key=_key,
+                    jira_url=_jira_url,
+                    mode="scan",
+                    text_preview=text[:500],
+                    sender_id=sender_id,
+                    sender_name="",
+                )
+                print(f"[event] NEW TOPIC {msg_id}: {text[:80]} (registered in pipeline_state, handing review to scanner)", flush=True)
+            except Exception as _te:
+                print(f"[event] NEW TOPIC {msg_id}: {text[:80]} (WARN: pipeline_state register failed: {_te})", flush=True)
         else:
             print(f"[event] ignore topic (no Jira URL) {msg_id}", flush=True)
     else:
