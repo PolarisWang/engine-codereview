@@ -428,7 +428,10 @@ def _empty_review_reason(engine_result, game_result):
         elif not (res.get("changed_files") or []):
             reasons.append(f"{label}：相对 `{res.get('base_branch')}` 无代码变更(改动可能已合并/分支无新提交)")
         elif r.get("error"):
-            reasons.append(f"{label}：review 出错 — {r.get('error')}")
+            _err = str(r.get("error")).replace("\n", " ")
+            if len(_err) > 160:
+                _err = _err[:160] + "…"
+            reasons.append(f"{label}：review 出错 — {_err}")
         # 否则 = clean(无 findings 且无上述异常)
 
     # 若两个仓库都是 clean → 真干净
@@ -597,7 +600,8 @@ def build_interact_card(has_findings=True, closure_style=True):
 
 
 def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
-                     triage="", round_no=1, summary="", mr_url="", jira_url="", project=""):
+                     triage="", round_no=1, summary="", mr_url="", jira_url="", project="",
+                     empty_reason=""):
     """Render the review results card (方案C).
 
     Format: `#N [icon 严重] [repo] file:line_range （function）: 问题 → 修法`,
@@ -606,7 +610,11 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
     NOTE (方案C 交互卡分离): this card does NOT embed the command footers — the
     interactive commands (rage closure + our auto-edit/MR) live on the SEPARATE
     interact card, so the review card shows results only (no semantic duplication).
-    """
+
+    empty_reason: when findings is empty, this overrides the default "✅ 已完成审查，
+    未发现问题。" — used to attribute WHY nothing was found (fork's baseless-empty
+    collapse: a failed review / missing branch / merged MR all produced the same
+    green card, so the reason must be passed in explicitly)."""
     findings = findings or []
     merged = [dict(f) for f in findings]
     # normalize severity first (English->Chinese) so sort + count + icon align
@@ -647,7 +655,10 @@ def render_rage_card(issue_key, findings, repo_labels=None, doc_url="",
             line += f" → {sug}"
         parts.append(line)
     if not ordered:
-        parts.append("✅ 已完成审查，未发现问题。")
+        if empty_reason and empty_reason.strip():
+            parts.append(empty_reason)
+        else:
+            parts.append("✅ 已完成审查，未发现问题。")
     if summary:
         parts.append(f"\n{summary}")
     return "\n".join(parts)

@@ -2122,6 +2122,17 @@ Diff:
                     "batches": 1}
         kept, traces = _post_validate_findings(findings, diff_info)
         net = _build_review_dict(kept, diff_info)
+        # R3 (防假绿卡): agent 路径空 findings 且无"确无问题"结论文本时, 判为未完成
+        # 而非干净 —— 与 HTTP 路径 _empty_output_allowed 对齐。agent 契约要求真实干净
+        # 时 findings=[] + 明确写"已完成审查，未发现问题"结论文本; 只吐 0 项机械 stub
+        # 而无结论文本视为模型没返回可审内容(ENG-34158: agent 被环境挡住返回空 findings)。
+        # 结论文本从 agent 的原始 stdout(raw) 里找 —— 其 JSON 只含 findings, 结论在散文里。
+        if not net.get("findings") and not net.get("error") \
+                and not _empty_output_allowed({}, net.get("review_text") or "") \
+                and not _empty_output_allowed({}, raw or ""):
+            net["summary"] = "LLM 返回空审查结果(无 findings、无结论文本)。这不代表'未发现问题', 而是审查未完成。"
+            net["error"] = "agent returned empty findings without an explicit clean conclusion"
+            net["severity_counts"] = {}
         return net
     except subprocess.TimeoutExpired:
         return {"summary": "agent timeout", "findings": [], "severity_counts": {},

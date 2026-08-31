@@ -84,6 +84,23 @@ def test_rage_card_no_findings_clean():
     assert "📊" not in t
 
 
+def test_rage_card_no_findings_empty_reason_overrides():
+    # R1: 空 findings 时传入归因 empty_reason, 卡上显示归因而非笼统"未发现问题"。
+    t = fn.render_rage_card("K-1", [], round_no=0,
+                            empty_reason="🚫 无可审内容，原因：branch not remote")
+    assert "branch not remote" in t
+    assert "已完成审查，未发现问题" not in t
+
+
+def test_rage_card_no_findings_empty_reason_with_summary():
+    # R2: summary 透传, 不因空 findings 丢弃。
+    t = fn.render_rage_card("K-1", [], round_no=0,
+                            empty_reason="🚫 无可审内容",
+                            summary="分支相对 base 无新增改动")
+    assert "无可审内容" in t
+    assert "分支相对 base 无新增改动" in t
+
+
 # ── interact card: all commands, no 改码/指引 ──────────────────────────────
 
 def test_interact_card_has_all_commands_no_changma():

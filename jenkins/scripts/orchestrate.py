@@ -486,11 +486,27 @@ def run(args):
 
     _round_no = int((pipeline_state.get_topic(state_file, key) or {}).get("review_round") or 1)
     # R7-C4 (统一卡): 一律走 rage 标准卡(4 级 #N + doc 链接 + 双段指令), 不再跳旧 3 级卡。
-    # 空 findings 由 render_rage_card 渲染"已完成审查, 未发现问题"。
+    # R1 修复: 空 findings 时用 _empty_review_reason 归因, 不再笼统写"未发现问题"。
+    empty_reason = ""
+    if not merged_findings:
+        try:
+            empty_reason = feishu_notifier._empty_review_reason(eng_res or {}, gam_res or {})
+        except Exception as _ee:
+            print(f"[orchestrate] empty_reason err: {_ee}", file=sys.stderr)
+    # R2: 从底层结果收集 review 摘要(透传 summary, 不丢)。
+    # 仅当 summary 不是错误/空结论时才透传, 避免把"agent output unparseable"等内部
+    # 信息暴露给用户(错误明细已在 empty_reason 中呈现)。
+    eng_summary = ((eng_res or {}).get("review") or {}).get("summary") or ""
+    gam_summary = ((gam_res or {}).get("review") or {}).get("summary") or ""
+    review_summary = ""
+    for s in (eng_summary, gam_summary):
+        if s and not any(kw in s.lower() for kw in ("error", "unparseable", "no changes", "no diff", "no findings")):
+            review_summary = (review_summary + "\n" + s).strip()
     full_text = feishu_notifier.render_rage_card(
         issue_key, merged_findings, doc_url=doc_url,
         triage=(pipeline_state.get_topic(state_file, key) or {}).get("review_triage") or "",
         round_no=_round_no, mr_url=mr_url, jira_url=jira_url,
+        empty_reason=empty_reason, summary=review_summary,
     )
     # 全量 review 单条普通消息发出(≤45000字符); 超大才拆第二段。
     segs = _split_text(full_text)
@@ -3299,10 +3315,22 @@ def consume_pending(key, state_file, workspace, app_id, app_secret, actor="jenki
                 fresh = pipeline_state.get_topic(state_file, key)
                 render = fresh.get("render_msg_id") or render
                 if render:
-                    eng_res, gam_res, st = _load_findings(workspace, key)
-                    all_f = (eng_res or []) + (gam_res or [])
+                    # 读取完整 result dict(含 branch_exists/changed_files/error), 供归因
+                    _eng_d = _read_json_file(os.path.join(workspace, f"result_{key}_engine.json")) or {}
+                    _gam_d = _read_json_file(os.path.join(workspace, f"result_{key}_game.json")) or {}
+                    eng_f = ((_eng_d.get("review") or {}).get("findings")) or []
+                    gam_f = ((_gam_d.get("review") or {}).get("findings")) or []
+                    all_f = eng_f + gam_f
                     if not all_f:
-                        note = "\n\nℹ️ 本次审查未发现代码问题（无 findings）。"
+                        # R5: re_review 空 findings 用归因逻辑, 不再硬编码"未发现代码问题"
+                        try:
+                            _empty_note = feishu_notifier._empty_review_reason(_eng_d, _gam_d)
+                        except Exception:
+                            _empty_note = ""
+                        if _empty_note:
+                            note = f"\n\n{_empty_note}"
+                        else:
+                            note = "\n\nℹ️ 本次审查未发现代码问题（无 findings）。"
             fresh = pipeline_state.get_topic(state_file, key)
             text = fresh.get("review_summary") or \
                 feishu_notifier.render_state_card(fresh)
