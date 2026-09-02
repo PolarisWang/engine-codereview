@@ -1981,8 +1981,9 @@ def _claude_p_call(prompt, model=EDIT_MODEL, timeout=180):
         print("[claude-p] claude CLI not found (need absolute path scan)", file=sys.stderr)
         return None
     try:
-        r = _sp.run([exe, "-p", prompt, "--model", model],
-                    capture_output=True, text=True, timeout=timeout,
+        # ENG-34209: pass prompt via stdin, not argv, to avoid ARG_MAX overflow
+        r = _sp.run([exe, "-p", "--model", model],
+                    input=prompt, capture_output=True, text=True, timeout=timeout,
                     stdin=_sp.PIPE)
         if r.returncode != 0:
             print(f"[claude-p] rc={r.returncode} err={r.stderr[:200]}", file=sys.stderr)

@@ -2115,14 +2115,19 @@ Diff:
         + "lines; line_range required for line-scoped findings). Follow them strictly.\n"
     )
     try:
+        # ENG-34209 root cause: the review prompt (full diff + task) used to be
+        # passed as a single command-line arg to `claude -p`, so an oversized diff
+        # blew Linux's per-arg/ARG_MAX limit → execve fails with E2BIG →
+        # `[Errno 7] Argument list too long`. claude -p reads the prompt from
+        # stdin when no positional prompt is given, so stream it via `input=`
+        # instead — the argv stays tiny and prompt length is memory-bound only.
         cmd = [claude_exe, "-p", "--model", model,
-               "--output-format", "json",
-               task]
+               "--output-format", "json"]
         env = os.environ.copy()
         if repo_dir:
             env.setdefault("PWD", repo_dir)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                              timeout=timeout)
+        proc = subprocess.run(cmd, input=task, capture_output=True, text=True,
+                              env=env, timeout=timeout)
         raw = proc.stdout.strip()
         if proc.returncode != 0:
             return {"summary": "agent failed", "findings": [],
