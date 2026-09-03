@@ -4701,7 +4701,7 @@ def _review_repos(key, project, issue_key, review_branch, base_branch, engine_ba
     cache_dir = os.path.join(workspace, ".review_cache")
     # Review cache version: bump when the rendered review format/prompt changes, so
     # caches written under an older render (e.g. pre-skill-template) are not reused.
-    REVIEW_CACHE_VERSION = 2
+    REVIEW_CACHE_VERSION = 3
 
     def _one(repo, repo_url, rb, baseb, out_path):
         base_args = ["--repo", repo_url, "--branch", rb, "--base-branch", baseb,
