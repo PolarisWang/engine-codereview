@@ -2091,6 +2091,7 @@ Diff:
     # bounded by `timeout`; beyond that we surface a clear agent-timeout error.
     json_shape = (
         '{\n'
+        '  "summary": "1-2 句中文本分支说明: 这段改动做了什么、解决什么问题",\n'
         '  "findings": [\n'
         '    {\n'
         '      "file": "repo-relative changed file",\n'
@@ -2108,8 +2109,10 @@ Diff:
         + "\nNow review per the rules (Chinese user-facing output). Respond with EXACTLY ONE "
         + "pure JSON object (no code fences, no prose before/after) with this shape:\n"
         + json_shape
-        + "\nSort findings by severity (严重>中>轻>建议). If no real issues, findings=[] "
-        + "and add a non-empty 'summary' stating 已完成审查，未发现问题.\n"
+        + "\n'summary' is REQUIRED (never empty): write 1-2 short Chinese sentences summarizing "
+        + "what this branch changes and the problem it solves. Write it regardless of findings.\n"
+        + "Sort findings by severity (严重>中>轻>建议). If no real issues, findings=[] "
+        + "and make 'summary' state 已完成审查，未发现问题.\n"
         + "\nYour system prompt holds the mandatory rules (whole-file scope verification via "
         + "`git show <branch_sha>:<path>` before ANY scope-dependent finding; only real +/- "
         + "lines; line_range required for line-scoped findings). Follow them strictly.\n"
@@ -2136,14 +2139,14 @@ Diff:
         # Parse the structured findings from the agent's pure-JSON stdout.
         # `claude -p --output-format json` wraps the answer in an envelope; peel it,
         # then run the findings through _parse_agent_json.
-        findings = _parse_agent_json(_unwrap_claude_json(raw))
+        findings, meta = _parse_agent_json(_unwrap_claude_json(raw))
         if findings is None:
             return {"summary": "agent output unparseable", "findings": [],
                     "severity_counts": {},
                     "error": f"no JSON findings in agent stdout: {raw[:400]}",
                     "batches": 1}
         kept, traces = _post_validate_findings(findings, diff_info)
-        net = _build_review_dict(kept, diff_info)
+        net = _build_review_dict(kept, diff_info, meta=meta)
         # R3 (防假绿卡): agent 路径空 findings 且无"确无问题"结论文本时, 判为未完成
         # 而非干净 —— 与 HTTP 路径 _empty_output_allowed 对齐。agent 契约要求真实干净
         # 时 findings=[] + 明确写"已完成审查，未发现问题"结论文本; 只吐 0 项机械 stub
@@ -2183,7 +2186,12 @@ def _unwrap_claude_json(raw):
 
 
 def _parse_agent_json(raw):
-    """Pull the findings list out of the agent's stdout (JSON tool call).
+    """Pull the findings list AND meta (summary, strengths) out of the agent's
+    stdout (JSON tool call).
+
+    Returns (findings_list, meta_dict). meta_dict contains 'summary' and
+    'strengths' if present in the JSON object; otherwise {}.
+    findings_list is None when no valid JSON findings can be extracted.
 
     Handles several output shapes the agent may return despite the strict
     "pure JSON, no prose" instruction (ENG-34158: the agent found 3 real
@@ -2195,20 +2203,26 @@ def _parse_agent_json(raw):
       4. Prose/junk BEFORE the JSON   "分析...：\n\n{...}"  ← new: locate the 1st '{'/'['
     """
     if not raw:
-        return None
+        return None, {}
 
     def _ok(data):
+        """Extract findings list and meta from a parsed JSON object."""
         if isinstance(data, list):
-            return data
+            return data, {}
         if isinstance(data, dict) and isinstance(data.get("findings"), list):
-            return data["findings"]
-        return None
+            meta = {}
+            if data.get("summary"):
+                meta["summary"] = data["summary"]
+            if data.get("strengths"):
+                meta["strengths"] = data["strengths"]
+            return data["findings"], meta
+        return None, {}
 
     # #1/#2: try the whole string as pure JSON first (fast path).
     try:
-        res = _ok(json.loads(raw))
+        res, meta = _ok(json.loads(raw))
         if res is not None:
-            return res
+            return res, meta
     except json.JSONDecodeError:
         pass
 
@@ -2217,9 +2231,9 @@ def _parse_agent_json(raw):
     m = _re.search(r"```json\s*(.+?)\s*```", raw, _re.S)
     if m:
         try:
-            res = _ok(json.loads(m.group(1)))
+            res, meta = _ok(json.loads(m.group(1)))
             if res is not None:
-                return res
+                return res, meta
         except json.JSONDecodeError:
             pass
 
@@ -2234,13 +2248,13 @@ def _parse_agent_json(raw):
         if candidates:
             start = min(candidates)
             obj, _end = dec.raw_decode(raw[start:])
-            res = _ok(obj)
+            res, meta = _ok(obj)
             if res is not None:
-                return res
+                return res, meta
     except json.JSONDecodeError:
         pass
 
-    return None
+    return None, {}
 
 
 def _severity_zh(sev):
@@ -2314,14 +2328,16 @@ def _findings_counts_zh(findings):
         _severity_zh(f.get("severity")) for f in (findings or []))}
 
 
-def _build_review_dict(findings, diff_info, repo_label="engine"):
+def _build_review_dict(findings, diff_info, meta=None, repo_label="engine"):
     """Assemble the review result the rest of the pipeline consumes."""
+    meta = meta or {}
     counts = _findings_counts(findings)          # legacy 3-tier (critical/warning/suggestion)
     counts_zh = _findings_counts_zh(findings)    # rage 4-tier (严重/中/轻/建议)
-    # Render a rage-standard report (严重/中/轻/建议 + [Repo] file:line).
-    review_text = render_rage_markdown_from_findings(findings, meta={}, repo_label=repo_label)
+    # Render a rage-standard report (严重/中/轻/建议 + [Repo] file:line), carrying
+    # the agent's own summary (方案B) so findings=0 still shows a real conclusion.
+    review_text = render_rage_markdown_from_findings(findings, meta=meta, repo_label=repo_label)
     return {
-        "summary": "",
+        "summary": (meta.get("summary") or ""),
         "review_text": review_text,
         "severity_counts": counts,
         "severity_counts_zh": counts_zh,

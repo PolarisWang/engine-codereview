@@ -135,8 +135,9 @@ def test_agent_envelope_unwrap_and_parse():
     assert "findings" in inner
     # fenced form (the agent wrapped JSON in ```json ... ```)
     fenced = '{"type":"result","result":"```json\\n{\\"findings\\":[{\\"file\\":\\"a.cpp\\",\\"severity\\":\\"轻\\"}]}\\n```"}'
-    f = cr._parse_agent_json(cr._unwrap_claude_json(fenced))
+    f, meta = cr._parse_agent_json(cr._unwrap_claude_json(fenced))
     assert f is not None and f[0]["file"] == "a.cpp"
+    assert meta == {}  # no summary in that object
 
 
 def test_parse_agent_json_prose_prefix():
@@ -145,15 +146,18 @@ def test_parse_agent_json_prose_prefix():
     findings → false empty. _parse_agent_json must locate the first '{' and parse
     from there."""
     import code_reviewer as cr
-    findings_json = ('{"findings":[{"file":"sentry_plugin.cpp","severity":"中",'
+    findings_json = ('{"summary":"修复异步清理资源前未同步的竞态","findings":'
+                     '[{"file":"sentry_plugin.cpp","severity":"中",'
                      '"line_range":"37-39","issue":"枚举值可能 != 5",'
                      '"suggestion":"核对 SENTRY_GAMETYPE_EV"}]}')
     prose_prefix = "分析 diff 内容，无需整文件读取即可确定的问题如下：\n\n"
     # plain string (the form _unwrap_claude_json returns)
-    f = cr._parse_agent_json(prose_prefix + findings_json)
+    f, meta = cr._parse_agent_json(prose_prefix + findings_json)
     assert f is not None and len(f) == 1
     assert f[0]["file"] == "sentry_plugin.cpp"
     assert f[0]["severity"] == "中"
+    # 方案B: object-level summary is carried through, not dropped
+    assert meta.get("summary") == "修复异步清理资源前未同步的竞态"
 
 
 def test_parse_agent_json_prose_prefix_full_envelope():
@@ -166,7 +170,7 @@ def test_parse_agent_json_prose_prefix_full_envelope():
             '\\"issue\\":\\"x\\"},{\\"file\\":\\"b.cpp\\",\\"severity\\":\\"中\\",' \
             '\\"issue\\":\\"y\\"}]}'
     env = '{"type":"result","subtype":"success","result":"' + inner + '"}'
-    f = cr._parse_agent_json(cr._unwrap_claude_json(env))
+    f, meta = cr._parse_agent_json(cr._unwrap_claude_json(env))
     assert f is not None and len(f) == 2
     assert f[0]["file"] == "a.cpp"
     assert f[1]["file"] == "b.cpp"
@@ -175,8 +179,19 @@ def test_parse_agent_json_prose_prefix_full_envelope():
 def test_parse_agent_json_bare_array_prose():
     """Prose followed by a bare findings array (not wrapped in an object)."""
     import code_reviewer as cr
-    f = cr._parse_agent_json("问题如下：\n\n[{\"file\":\"c.cpp\",\"severity\":\"轻\"}]")
+    f, meta = cr._parse_agent_json("问题如下：\n\n[{\"file\":\"c.cpp\",\"severity\":\"轻\"}]")
     assert f is not None and len(f) == 1 and f[0]["file"] == "c.cpp"
+    assert meta == {}
+
+
+def test_parse_agent_json_clean_with_summary():
+    """方案B: findings=[] + explicit summary (真干净) — summary must survive parse
+    so the published card carries a real clean conclusion, not a bare 0-项 stub."""
+    import code_reviewer as cr
+    raw = '{"summary":"已完成审查，未发现问题：本分支在 render reset 前等待异步 task counter，修复销毁竞态。","findings":[]}'
+    f, meta = cr._parse_agent_json(raw)
+    assert f == []
+    assert "已完成审查，未发现问题" in meta.get("summary", "")
 
 
 def test_lex_identifiers_pygments_absent_fallback():
