@@ -57,3 +57,49 @@ def test_mixed_one_repo_dirty_dedup():
 def test_error_shown():
     out = fn._empty_review_reason(_res(error="API timeout"), _res(error="API timeout"))
     assert "出错" in out or "error" in out.lower() or "API" in out
+
+
+# ── ENG-33381 回归: 一个仓库真 clean review + 另一仓库 infra SKIPPED ───────────────
+def _clean_res(**kw):
+    """分支在、有改动、无 error(真实走完 review 且 0 findings 的"真 clean")。"""
+    return _res(changed_files=["a.cpp"], branch_exists=True, branch_merged=False,
+                error=None, mr_state=kw.get("mr_state", "opened"))
+
+
+def _skip_branch_missing_res(branch="bugfix/ENG-33381-aifix-1"):
+    """分支在游戏仓不存在(branch_exists=False) → infra SKIPPED, 没真正审。"""
+    r = _res(changed_files=[])
+    r["branch"] = branch
+    r["branch_exists"] = False
+    return r
+
+
+def test_engine_clean_game_skip_branch_missing():
+    """ENG-33381: 引擎(有实质改动)审出 0 findings(真干净), 游戏仓找不到分支(SKIPPED)。
+
+    修复前: 被 SKIPPED 的游戏仓带偏 -> "无可审内容/游戏: 分支不存在"(误导, 明明审过了)。
+    修复后: 有真审查结果 -> 报"未发现问题", 仅附带说明某仓未纳入实质审查。
+    """
+    out = fn._empty_review_reason(_clean_res(), _skip_branch_missing_res())
+    assert "未发现需要处理的代码问题" in out
+    assert "不存在" not in out          # 不被 SKIPPED 仓 带偏
+    assert "游戏" in out                 # 附加说明是游戏仓
+
+def test_engine_skip_game_clean():
+    """镜像对称: 游戏真 clean, 引擎找不到分支 -> 仍报"未发现问题", 附带引擎."""
+    out = fn._empty_review_reason(_skip_branch_missing_res(), _clean_res())
+    assert "未发现需要处理的代码问题" in out
+    assert "不存在" not in out
+    assert "引擎" in out
+
+def test_all_clean_still_reports_clean():
+    """两个仓都真 clean -> 无任何附注(不带'未纳入'尾巴)."""
+    out = fn._empty_review_reason(_clean_res(), _clean_res())
+    assert out == "✅ 未发现需要处理的代码问题。"
+
+def test_all_skip_branch_missing_still_attributed():
+    """两个仓都找不到分支(都没审) -> 保留原"无可审内容/分支不存在"归因."""
+    out = fn._empty_review_reason(_skip_branch_missing_res(), _skip_branch_missing_res())
+    assert "无可审内容" in out
+    assert "不存在" in out
+

@@ -414,7 +414,33 @@ def _empty_review_reason(engine_result, game_result):
         return (f"🚫 该分支的 MR 已合并进 `{base}`，相对该 base 没有新增改动，"
                 f"因此本次未产生 findings。如需审该段代码，请直接审 `{base}` 上当前实现。")
 
-    # A 兜底: 逐仓库归因
+    def _clean_repo(res):
+        """一个仓库是否"真正走完了 review 且 clean"(分支在、有改动、无 error、无 findings)。
+        区分于"未可审"(branch_missing/merged/no_diff/error) —— 后者根本没审, 其 0 findings
+        不算数。"""
+        if not res:
+            return False
+        r = res.get("review") or {}
+        return (res.get("branch_exists") is not False
+                and not res.get("branch_merged")
+                and (res.get("changed_files") or [])
+                and not r.get("error"))
+
+    # 只要有一个仓库真正走完 review 且 clean, 就把"真审查结果"判为干净，不被其它
+    # 因 infra 原因 SKIPPED 的仓库(如纯引擎 MR 在游戏仓找不到该分支)带偏。例 ENG-33381:
+    # 引擎仓审到 0 findings(真干净)，游戏仓 branch_exists=False(没审) —— 应"未发现问题"，
+    # 而非报"游戏: 分支不存在"让用户以为整个 review 白跑。
+    cleaned = [res for res in (engine_result, game_result) if _clean_repo(res)]
+    if cleaned:
+        # 附注被跳过的仓库(可选, 帮助用户理解为什么"没审全")
+        skipped_note = ""
+        skipped = [label for (label, res) in (("引擎", engine_result), ("游戏", game_result))
+                   if res and not _clean_repo(res)]
+        if skipped:
+            skipped_note = "（" + "、".join(skipped) + "仓库未纳入本次实质审查）"
+        return "✅ 未发现需要处理的代码问题。" + skipped_note
+
+    # 没有任何仓库 clean —— 全部 未可审/出错/无review结果: 逐仓归因去重展示 "无可审内容"。
     reasons = []
     for label, res in (("引擎", engine_result), ("游戏", game_result)):
         if not res:
@@ -433,17 +459,6 @@ def _empty_review_reason(engine_result, game_result):
                 _err = _err[:160] + "…"
             reasons.append(f"{label}：review 出错 — {_err}")
         # 否则 = clean(无 findings 且无上述异常)
-
-    # 若两个仓库都是 clean → 真干净
-    clean = all(
-        res and res.get("review") and res.get("branch_exists") is not False
-        and not res.get("branch_merged")
-        and (res.get("changed_files") or [])
-        and not (res.get("review") or {}).get("error")
-        for res in (engine_result, game_result)
-    )
-    if clean:
-        return "✅ 未发现需要处理的代码问题。"
     # 去重(按"去掉仓库前缀后的原因文本"), 同一原因多仓库只写一遍
     seen = set()
     compact = []
